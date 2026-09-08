@@ -37,7 +37,7 @@ const (
 type FeeBreakdown struct {
 	SellerPrice     int64    // Seller's listed price
 	PlatformFee     int64    // Platform markup
-	DokuFee         int64    // Payment gateway fee
+	GatewayFee      int64    // Payment gateway fee, as expected at payment time
 	TotalCharged    int64    // What customer pays (varies by fee model)
 	SellerNetAmount int64    // What seller actually receives (varies by fee model)
 	FeeModel        FeeModel // Who pays the gateway fee
@@ -56,11 +56,11 @@ type ProductTransaction struct {
 	Fee                      FeeBreakdown
 	Status                   TransactionStatus
 	Metadata                 map[string]any // Caller-defined metadata (product details, buyer/seller info, etc.)
-	CompletedAt              *time.Time     // When user paid (DOKU webhook)
-	SettledAt                *time.Time     // When appeared in settlement CSV
+	CompletedAt              *time.Time     // When the payer paid (money-in webhook)
+	SettledAt                *time.Time     // When Singapay settled the funds into the available balance
 	PlatformFeeTransferred   bool           // Whether platform fee has been transferred to platform sub-account
-	PlatformFeeTransferredAt *time.Time     // When platform fee was successfully transferred via DOKU API
-	TransferRequestID        string         // DOKU request-id used for platform fee transfer (for idempotent retries)
+	PlatformFeeTransferredAt *time.Time     // When platform fee was successfully transferred between sub-accounts
+	TransferRequestID        string         // merchant_ref_no used for the platform fee transfer (for idempotent retries)
 }
 
 // ProductTransactionRepository defines data access for product transactions
@@ -81,11 +81,17 @@ type ProductTransactionRepository interface {
 	SaveTransferRequestID(ctx context.Context, id string, requestID string) error
 	MarkPlatformFeeTransferred(ctx context.Context, id string) error
 	GetSettledWithoutPlatformFeeTransfer(ctx context.Context, limit int) ([]*ProductTransaction, error)
+
+	// GetAwaitingSettlement returns COMPLETED transactions whose funds have not settled
+	// yet, oldest first. The reconciler needs this to know which invoices it is waiting
+	// on: Singapay's settlement webhook carries totals and a date window but no list of
+	// the transactions the batch covered.
+	GetAwaitingSettlement(ctx context.Context, limit int) ([]*ProductTransaction, error)
 }
 
 // NewFeeBreakdown creates a FeeBreakdown with specified fee model and validates amounts
-func NewFeeBreakdown(sellerPrice, platformFee, dokuFee int64, currency Currency, feeModel FeeModel) (*FeeBreakdown, error) {
-	if sellerPrice < 0 || platformFee < 0 || dokuFee < 0 {
+func NewFeeBreakdown(sellerPrice, platformFee, gatewayFee int64, currency Currency, feeModel FeeModel) (*FeeBreakdown, error) {
+	if sellerPrice < 0 || platformFee < 0 || gatewayFee < 0 {
 		return nil, ledgererr.ErrInvalidFeeBreakdown
 	}
 
@@ -94,24 +100,24 @@ func NewFeeBreakdown(sellerPrice, platformFee, dokuFee int64, currency Currency,
 	switch feeModel {
 	case FeeModelGatewayOnCustomer:
 		// Customer pays everything: seller_price + platform_fee + gateway_fee
-		totalCharged = sellerPrice + platformFee + dokuFee
+		totalCharged = sellerPrice + platformFee + gatewayFee
 		sellerNetAmount = sellerPrice // Seller gets 100% of their price
 
 	case FeeModelGatewayOnSeller:
 		// Customer pays: seller_price + platform_fee (no gateway fee)
 		totalCharged = sellerPrice + platformFee
-		sellerNetAmount = sellerPrice - dokuFee // Seller bears the DOKU fee; platform fee tracked separately
+		sellerNetAmount = sellerPrice - gatewayFee // Seller bears the gateway fee; platform fee tracked separately
 
 	default:
 		// Default to customer pays all (backward compatibility)
-		totalCharged = sellerPrice + platformFee + dokuFee
+		totalCharged = sellerPrice + platformFee + gatewayFee
 		sellerNetAmount = sellerPrice
 	}
 
 	return &FeeBreakdown{
 		SellerPrice:     sellerPrice,
 		PlatformFee:     platformFee,
-		DokuFee:         dokuFee,
+		GatewayFee:      gatewayFee,
 		TotalCharged:    totalCharged,
 		SellerNetAmount: sellerNetAmount,
 		FeeModel:        feeModel,
@@ -184,7 +190,7 @@ func (pt *ProductTransaction) IsCompleted() bool {
 	return pt.Status == TransactionStatusCompleted
 }
 
-// IsSettled checks if transaction has been settled via CSV reconciliation
+// IsSettled checks if transaction has been settled via reconciliation
 func (pt *ProductTransaction) IsSettled() bool {
 	return pt.Status == TransactionStatusSettled
 }
@@ -222,7 +228,7 @@ func (pt *ProductTransaction) CanTransitionTo(newStatus TransactionStatus) bool 
 	}
 }
 
-// MarkCompleted transitions from PENDING to COMPLETED (when DOKU webhook received)
+// MarkCompleted transitions from PENDING to COMPLETED (when the money-in webhook is booked)
 func (pt *ProductTransaction) MarkCompleted() error {
 	if !pt.CanTransitionTo(TransactionStatusCompleted) {
 		return ledgererr.ErrInvalidTransactionStatus
@@ -233,7 +239,7 @@ func (pt *ProductTransaction) MarkCompleted() error {
 	return nil
 }
 
-// MarkSettled transitions from COMPLETED to SETTLED (when appeared in settlement CSV)
+// MarkSettled transitions from COMPLETED to SETTLED (when the funds appear in a Singapay settlement)
 func (pt *ProductTransaction) MarkSettled() error {
 	if !pt.CanTransitionTo(TransactionStatusSettled) {
 		return ledgererr.ErrInvalidTransactionStatus

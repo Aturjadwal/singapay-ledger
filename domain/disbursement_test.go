@@ -234,10 +234,10 @@ func TestDisbursement_MarkCompleted(t *testing.T) {
 		d, _ := NewDisbursement("ledger-123", 100000, CurrencyIDR, bankAccount, "Test")
 		d.Status = DisbursementStatusProcessing
 
-		err := d.MarkCompleted("DOKU-TX-123")
+		err := d.MarkCompleted("SP-TX-123")
 		assert.NoError(t, err)
 		assert.Equal(t, DisbursementStatusCompleted, d.Status)
-		assert.Equal(t, "DOKU-TX-123", d.ExternalTransactionID)
+		assert.Equal(t, "SP-TX-123", d.ExternalTransactionID)
 		assert.NotNil(t, d.ProcessedAt)
 		assert.True(t, d.IsTerminal())
 	})
@@ -245,10 +245,10 @@ func TestDisbursement_MarkCompleted(t *testing.T) {
 	t.Run("valid transition from pending (immediate success)", func(t *testing.T) {
 		d, _ := NewDisbursement("ledger-123", 100000, CurrencyIDR, bankAccount, "Test")
 
-		err := d.MarkCompleted("DOKU-TX-456")
+		err := d.MarkCompleted("SP-TX-456")
 		assert.NoError(t, err)
 		assert.Equal(t, DisbursementStatusCompleted, d.Status)
-		assert.Equal(t, "DOKU-TX-456", d.ExternalTransactionID)
+		assert.Equal(t, "SP-TX-456", d.ExternalTransactionID)
 		assert.NotNil(t, d.ProcessedAt)
 	})
 }
@@ -263,10 +263,10 @@ func TestDisbursement_MarkFailed(t *testing.T) {
 	t.Run("valid transition from pending", func(t *testing.T) {
 		d, _ := NewDisbursement("ledger-123", 100000, CurrencyIDR, bankAccount, "Test")
 
-		err := d.MarkFailed("DOKU API error")
+		err := d.MarkFailed("gateway API error")
 		assert.NoError(t, err)
 		assert.Equal(t, DisbursementStatusFailed, d.Status)
-		assert.Equal(t, "DOKU API error", d.FailureReason)
+		assert.Equal(t, "gateway API error", d.FailureReason)
 		assert.NotNil(t, d.ProcessedAt)
 		assert.True(t, d.IsTerminal())
 	})
@@ -317,7 +317,7 @@ func TestDisbursement_NeedsRollback(t *testing.T) {
 
 	t.Run("needs rollback when failed without external ID", func(t *testing.T) {
 		d, _ := NewDisbursement("ledger-123", 100000, CurrencyIDR, bankAccount, "Test")
-		_ = d.MarkFailed("DOKU API down")
+		_ = d.MarkFailed("gateway API down")
 
 		assert.True(t, d.NeedsRollback())
 	})

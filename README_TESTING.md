@@ -34,7 +34,7 @@ func TestCSVParsingAlone(t *testing.T) {
 Batch ID,BATCH-001
 ...`
 
-    parser := domain.NewDokuSettlementCSVParser("test.csv", 1)
+    parser := domain.(removed — Singapay publishes no settlement file)("test.csv", 1)
     err := parser.Parse(strings.NewReader(csv))
 
     // Assert metadata and rows
@@ -48,7 +48,7 @@ func TestFeeCalculationAlone(t *testing.T) {
     fee, err := domain.NewFeeBreakdown(
         50000,  // seller price
         1000,   // platform fee
-        4995,   // doku fee
+        4995,   // singapay fee
         domain.CurrencyIDR,
         domain.FeeModelGatewayOnSeller,
     )
@@ -118,7 +118,7 @@ func TestSACVerification(t *testing.T) {
 
     // Retrieve and compare
     dbAcc, _ := fakeAccounts.GetBySel lerID(ctx, "seller-1")
-    assert.NotEqual(t, csvSAC, dbAcc.DokuSubAccountID)
+    assert.NotEqual(t, csvSAC, dbAcc.SingapayAccountID)
 }
 ```
 

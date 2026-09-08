@@ -39,8 +39,7 @@ func TestCreatePaymentLink(t *testing.T) {
 	if err := json.Unmarshal(got.Body, &body); err != nil {
 		t.Fatal(err)
 	}
-	// expired_at is an absolute timestamp here, unlike DOKU's payment_due_date which
-	// is a count of minutes.
+	// expired_at is an absolute timestamp here rather than a lifetime in minutes.
 	if body["expired_at"] != "2026-09-08T13:00:00+07:00" {
 		t.Errorf("expired_at = %v", body["expired_at"])
 	}
@@ -272,8 +271,7 @@ func TestListPaymentMethods(t *testing.T) {
 	if len(methods) != 2 || methods[0].Code != "VA_BRI" {
 		t.Fatalf("got %+v", methods)
 	}
-	// These codes replace DOKU's channel constants wholesale; nothing else in the API
-	// accepts DOKU's spellings.
+	// These codes are the only spellings the API accepts; a fee table has to key on them.
 	for _, m := range methods {
 		if m.Code == "" || m.Group == "" {
 			t.Errorf("incomplete method %+v", m)

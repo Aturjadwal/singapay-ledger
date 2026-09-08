@@ -1,120 +1,111 @@
-# Settlement & Reconciliation - Architecture Diagram
+# Settlement & Reconciliation
 
-This diagram details the reconciliation process: processing settlement CSVs from the Payment Gateway (DOKU) to update actual ledger balances.
+> **Not implemented.** `ProcessReconciliation` returns `ErrReconciliationNotImplemented` and
+> books nothing. This document describes the design and, more importantly, the four questions
+> that have to be answered before it can be built. See [`reconciliation.go`](../reconciliation.go).
 
-## How a CSV reaches this package
+Reconciliation is the step that converts a seller's `PENDING` balance into `AVAILABLE`.
+Until it lands, money can arrive and be booked, and payouts can be made against whatever is
+already `AVAILABLE` — but nothing new becomes withdrawable, and
+`ProcessPlatformFeeTransfer` finds no work because nothing reaches `SETTLED`.
 
-`ProcessReconciliation` takes an `io.Reader`, not a path or a bucket key. Where the CSV came
-from is the caller's business, and deliberately so — this package knows about ledgers, not
-about object storage.
+## Why it is absent rather than approximated
 
-In production the caller is a **background worker**, not an admin upload. Each tick it lists
-the settlement bucket, asks `FilterIngestedReportFiles` which of those keys are already
-booked, and hands over the rest. It calls with `UploadedBy: "System"`, passes the full object
-key as `ReportFileName` (unique where a bare filename is not), and leaves `SettlementDate`
-zero so that this package falls back to the `PayOutDate` of the first CSV row — the file's
-real settlement date, rather than the date the worker happened to run.
+Ledger entries are insert-only. A settlement booked on a wrong assumption cannot be undone,
+only compensated with a second set of entries and an audit. So an approximation here is more
+expensive than an absence: the absence is loud, while a wrong `PENDING` → `AVAILABLE`
+conversion is silent — and it decides what a seller is allowed to withdraw.
 
-An admin upload is still a perfectly valid caller; it is simply no longer the only one, and
-no longer the one that runs every day.
+## What replaced the settlement file
 
-## Ingestion is idempotent
-
-A settlement batch is booked **at most once**, keyed on DOKU's own `Batch ID` from the CSV
-metadata header. Presenting the same CSV again — under the same name or a different one —
-returns `AlreadyIngested: true` with `IngestedAs` naming the file it was first booked under,
-and posts nothing.
-
-This matters because a caller that discovers files by listing a bucket will meet the same
-file repeatedly, and because ledger entries are immutable: a double-post cannot be deleted,
-only corrected with compensating entries.
-
-There are two brakes, and both are needed:
-
-| Brake | Where | Catches |
-|---|---|---|
-| `batch_id` check before any write | `ProcessReconciliation` | the ordinary repeat — answered quietly, no error |
-| partial `UNIQUE` index on `batch_id` | migration `013` | the race between two concurrent callers, and any path that skips the check |
-
-`IngestedAs` is returned rather than a bare boolean so the caller can distinguish a benign
-re-ship (same file, new key) from a *different* file carrying a `batch_id` already booked —
-which is also what a DOKU correction would look like, and should not be swallowed quietly.
+There isn't one. The previous gateway published a settlement CSV: a single artefact naming
+every transaction in the batch, its amount and its fee. Singapay publishes a webhook.
 
 ```mermaid
 sequenceDiagram
-    participant Caller as Caller (worker / admin)
-    participant Reconcile as ProcessReconciliation
-    participant SettlementParsing
+    participant Singapay
+    participant LedgerAPI
     participant LedgerStore
-    participant DOKU_API (Balance)
 
-    %% Step 1: Intake
-    Caller->>Reconcile: ProcessReconciliation(CSVReader, ReportFileName, UploadedBy)
-    Reconcile->>SettlementParsing: Parse CSV (metadata + rows)
-    SettlementParsing-->>Reconcile: Batch ID + rows
+    Singapay->>LedgerAPI: POST settlement_notif_url (settlement.completed)
+    Note right of LedgerAPI: Carries totals, settlement_method,<br/>and a date window.<br/>NOT a list of transactions.
 
-    %% Step 1b: Idempotency guard - before any write
-    Reconcile->>LedgerStore: Find SettlementBatch by Batch ID
-    alt Batch ID already booked
-        LedgerStore-->>Reconcile: existing batch
-        Reconcile-->>Caller: AlreadyIngested = true, IngestedAs = <original file>
-    else New batch
-        Reconcile->>Reconcile: Create SettlementBatch (PENDING -> PROCESSING)
+    LedgerAPI->>LedgerAPI: Verify signature
+    LedgerAPI->>LedgerAPI: settlement_method balance / auto-balance?
+    Note right of LedgerAPI: 'bank-account' pays out instead —<br/>a different event entirely
+
+    LedgerAPI->>LedgerStore: Which invoices are awaiting settlement?
+    Note right of LedgerStore: GetAwaitingSettlement bounds the work to<br/>accounts actually holding unsettled money
+
+    loop per account, per channel used
+        LedgerAPI->>Singapay: List VA / QRIS / e-wallet / link transactions
+        Note right of Singapay: filtered on SettlementWindow<br/>(settle_from .. settle_to)
+        Singapay-->>LedgerAPI: settled rows + the fee each channel took
     end
 
-    %% Step 2: Processing Transactions
-    rect rgb(240, 240, 240)
-    loop For each Row in CSV
-        Reconcile->>LedgerStore: Find ProductTransaction by Invoice No
-        alt Transaction Found
-            Reconcile->>LedgerStore: Mark Transaction -> SETTLED
-            Reconcile->>LedgerStore: Record Fees (Platform, Gateway)
-            Reconcile->>LedgerStore: Link to SettlementBatch
-        else Not Found
-            Reconcile->>LedgerStore: Log Unmatched Transaction (Warning)
-        end
-    end
-    end
-
-    %% Step 3: Balance Calculation & Update
-    Reconcile->>LedgerStore: Create Journal (Event: SETTLEMENT)
-
-    loop For Each Settled Transaction (Seller)
-        Note right of LedgerStore: Seller Balance Update (Pending -> Available)
-        Reconcile->>LedgerStore: Creates LedgerEntry (Seller): -Amount (PENDING)
-        Reconcile->>LedgerStore: Creates LedgerEntry (Seller): +Amount (AVAILABLE)
-    end
-
-    loop For Each Settled Transaction (Platform)
-        Note right of LedgerStore: Platform Fee Update (Pending -> Available)
-        Reconcile->>LedgerStore: Creates LedgerEntry (Platform): -Fee (PENDING)
-        Reconcile->>LedgerStore: Creates LedgerEntry (Platform): +Fee (AVAILABLE)
-    end
-
-    loop For Each Settled Transaction (Doku)
-        Note right of LedgerStore: Doku Fee Clear (Pending -> Cleared)
-        Reconcile->>LedgerStore: Creates LedgerEntry (Doku): -Fee (PENDING)
-    end
-
-    Reconcile-->>Caller: ReconciliationResponse (matched, unmatched, discrepancies)
+    LedgerAPI->>LedgerAPI: Match rows to invoices by merchant reference
+    LedgerAPI->>LedgerStore: Write settlement entries (see 104 for the fee rules)
 ```
 
-**Key Concepts:**
+`domain.SettledTransaction` exists to flatten the four channel shapes into one, because the
+reconciler should not carry four branches for what is nearly the same row.
 
-- **SettlementBatch**: Represents one ingested settlement CSV, identified by DOKU's `Batch ID`.
-- **Ledger Entries Created**:
-  - **Journal**: EventType `SETTLEMENT`
-  - **Seller Entries**:
-    - `-Amount` from **PENDING** (removes hold)
-    - `+Amount` into **AVAILABLE** (funds ready for withdrawal)
-  - **Platform Entries**:
-    - `-Fee` from **PENDING**
-    - `+Fee` into **AVAILABLE**
-  - **Doku Entries**:
-    - `-Fee` from **PENDING** (clears liability, Doku keeps the fee)
-- **Safe Balance**: `MIN(Expected, Actual)` used for withdrawals.
+## The four open questions
 
-**Related:**
+Each has a wrong answer that produces a plausible-looking result. That is why none of them
+can be guessed.
 
-- `database/migrations/013_settlement_batches_idempotency.sql` — the two indexes ingestion
-  relies on, and why one of them is unique.
+### 1. Timezone and boundary of the settlement window
+
+Singapay writes settlement timestamps as human-readable text with no offset —
+`"26 Dec 2025 13:35:45"`. Asia/Jakarta is an assumption, documented as such in
+`singapay.TextTime`, not a fact Singapay states. Seven hours in either direction moves rows
+between batches: some settle twice, others never.
+
+Whether the window bounds are inclusive is equally unstated.
+
+### 2. Which settlement event the window keys on
+
+A QRIS transaction carries `HasSettle`/`SettleAt` **and** `HasSettleToMerchant`/
+`SettledToMerchantAt`. Those are different moments. Filtering on the wrong one returns a set
+of rows that looks entirely reasonable and is wrong.
+
+### 3. Whether the reconstruction scales
+
+N accounts × up to 4 product lists × pagination, per settlement. Rate limits and page
+behaviour are unmeasured. `GetAwaitingSettlement` bounds N to accounts actually holding
+unsettled money rather than every sub-account the merchant owns, which helps — but the
+ordering is still different from reading one file.
+
+This is a viability question, not a correctness one. It may be the one that changes the
+design.
+
+### 4. What `settlement.refunded` should do
+
+It can pull back funds that have already become `AVAILABLE` and may already have been
+withdrawn. This ledger has no negative-balance policy, and inventing one inside a
+reconciliation routine is the wrong place to decide it. **This is a business decision, not a
+coding gap.**
+
+## How to answer them
+
+`cmd/singapay-smoke` is where (1) and (2) get settled: create a VA payment in sandbox, let it
+settle, then compare the settlement webhook's window against the timestamps on the
+transaction record. (3) needs a sandbox with enough volume to page. (4) needs a person.
+
+## What is already in place
+
+- `domain.SettlementBatch` — carries `BatchID` (the idempotency key), `SettlementReference`,
+  and `SettleFrom`/`SettleTo`. The constructor **requires** the window, because a batch
+  without one can never be reprocessed or audited.
+- `domain.SettlementItem` — one settled gateway row, with `FeeReported` recording whether its
+  fee is a fact or a fallback. See [104](./104-fee-mismatch-reconciliation.md).
+- `domain.SettledTransaction` — the normalised shape across the four channels.
+- The ledger-entry side is unchanged and correct: `PENDING` → `AVAILABLE` conversion, fee
+  adjustment write-offs and credits, gateway fee clearance. Singapay's pending/available split
+  matches this ledger's, which is why the model survived the migration intact.
+- Schema: `settlement_batches` and `settlement_items` are migrated
+  ([018](../database/migrations/018_migrate_to_singapay.sql)).
+
+What is missing is only the part that decides which rows belong to a batch — and that is
+exactly the part that is unverified.

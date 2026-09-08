@@ -1,6 +1,6 @@
 # Ledger — Entity Reference
 
-Dokumen ini menjelaskan seluruh tabel/entitas yang terlibat dalam operasional ledger: struktur field, relasi antar entitas, lifecycle status, dan peran masing-masing dalam alur bisnis.
+Singapaymen ini menjelaskan seluruh tabel/entitas yang terlibat dalam operasional ledger: struktur field, relasi antar entitas, lifecycle status, dan peran masing-masing dalam alur bisnis.
 
 ---
 
@@ -10,11 +10,11 @@ Dokumen ini menjelaskan seluruh tabel/entitas yang terlibat dalam operasional le
 |---|---|---|
 | [Account](#1-account) | `ledger_accounts` | Akun keuangan (seller, platform, payment gateway) |
 | [ProductTransaction](#2-producttransaction) | `product_transactions` | Transaksi penjualan produk |
-| [PaymentRequest](#3-paymentrequest) | `payment_requests` | Sesi pembayaran DOKU |
+| [PaymentRequest](#3-paymentrequest) | `payment_requests` | Sesi pembayaran Singapay |
 | [Journal](#4-journal) | `journals` | Pengelompokan event akuntansi |
 | [LedgerEntry](#5-ledgerentry) | `ledger_entries` | Entri double-entry yang immutable |
-| [FeeConfig](#6-feeconfig) | `fee_configs` | Konfigurasi fee platform dan DOKU |
-| [SettlementBatch](#7-settlementbatch) | `settlement_batches` | Batch upload CSV settlement DOKU |
+| [FeeConfig](#6-feeconfig) | `fee_configs` | Konfigurasi fee platform dan Singapay |
+| [SettlementBatch](#7-settlementbatch) | `settlement_batches` | Batch upload CSV settlement Singapay |
 | [SettlementItem](#8-settlementitem) | `settlement_items` | Baris individual dari CSV settlement |
 | [Disbursement](#9-disbursement) | `disbursements` | Penarikan saldo seller ke rekening bank |
 | [ReconciliationDiscrepancy](#10-reconciliationdiscrepancy) | `reconciliation_discrepancies` | Selisih saldo yang terdeteksi saat rekonsiliasi |
@@ -34,7 +34,7 @@ Entitas inti yang merepresentasikan akun keuangan dalam sistem. Setiap seller me
 |---|---|---|
 | `uuid` | VARCHAR(255) PK | Identifier internal akun |
 | `randid` | VARCHAR(255) UNIQUE | ID acak untuk referensi publik |
-| `doku_subaccount_id` | VARCHAR(100) UNIQUE | ID sub-account DOKU yang ditautkan |
+| `singapay_account_id` | VARCHAR(100) UNIQUE | ID sub-account Singapay yang ditautkan |
 | `owner_type` | VARCHAR(20) | `SELLER`, `PLATFORM`, `PAYMENT_GATEWAY`, atau `RESERVE` |
 | `owner_id` | VARCHAR(255) | Seller ID, `"PLATFORM"`, nama gateway, atau identifier reserve |
 | `currency` | VARCHAR(3) | `IDR` atau `USD` |
@@ -49,7 +49,7 @@ Entitas inti yang merepresentasikan akun keuangan dalam sistem. Setiap seller me
 
 - **`SELLER`** — Akun milik seller. Satu per seller. Saldo tumbuh dari transaksi yang settled.
 - **`PLATFORM`** — Satu akun untuk platform. Menerima platform fee dari setiap transaksi.
-- **`PAYMENT_GATEWAY`** — Satu akun untuk DOKU. Menerima DOKU fee dari setiap transaksi.
+- **`PAYMENT_GATEWAY`** — Satu akun untuk Singapay. Menerima gateway fee dari setiap transaksi.
 - **`RESERVE`** — Akun cadangan untuk penyesuaian manual.
 
 ### Catatan Penting
@@ -87,7 +87,7 @@ Entitas pusat yang merepresentasikan penjualan produk antara buyer dan seller. I
 | `invoice_number` | VARCHAR(50) UNIQUE | Nomor invoice untuk pencocokan CSV settlement |
 | `seller_price` | BIGINT | Harga yang ditetapkan seller |
 | `platform_fee` | BIGINT | Markup platform di atas harga seller |
-| `doku_fee` | BIGINT | Fee payment gateway DOKU |
+| `gateway_fee` | BIGINT | Fee payment gateway Singapay |
 | `total_charged` | BIGINT | Total yang dibebankan ke buyer |
 | `seller_net_amount` | BIGINT | Jumlah bersih yang diterima seller |
 | `fee_model` | VARCHAR(50) | `GATEWAY_ON_CUSTOMER` atau `GATEWAY_ON_SELLER` |
@@ -95,8 +95,8 @@ Entitas pusat yang merepresentasikan penjualan produk antara buyer dan seller. I
 | `status` | VARCHAR(20) | Lihat lifecycle di bawah |
 | `platform_fee_transferred` | BOOLEAN | Apakah platform fee sudah ditransfer ke sub-account platform |
 | `platform_fee_transferred_at` | TIMESTAMP | Waktu transfer platform fee |
-| `transfer_request_id` | TEXT | DOKU request-id untuk transfer platform fee (dipakai ulang saat retry untuk idempotency) |
-| `completed_at` | TIMESTAMP | Waktu pembayaran dikonfirmasi webhook DOKU |
+| `transfer_request_id` | TEXT | Singapay request-id untuk transfer platform fee (dipakai ulang saat retry untuk idempotency) |
+| `completed_at` | TIMESTAMP | Waktu pembayaran dikonfirmasi webhook Singapay |
 | `settled_at` | TIMESTAMP | Waktu muncul dalam CSV settlement |
 | `metadata` | JSONB | Detail produk (photo_id, title, resolution, dll.) |
 | `created_at` | TIMESTAMP | Waktu pembuatan |
@@ -104,10 +104,10 @@ Entitas pusat yang merepresentasikan penjualan produk antara buyer dan seller. I
 
 ### Fee Model
 
-| Model | Siapa yang Bayar DOKU Fee | Efek pada `total_charged` | Efek pada `seller_net_amount` |
+| Model | Siapa yang Bayar Gateway fee | Efek pada `total_charged` | Efek pada `seller_net_amount` |
 |---|---|---|---|
-| `GATEWAY_ON_CUSTOMER` | Buyer | `seller_price + platform_fee + doku_fee` | `seller_price` (penuh) |
-| `GATEWAY_ON_SELLER` | Seller | `seller_price + platform_fee` | `seller_price - doku_fee` |
+| `GATEWAY_ON_CUSTOMER` | Buyer | `seller_price + platform_fee + gateway_fee` | `seller_price` (penuh) |
+| `GATEWAY_ON_SELLER` | Seller | `seller_price + platform_fee` | `seller_price - gateway_fee` |
 
 ### Lifecycle Status
 
@@ -120,8 +120,8 @@ SETTLED ──► REFUNDED
 ```
 
 - **`PENDING`** — Invoice dibuat, menunggu pembayaran.
-- **`COMPLETED`** — DOKU webhook mengkonfirmasi pembayaran. Ledger entry dibuat di sini.
-- **`SETTLED`** — Transaksi muncul di CSV settlement DOKU.
+- **`COMPLETED`** — money-in webhook mengkonfirmasi pembayaran. Ledger entry dibuat di sini.
+- **`SETTLED`** — Transaksi muncul di CSV settlement Singapay.
 - **`FAILED`** — Transaksi gagal di titik mana pun.
 - **`REFUNDED`** — Dana dikembalikan ke buyer.
 
@@ -138,7 +138,7 @@ SETTLED ──► REFUNDED
 
 **Tabel:** `payment_requests`
 
-Melacak lifecycle integrasi dengan DOKU payment gateway. Satu `PaymentRequest` per `ProductTransaction`.
+Melacak lifecycle integrasi dengan Singapay payment gateway. Satu `PaymentRequest` per `ProductTransaction`.
 
 ### Fields
 
@@ -147,7 +147,7 @@ Melacak lifecycle integrasi dengan DOKU payment gateway. Satu `PaymentRequest` p
 | `uuid` | VARCHAR(255) PK | Identifier request |
 | `randid` | VARCHAR(255) UNIQUE | ID acak untuk referensi publik |
 | `product_transaction_uuid` | VARCHAR(255) FK | Transaksi yang ditautkan |
-| `request_id` | VARCHAR(100) UNIQUE | ID payment request dari DOKU |
+| `request_id` | VARCHAR(100) UNIQUE | ID payment request dari Singapay |
 | `payment_code` | VARCHAR(100) | Nomor VA, kode QRIS, dsb. |
 | `payment_channel` | VARCHAR(50) | `QRIS`, `VA_BCA`, `VA_BRI`, `VA_MANDIRI`, `VA_BNI`, `CREDIT_CARD`, `E_WALLET` |
 | `payment_url` | TEXT | URL bagi buyer untuk menyelesaikan pembayaran |
@@ -155,7 +155,7 @@ Melacak lifecycle integrasi dengan DOKU payment gateway. Satu `PaymentRequest` p
 | `currency` | VARCHAR(3) | `IDR` atau `USD` |
 | `status` | VARCHAR(20) | Lihat lifecycle di bawah |
 | `failure_reason` | TEXT | Detail error jika gagal |
-| `completed_at` | TIMESTAMP | Waktu konfirmasi dari DOKU webhook |
+| `completed_at` | TIMESTAMP | Waktu konfirmasi dari money-in webhook |
 | `expires_at` | TIMESTAMP | Batas waktu kadaluarsa link pembayaran |
 | `created_at` | TIMESTAMP | Waktu pembuatan |
 | `updated_at` | TIMESTAMP | Waktu update terakhir |
@@ -170,7 +170,7 @@ PENDING ──► COMPLETED
 ```
 
 - **`PENDING`** — Menunggu pembayaran dari buyer.
-- **`COMPLETED`** — DOKU mengkonfirmasi pembayaran berhasil.
+- **`COMPLETED`** — Singapay mengkonfirmasi pembayaran berhasil.
 - **`FAILED`** — Pembayaran gagal.
 - **`EXPIRED`** — Link pembayaran melewati `expires_at` (biasanya 24 jam).
 
@@ -205,7 +205,7 @@ Event akuntansi atomik yang mengelompokkan satu atau lebih `ledger_entries`. Set
 
 | Event | Pemicu | Entri yang Dihasilkan |
 |---|---|---|
-| `PAYMENT_SUCCESS` | DOKU webhook konfirmasi pembayaran | 3 entri: seller (PENDING), platform (PENDING), DOKU (PENDING) |
+| `PAYMENT_SUCCESS` | money-in webhook konfirmasi pembayaran | 3 entri: seller (PENDING), platform (PENDING), Singapay (PENDING) |
 | `SETTLEMENT` | Rekonsiliasi CSV settlement | 2 entri per akun: debit PENDING, kredit AVAILABLE |
 | `DISBURSEMENT` | Seller membuat permintaan penarikan | 1 entri: debit AVAILABLE seller |
 | `RECONCILIATION` | Penyesuaian selisih rekonsiliasi | Bervariasi |
@@ -252,7 +252,7 @@ Catatan double-entry yang immutable. Setiap entri merepresentasikan debit atau k
 |---|---|---|---|
 | `PRODUCT_PAYMENT` | PENDING | Kredit | Dana masuk ke seller saat transaksi selesai |
 | `PLATFORM_COMMISSION` | PENDING | Kredit | Fee platform masuk ke akun platform |
-| `PROCESSOR_FEE` | PENDING | Kredit | DOKU fee masuk ke akun PAYMENT_GATEWAY |
+| `PROCESSOR_FEE` | PENDING | Kredit | gateway fee masuk ke akun PAYMENT_GATEWAY |
 | `SETTLEMENT_CLEAR` | PENDING | Debit | Membersihkan PENDING saat settlement |
 | `SETTLEMENT_NET` | AVAILABLE | Kredit | Memindahkan dana ke AVAILABLE saat settlement |
 | `SETTLEMENT` | PENDING / AVAILABLE | Bervariasi | Entry settlement generik (legacy) |
@@ -266,7 +266,7 @@ Catatan double-entry yang immutable. Setiap entri merepresentasikan debit atau k
 PENDING ──[settlement]──► AVAILABLE ──[disbursement]──► (rekening bank seller)
 ```
 
-- **`PENDING`** — Dana yang sudah di-capture dari buyer tetapi belum dikonfirmasi dalam CSV settlement DOKU.
+- **`PENDING`** — Dana yang sudah di-capture dari buyer tetapi belum dikonfirmasi dalam CSV settlement Singapay.
 - **`AVAILABLE`** — Dana yang sudah dikonfirmasi settlement dan siap ditarik oleh seller.
 
 ### Set Entri per Event
@@ -274,7 +274,7 @@ PENDING ──[settlement]──► AVAILABLE ──[disbursement]──► (rek
 **PAYMENT_SUCCESS** (3 entri):
 1. `PRODUCT_PAYMENT` → akun seller, PENDING, kredit `seller_net_amount`
 2. `PLATFORM_COMMISSION` → akun platform, PENDING, kredit `platform_fee`
-3. `PROCESSOR_FEE` → akun DOKU, PENDING, kredit `doku_fee`
+3. `PROCESSOR_FEE` → akun Singapay, PENDING, kredit `gateway_fee`
 
 **SETTLEMENT** (2 entri per akun seller):
 1. `SETTLEMENT_CLEAR` → akun seller, PENDING, debit `seller_net_amount`
@@ -295,7 +295,7 @@ PENDING ──[settlement]──► AVAILABLE ──[disbursement]──► (rek
 
 **Tabel:** `fee_configs`
 
-Konfigurasi fee platform dan DOKU per payment channel. Digunakan oleh `FeeCalculator` untuk menghitung biaya setiap transaksi.
+Konfigurasi fee platform dan Singapay per payment channel. Digunakan oleh `FeeCalculator` untuk menghitung biaya setiap transaksi.
 
 ### Fields
 
@@ -303,7 +303,7 @@ Konfigurasi fee platform dan DOKU per payment channel. Digunakan oleh `FeeCalcul
 |---|---|---|
 | `uuid` | VARCHAR(255) PK | Identifier config |
 | `randid` | VARCHAR(255) UNIQUE | ID acak untuk referensi publik |
-| `config_type` | VARCHAR(20) | `PLATFORM` atau `DOKU` |
+| `config_type` | VARCHAR(20) | `PLATFORM` atau `Singapay` |
 | `payment_channel` | VARCHAR(50) | Channel pembayaran (lihat di bawah) |
 | `name` | VARCHAR(100) | Nama human-readable |
 | `fee_type` | VARCHAR(20) | `FIXED` atau `PERCENTAGE` |
@@ -325,13 +325,13 @@ Konfigurasi fee platform dan DOKU per payment channel. Digunakan oleh `FeeCalcul
 | Type | Channel | Fee |
 |---|---|---|
 | PLATFORM | — | Rp 1.000 (fixed) per transaksi |
-| DOKU | QRIS | 2,2% (percentage) |
-| DOKU | VIRTUAL_ACCOUNT | Rp 4.500 (fixed) |
+| Singapay | QRIS | 2,2% (percentage) |
+| Singapay | VIRTUAL_ACCOUNT | Rp 4.500 (fixed) |
 
 ### Catatan Penting
 
 - Kombinasi `(config_type, payment_channel)` bersifat UNIQUE.
-- Fee DOKU dengan model persentase menggunakan **reverse calculation**: buyer membayar jumlah yang sudah mencakup fee, bukan jumlah ditambah fee.
+- Fee Singapay dengan model persentase menggunakan **reverse calculation**: buyer membayar jumlah yang sudah mencakup fee, bukan jumlah ditambah fee.
 
 ---
 
@@ -339,7 +339,7 @@ Konfigurasi fee platform dan DOKU per payment channel. Digunakan oleh `FeeCalcul
 
 **Tabel:** `settlement_batches`
 
-Merepresentasikan satu file CSV settlement dari DOKU. Mengelompokkan `settlement_items` dan melacak progress rekonsiliasi.
+Merepresentasikan satu file CSV settlement dari Singapay. Mengelompokkan `settlement_items` dan melacak progress rekonsiliasi.
 
 ### Fields
 
@@ -349,11 +349,11 @@ Merepresentasikan satu file CSV settlement dari DOKU. Mengelompokkan `settlement
 | `randid` | VARCHAR(255) UNIQUE | ID acak untuk referensi publik |
 | `account_uuid` | VARCHAR(255) FK | Akun seller pemilik batch ini |
 | `report_file_name` | VARCHAR(255) | Nama file CSV |
-| `settlement_date` | DATE | Tanggal settlement dari DOKU |
-| `batch_id` | VARCHAR(255) | Batch ID dari metadata CSV DOKU |
+| `settlement_date` | DATE | Tanggal settlement dari Singapay |
+| `batch_id` | VARCHAR(255) | Batch ID dari metadata CSV Singapay |
 | `gross_amount` | BIGINT | Total amount sebelum fee |
-| `net_amount` | BIGINT | Total PAY TO MERCHANT (setelah DOKU fee) |
-| `doku_fee` | BIGINT | Total DOKU fee dari semua transaksi |
+| `net_amount` | BIGINT | Total PAY TO MERCHANT (setelah gateway fee) |
+| `gateway_fee` | BIGINT | Total gateway fee dari semua transaksi |
 | `currency` | VARCHAR(3) | `IDR` atau `USD` |
 | `uploaded_by` | VARCHAR(255) | ID user yang mengupload |
 | `uploaded_at` | TIMESTAMP | Waktu upload |
@@ -391,7 +391,7 @@ PENDING ──► PROCESSING ──► COMPLETED
 
 **Tabel:** `settlement_items`
 
-Merepresentasikan satu baris dari CSV settlement DOKU. Dicocokkan ke `product_transactions` berdasarkan `invoice_number`.
+Merepresentasikan satu baris dari CSV settlement Singapay. Dicocokkan ke `product_transactions` berdasarkan `invoice_number`.
 
 ### Fields
 
@@ -403,10 +403,10 @@ Merepresentasikan satu baris dari CSV settlement DOKU. Dicocokkan ke `product_tr
 | `product_transaction_uuid` | VARCHAR(255) FK | Transaksi yang dicocokkan (null jika belum cocok) |
 | `seller_account_id` | VARCHAR(255) | ID akun seller (cache untuk grouping) |
 | `invoice_number` | VARCHAR(100) | INVOICE NUMBER dari CSV (kunci pencocokan) |
-| `sub_account` | VARCHAR(100) | SUB ACCOUNT dari CSV (ID sub-account DOKU) |
+| `sub_account` | VARCHAR(100) | SUB ACCOUNT dari CSV (ID sub-account Singapay) |
 | `transaction_amount` | BIGINT | AMOUNT dari CSV |
-| `pay_to_merchant` | BIGINT | PAY TO MERCHANT dari CSV (net setelah DOKU fee) |
-| `allocated_fee` | BIGINT | FEE dari CSV (DOKU fee) |
+| `pay_to_merchant` | BIGINT | PAY TO MERCHANT dari CSV (net setelah gateway fee) |
+| `allocated_fee` | BIGINT | FEE dari CSV (gateway fee) |
 | `is_matched` | BOOLEAN | Apakah sudah cocok dengan `product_transaction` |
 | `csv_row_number` | INT | Nomor baris asli di CSV (untuk debugging) |
 | `raw_csv_data` | JSONB | Data baris CSV asli |
@@ -451,9 +451,9 @@ Permintaan penarikan saldo seller ke rekening bank eksternal. Memicu debit dari 
 | `account_number` | VARCHAR(50) | Nomor rekening tujuan |
 | `account_name` | VARCHAR(255) | Nama pemilik rekening |
 | `description` | TEXT | Deskripsi transaksi (opsional) |
-| `external_transaction_id` | VARCHAR(100) | ID transaksi dari DOKU |
+| `external_transaction_id` | VARCHAR(100) | ID transaksi dari Singapay |
 | `failure_reason` | TEXT | Detail error jika gagal |
-| `processed_at` | TIMESTAMP | Waktu DOKU memproses penarikan |
+| `processed_at` | TIMESTAMP | Waktu Singapay memproses penarikan |
 | `created_at` | TIMESTAMP | Waktu pembuatan |
 | `updated_at` | TIMESTAMP | Waktu update terakhir |
 
@@ -468,9 +468,9 @@ PENDING ──► PROCESSING ──► COMPLETED
    └──► CANCELLED
 ```
 
-- **`PENDING`** → **`PROCESSING`** — DOKU menerima dan sedang memproses.
-- **`PROCESSING`** → **`COMPLETED`** — DOKU berhasil mentransfer.
-- **`PENDING`** → **`COMPLETED`** — DOKU langsung berhasil tanpa delay.
+- **`PENDING`** → **`PROCESSING`** — Singapay menerima dan sedang memproses.
+- **`PROCESSING`** → **`COMPLETED`** — Singapay berhasil mentransfer.
+- **`PENDING`** → **`COMPLETED`** — Singapay langsung berhasil tanpa delay.
 - **`PENDING`** / **`PROCESSING`** → **`FAILED`** — Terjadi error.
 - **`PENDING`** → **`CANCELLED`** — Dibatalkan sebelum diproses.
 
@@ -504,9 +504,9 @@ Mencatat ketidaksesuaian saldo yang terdeteksi saat rekonsiliasi settlement. Sat
 | `settlement_batch_uuid` | VARCHAR(255) FK | Batch yang memicu deteksi |
 | `discrepancy_type` | VARCHAR(50) | Lihat tipe di bawah |
 | `expected_pending` | BIGINT | Saldo PENDING yang dihitung sistem |
-| `actual_pending` | BIGINT | Saldo PENDING dari DOKU GetBalance API |
+| `actual_pending` | BIGINT | Saldo PENDING dari Singapay GetBalance API |
 | `expected_available` | BIGINT | Saldo AVAILABLE yang dihitung sistem |
-| `actual_available` | BIGINT | Saldo AVAILABLE dari DOKU GetBalance API |
+| `actual_available` | BIGINT | Saldo AVAILABLE dari Singapay GetBalance API |
 | `pending_diff` | BIGINT | `actual_pending - expected_pending` |
 | `available_diff` | BIGINT | `actual_available - expected_available` |
 | `item_discrepancy_count` | INT | Jumlah `settlement_items` dengan selisih |
@@ -644,20 +644,20 @@ Buyer membayar
 ProductTransaction (PENDING)
     + PaymentRequest (PENDING)
     │
-    ▼ [DOKU webhook]
+    ▼ [money-in webhook]
 ProductTransaction (COMPLETED)
     + PaymentRequest (COMPLETED)
     + Journal (PAYMENT_SUCCESS)
     + 3x LedgerEntry:
         seller  → PENDING +seller_net_amount
         platform → PENDING +platform_fee
-        DOKU    → PENDING +doku_fee
+        Singapay    → PENDING +gateway_fee
 ```
 
 ### 2. Rekonsiliasi Settlement
 
 ```
-Admin upload CSV settlement DOKU
+Admin upload CSV settlement Singapay
     │
     ▼
 SettlementBatch (PENDING)
@@ -688,7 +688,7 @@ Disbursement (PENDING)
     + Journal (DISBURSEMENT)
     + LedgerEntry: seller AVAILABLE -amount
     │
-    ▼ [DOKU proses]
+    ▼ [Singapay proses]
 Disbursement (COMPLETED)
     Dana masuk ke rekening bank seller
 ```
@@ -704,7 +704,7 @@ Cari ProductTransaction dengan:
     platform_fee_transferred = false
     │
     ▼
-Transfer via DOKU intra sub-account API
+Transfer via Singapay intra sub-account API
     │
     ▼
 ProductTransaction.platform_fee_transferred = true

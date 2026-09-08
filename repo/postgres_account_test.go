@@ -18,17 +18,18 @@ import (
 // the const without updating the scan shifts every field after it, and the compiler
 // cannot see that.
 var accountColumns = []string{
-	"uuid", "randid", "doku_subaccount_id", "singapay_account_id", "singapay_account_number",
+	"uuid", "randid", "singapay_account_id", "singapay_account_number",
 	"owner_type", "owner_id", "currency",
 	"pending_balance", "available_balance", "total_withdrawal_amount", "total_deposit_amount",
 	"created_at", "updated_at",
 }
 
-// accountRow builds one row. The three gateway identifiers are untyped so a test can pass
-// nil for a SQL NULL, which is what an account backed by the other gateway looks like.
-func accountRow(uuid string, doku, singapayID, singapayNumber any, createdAt time.Time) []driver.Value {
+// accountRow builds one row. Both identifiers are untyped so a test can pass nil for a SQL
+// NULL — which is what the PAYMENT_GATEWAY expense account looks like, and what a
+// sub-account Singapay issued without a number looks like.
+func accountRow(uuid string, singapayID, singapayNumber any, createdAt time.Time) []driver.Value {
 	return []driver.Value{
-		uuid, "randid-" + uuid, doku, singapayID, singapayNumber,
+		uuid, "randid-" + uuid, singapayID, singapayNumber,
 		"SELLER", "seller-001", "IDR",
 		int64(0), int64(0), int64(0), int64(0),
 		createdAt, createdAt,
@@ -44,7 +45,7 @@ func newMockAccountRepo(t *testing.T) (*PostgresAccountRepository, sqlmock.Sqlmo
 	return NewPostgresAccountRepository(db), mock, func() { db.Close() }
 }
 
-func TestScanAccountReadsBothGatewayIdentifiers(t *testing.T) {
+func TestScanAccountReadsBothSingapayIdentifiers(t *testing.T) {
 	repo, mock, closeDB := newMockAccountRepo(t)
 	defer closeDB()
 
@@ -52,15 +53,13 @@ func TestScanAccountReadsBothGatewayIdentifiers(t *testing.T) {
 	mock.ExpectQuery("SELECT").
 		WithArgs("acc-001").
 		WillReturnRows(sqlmock.NewRows(accountColumns).
-			AddRow(accountRow("acc-001", nil, "01K946KF851RK7FX075GJHBVKF", "000000000123", now)...))
+			AddRow(accountRow("acc-001", "01K946KF851RK7FX075GJHBVKF", "000000000123", now)...))
 
 	got, err := repo.GetByID(context.Background(), "acc-001")
 	require.NoError(t, err)
 
 	assert.Equal(t, "01K946KF851RK7FX075GJHBVKF", got.SingapayAccountID)
 	assert.Equal(t, "000000000123", got.SingapayAccountNumber)
-	// A NULL for the other gateway must read as empty, not blow up the scan.
-	assert.Empty(t, got.DokuSubAccountID)
 	assert.True(t, got.CanReceiveTransfer())
 
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -76,7 +75,7 @@ func TestScanAccountHandlesMissingAccountNumber(t *testing.T) {
 	mock.ExpectQuery("SELECT").
 		WithArgs("acc-002").
 		WillReturnRows(sqlmock.NewRows(accountColumns).
-			AddRow(accountRow("acc-002", nil, "01K946KF851RK7FX075GJHBVKG", nil, now)...))
+			AddRow(accountRow("acc-002", "01K946KF851RK7FX075GJHBVKG", nil, now)...))
 
 	got, err := repo.GetByID(context.Background(), "acc-002")
 	require.NoError(t, err)
@@ -97,7 +96,7 @@ func TestGetBySingapayAccountID(t *testing.T) {
 	mock.ExpectQuery("WHERE singapay_account_id = \\$1").
 		WithArgs("01K946KF851RK7FX075GJHBVKF").
 		WillReturnRows(sqlmock.NewRows(accountColumns).
-			AddRow(accountRow("acc-001", nil, "01K946KF851RK7FX075GJHBVKF", "000000000123", now)...))
+			AddRow(accountRow("acc-001", "01K946KF851RK7FX075GJHBVKF", "000000000123", now)...))
 
 	got, err := repo.GetBySingapayAccountID(context.Background(), "01K946KF851RK7FX075GJHBVKF")
 	require.NoError(t, err)
@@ -128,17 +127,18 @@ func TestSaveWritesEmptyIdentifiersAsNull(t *testing.T) {
 	repo, mock, closeDB := newMockAccountRepo(t)
 	defer closeDB()
 
-	account := domain.NewSellerAccount("SAC-1234-5678", "seller-001", domain.CurrencyIDR)
+	// The PAYMENT_GATEWAY expense account is the real case for this: it is bookkeeping
+	// only and has no Singapay sub-account behind it.
+	account := domain.NewPaymentGatewayAccount("", "SINGAPAY", domain.CurrencyIDR)
 
 	mock.ExpectExec("INSERT INTO ledger_accounts").
 		WithArgs(
 			account.UUID,
 			account.RandId,
-			"SAC-1234-5678",
 			nil, // singapay_account_id
 			nil, // singapay_account_number
-			domain.OwnerTypeSeller,
-			"seller-001",
+			domain.OwnerTypePaymentGateway,
+			"SINGAPAY",
 			domain.CurrencyIDR,
 			int64(0), int64(0), int64(0), int64(0),
 			sqlmock.AnyArg(), sqlmock.AnyArg(),
@@ -153,14 +153,13 @@ func TestSaveWritesSingapayIdentifiers(t *testing.T) {
 	repo, mock, closeDB := newMockAccountRepo(t)
 	defer closeDB()
 
-	account := domain.NewSellerAccount("", "seller-002", domain.CurrencyIDR)
+	account := domain.NewSellerAccount("01K946KF851RK7FX075GJHBVKF", "seller-002", domain.CurrencyIDR)
 	account.SetSingapayAccount("01K946KF851RK7FX075GJHBVKF", "000000000123")
 
 	mock.ExpectExec("INSERT INTO ledger_accounts").
 		WithArgs(
 			account.UUID,
 			account.RandId,
-			nil, // doku_subaccount_id
 			"01K946KF851RK7FX075GJHBVKF",
 			"000000000123",
 			domain.OwnerTypeSeller,

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The settlement flow handles the process of DOKU settling payments to the merchant's DOKU wallet. After a customer pays, DOKU batches transactions and settles them typically within 1-2 business days. During settlement, DOKU deducts their fees, and the net amount becomes available for disbursement.
+The settlement flow handles the process of Singapay settling payments to the merchant's Singapay wallet. After a customer pays, Singapay batches transactions and settles them typically within 1-2 business days. During settlement, Singapay deducts their fees, and the net amount becomes available for disbursement.
 
 ---
 
@@ -20,7 +20,7 @@ The settlement flow handles the process of DOKU settling payments to the merchan
 
 | Status | Description |
 |--------|-------------|
-| `IN_PROGRESS` | DOKU has initiated the settlement batch, funds are being processed |
+| `IN_PROGRESS` | Singapay has initiated the settlement batch, funds are being processed |
 | `TRANSFERRED` | Settlement complete, net amount moved to available balance |
 
 ---
@@ -30,13 +30,13 @@ The settlement flow handles the process of DOKU settling payments to the merchan
 | Field | Type | Description |
 |-------|------|-------------|
 | `ledger_account_uuid` | string | Reference to the account owner |
-| `batch_number` | string | DOKU's unique batch identifier |
+| `batch_number` | string | Singapay's unique batch identifier |
 | `settlement_date` | time.Time | Scheduled settlement date |
 | `real_settlement_date` | *time.Time | Actual transfer date (filled when TRANSFERRED) |
 | `currency` | string | Currency code (e.g., "IDR") |
 | `gross_amount` | int64 | Total amount before fee deduction |
 | `net_amount` | int64 | Amount after fee deduction (what user receives) |
-| `fee_amount` | int64 | Fee deducted by DOKU (gross - net) |
+| `fee_amount` | int64 | Fee deducted by Singapay (gross - net) |
 | `bank_name` | string | Destination bank name |
 | `bank_account_number` | string | Destination bank account number |
 | `account_type` | string | "ACCOUNT" or "SUB_ACCOUNT" |
@@ -55,14 +55,14 @@ The settlement flow handles the process of DOKU settling payments to the merchan
 │                                                                                 │
 │  Step 1: Calculate gross amount (before payment link creation)                 │
 │    - Payment method: QRIS                                                       │
-│    - DOKU fee: IDR 700 (flat fee, no tax for QRIS)                             │
+│    - gateway fee: IDR 700 (flat fee, no tax for QRIS)                             │
 │    - Gross amount = 100,000 + 700 = IDR 100,700                                │
 │                                                                                 │
 │  Step 2: Customer pays IDR 100,700 (gross_amount)                              │
 │                                                                                 │
 │  Step 3: On payment confirmation, create settlement:                           │
 │    - gross_amount = 100,700 (what customer paid)                               │
-│    - fee_amount = 700 (DOKU fee)                                               │
+│    - fee_amount = 700 (gateway fee)                                               │
 │    - net_amount = 100,000 (what provider receives after settlement)            │
 │                                                                                 │
 │  Stored in LedgerSettlement:                                                    │
@@ -82,8 +82,8 @@ The settlement flow handles the process of DOKU settling payments to the merchan
 | Term | Description | When Used |
 |------|-------------|-----------|
 | **Net Amount** | Service price / what provider wants to receive | Booking creation, after settlement |
-| **Gross Amount** | What customer pays (net + DOKU fees) | Payment link, LedgerPayment.Amount, pending_balance |
-| **Fee Amount** | DOKU transaction fee + tax (gross - net) | Settlement record |
+| **Gross Amount** | What customer pays (net + gateway fees) | Payment link, LedgerPayment.Amount, pending_balance |
+| **Fee Amount** | Singapay transaction fee + tax (gross - net) | Settlement record |
 
 ---
 
@@ -91,17 +91,17 @@ The settlement flow handles the process of DOKU settling payments to the merchan
 
 ### When to Call
 
-**Important**: Settlements should be created when a payment is **confirmed** (DOKU webhook SUCCESS), NOT when the payment link is created.
+**Important**: Settlements should be created when a payment is **confirmed** (money-in webhook SUCCESS), NOT when the payment link is created.
 
 **Correct Timing:**
-- ✅ Create settlement in the DOKU notification/webhook handler after `ConfirmPayment()` succeeds
+- ✅ Create settlement in the Singapay notification/webhook handler after `ConfirmPayment()` succeeds
 - ❌ Do NOT create settlement when generating the payment link
 
 **Why?**
 1. **Customer may abandon payment**: Creating settlement at payment link creation results in orphaned records
 2. **Payment method may differ**: Customer might choose QRIS instead of VA, affecting fee calculation
 3. **Payment may expire**: Unused settlements require cleanup
-4. **Accurate fees**: The actual payment method from DOKU webhook determines the correct fee
+4. **Accurate fees**: The actual payment method from money-in webhook determines the correct fee
 
 **Trigger**: Called in the payment notification handler (webhook) when `transaction.status == "SUCCESS"`.
 
@@ -112,7 +112,7 @@ The settlement flow handles the process of DOKU settling payments to the merchan
 │                          CREATE SETTLEMENT FLOW                                  │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
-│  1. DOKU sends webhook notification (payment SUCCESS):                         │
+│  1. Singapay sends webhook notification (payment SUCCESS):                         │
 │     - transaction.status = "SUCCESS"                                           │
 │     - channel.id = actual payment method (e.g., "VIRTUAL_ACCOUNT_BCA", "QRIS") │
 │     - order.invoice_number = original invoice                                  │
@@ -124,7 +124,7 @@ The settlement flow handles the process of DOKU settling payments to the merchan
 │     - Adds amount to pending_balance and income_accumulation                  │
 │                                                                                 │
 │  3. Calculate settlement fee using actual payment method:                      │
-│     - Calls DokuSettlementUseCase.CalculateSettlementFee(paymentMethod, amount)│
+│     - Calls SingapaySettlementUseCase.CalculateSettlementFee(paymentMethod, amount)│
 │     - Returns: grossAmount, netAmount, transactionFee, tax                    │
 │                                                                                 │
 │  4. Create LedgerSettlement record:                                            │
@@ -132,11 +132,11 @@ The settlement flow handles the process of DOKU settling payments to the merchan
 │     - batch_number = invoice_number (for idempotency)                          │
 │     - settlement_date = estimated (next business day)                          │
 │     - gross_amount = customer paid amount                                       │
-│     - net_amount = amount after DOKU fees                                       │
+│     - net_amount = amount after gateway fees                                       │
 │     - fee_amount = gross_amount - net_amount                                   │
 │                                                                                 │
 │  Note: Wallet pending_balance is already updated in step 2.                    │
-│        When DOKU actually settles, reconciliation moves to TRANSFERRED.        │
+│        When Singapay actually settles, reconciliation moves to TRANSFERRED.        │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -144,14 +144,14 @@ The settlement flow handles the process of DOKU settling payments to the merchan
 ### Integration Example (Webhook Handler)
 
 ```go
-func (h *webhookHandler) processSuccessfulPayment(notification *DokuNotification) error {
+func (h *webhookHandler) processSuccessfulPayment(notification *SingapayNotification) error {
     tx, err := h.db.BeginTx()
     if err != nil {
         return err
     }
     defer tx.Rollback()
     
-    // 1. Get actual payment method from DOKU notification
+    // 1. Get actual payment method from Singapay notification
     paymentMethod := notification.Channel.ID.String
     
     // 2. Confirm payment in ledger (updates wallet pending_balance)
@@ -165,7 +165,7 @@ func (h *webhookHandler) processSuccessfulPayment(notification *DokuNotification
     }
     
     // 3. Calculate fee using actual payment method
-    settlementResult, err := h.dokuSettlementUseCase.CalculateSettlementFee(
+    settlementResult, err := h.gateway.CalculateSettlementFee(
         paymentMethod,
         float64(confirmedPayment.Amount),
     )
@@ -174,7 +174,7 @@ func (h *webhookHandler) processSuccessfulPayment(notification *DokuNotification
     }
     
     // 4. Create settlement record
-    estimatedSettlementDate := time.Now().AddDate(0, 0, 1) // DOKU settles next day ~1 PM
+    estimatedSettlementDate := time.Now().AddDate(0, 0, 1) // Singapay settles next day ~1 PM
     
     _, err = h.ledgerSettlementUseCase.CreateSettlement(
         tx,
@@ -257,7 +257,7 @@ func (u *ledgerSettlementUseCase) CreateSettlement(
 ## Complete Settlement Flow (TRANSFERRED)
 
 ### When to Call
-Called when DOKU confirms the settlement has been transferred to the merchant's DOKU wallet.
+Called when Singapay confirms the settlement has been transferred to the merchant's Singapay wallet.
 
 ### Flow Diagram
 
@@ -266,8 +266,8 @@ Called when DOKU confirms the settlement has been transferred to the merchant's 
 │                       COMPLETE SETTLEMENT FLOW                                   │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
-│  1. DOKU confirms settlement is complete                                       │
-│     - Funds have been transferred to DOKU wallet                               │
+│  1. Singapay confirms settlement is complete                                       │
+│     - Funds have been transferred to Singapay wallet                               │
 │                                                                                 │
 │  2. System calls CompleteSettlement:                                           │
 │     - settlement_uuid or batch_number                                          │
@@ -372,9 +372,9 @@ func (u *ledgerSettlementUseCase) CompleteSettlement(
 ### Implementation Logic
 
 ```go
-// SettlePendingBalance moves funds from pending to available when DOKU settles
+// SettlePendingBalance moves funds from pending to available when Singapay settles
 // pendingAmount: the gross amount to deduct from pending_balance
-// netAmount: the net amount after fees (now available in DOKU wallet for disbursement)
+// netAmount: the net amount after fees (now available in Singapay wallet for disbursement)
 func (u *ledgerWalletUseCase) SettlePendingBalance(
     sqlTransaction *sqlx.Tx,
     walletUUID string,
@@ -399,7 +399,7 @@ func (u *ledgerWalletUseCase) SettlePendingBalance(
     wallet.PendingBalance -= pendingAmount
 
     // Add to available balance (net amount after fee deduction)
-    // This money is now available in DOKU wallet for disbursement via "KIRIM DOKU"
+    // This money is now available in Singapay wallet for disbursement via "KIRIM Singapay"
     wallet.Balance += netAmount
 
     err = u.ledgerWalletRepository.Update(sqlTransaction, wallet)
@@ -436,21 +436,21 @@ func (u *ledgerWalletUseCase) SettlePendingBalance(
 │                                                                                 │
 │  Day 2 (Tuesday):                                                               │
 │  ├─ 10:00 - Customer D pays IDR 40,000 → pending_balance = 140,000            │
-│  └─ 23:59 - DOKU cuts off for settlement batch                                 │
+│  └─ 23:59 - Singapay cuts off for settlement batch                                 │
 │                                                                                 │
 │  Day 3 (Wednesday):                                                             │
-│  ├─ 08:00 - DOKU creates settlement batch:                                     │
+│  ├─ 08:00 - Singapay creates settlement batch:                                     │
 │  │          - gross_amount = 140,000                                           │
 │  │          - fee (3%) = 4,200                                                 │
 │  │          - net_amount = 135,800                                             │
 │  │          - Status = IN_PROGRESS                                             │
 │  │                                                                              │
-│  └─ 15:00 - DOKU confirms transfer complete:                                   │
+│  └─ 15:00 - Singapay confirms transfer complete:                                   │
 │             - Status = TRANSFERRED                                              │
 │             - pending_balance: 140,000 → 0                                     │
 │             - balance: 0 → 135,800                                             │
 │                                                                                 │
-│  Now merchant can "KIRIM DOKU" (disburse) IDR 135,800 to their bank           │
+│  Now merchant can "KIRIM Singapay" (disburse) IDR 135,800 to their bank           │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -512,12 +512,12 @@ func (u *ledgerSettlementUseCase) GetPendingSettlements() ([]*models.LedgerSettl
 
 ### Overview
 
-DOKU settles payments daily at 1PM on weekdays, but **does not provide a webhook** for settlement completion. To detect when settlements have been processed, the system uses an **on-demand reconciliation** approach.
+Singapay settles payments daily at 1PM on weekdays, but **does not provide a webhook** for settlement completion. To detect when settlements have been processed, the system uses an **on-demand reconciliation** approach.
 
 When a user accesses their balance page, the backend:
-1. Fetches the real-time balance from DOKU's GetBalance API
-2. Compares DOKU's pending balance with our ledger's pending balance
-3. If DOKU's pending is lower, it means settlements have been processed
+1. Fetches the real-time balance from Singapay's GetBalance API
+2. Compares Singapay's pending balance with our ledger's pending balance
+3. If Singapay's pending is lower, it means settlements have been processed
 4. Updates our ledger to reflect the completed settlements
 
 ### Reconciliation Flow Diagram
@@ -531,7 +531,7 @@ When a user accesses their balance page, the backend:
 │          │                                                                      │
 │          ▼                                                                      │
 │  ┌───────────────────────────────────┐                                          │
-│  │  1. Call DOKU GetBalance API      │                                          │
+│  │  1. Call Singapay GetBalance API      │                                          │
 │  │     Returns: pending, available   │                                          │
 │  └───────────────────────────────────┘                                          │
 │          │                                                                      │
@@ -546,7 +546,7 @@ When a user accesses their balance page, the backend:
 │  ┌───────────────────────────────────┐                                          │
 │  │  3. Calculate Delta               │                                          │
 │  │     delta = ledger_pending -      │                                          │
-│  │             doku_pending          │                                          │
+│  │             gateway_pending          │                                          │
 │  └───────────────────────────────────┘                                          │
 │          │                                                                      │
 │          ├─── delta <= 0 ───▶ No reconciliation needed                          │
@@ -655,7 +655,7 @@ func (r *ledgerSettlementRepository) GetByLedgerAccountUUIDAndStatus(
 │                                                                                 │
 │  Day 1 (Monday) 10:00 AM - Payment Confirmed                                    │
 │  ─────────────────────────────────────────────                                  │
-│  DOKU Balance:                                                                  │
+│  Singapay Balance:                                                                  │
 │    pending: 100,000                                                             │
 │    available: 0                                                                 │
 │                                                                                 │
@@ -670,9 +670,9 @@ func (r *ledgerSettlementRepository) GetByLedgerAccountUUIDAndStatus(
 │                                                                                 │
 │  ═══════════════════════════════════════════════════════════════════════════    │
 │                                                                                 │
-│  Day 2 (Tuesday) 1:00 PM - DOKU Settlement (No Webhook)                         │
+│  Day 2 (Tuesday) 1:00 PM - Singapay Settlement (No Webhook)                         │
 │  ──────────────────────────────────────────────────────                         │
-│  DOKU Balance (real):                                                           │
+│  Singapay Balance (real):                                                           │
 │    pending: 0                                                                   │
 │    available: 95,560                                                            │
 │                                                                                 │
@@ -684,7 +684,7 @@ func (r *ledgerSettlementRepository) GetByLedgerAccountUUIDAndStatus(
 │                                                                                 │
 │  Day 2 (Tuesday) 3:00 PM - User Visits Balance Page                             │
 │  ───────────────────────────────────────────────────                            │
-│  1. Backend calls DOKU GetBalance API                                           │
+│  1. Backend calls Singapay GetBalance API                                           │
 │     → pending: 0, available: 95,560                                             │
 │                                                                                 │
 │  2. Compare with Ledger:                                                        │
@@ -709,10 +709,10 @@ func (r *ledgerSettlementRepository) GetByLedgerAccountUUIDAndStatus(
 
 | Scenario | Handling |
 |----------|----------|
-| DOKU API is down | Return cached ledger balance, log warning |
+| Singapay API is down | Return cached ledger balance, log warning |
 | Multiple settlements same day | Process FIFO until delta is satisfied |
 | Delta exceeds available settlements | Process all available, log discrepancy |
-| DOKU pending > Ledger pending | Log data integrity warning, no action |
+| Singapay pending > Ledger pending | Log data integrity warning, no action |
 | Concurrent balance requests | Database transaction ensures consistency |
 
 ### Important Notes
@@ -720,4 +720,4 @@ func (r *ledgerSettlementRepository) GetByLedgerAccountUUIDAndStatus(
 1. **FIFO Order**: Settlements are processed oldest-first based on `created_at`
 2. **Idempotency**: Only IN_PROGRESS settlements are processed; TRANSFERRED ones are skipped
 3. **Atomic Updates**: Settlement status and wallet balance are updated in a single transaction
-4. **Graceful Degradation**: If DOKU API fails, users still see cached ledger balance
+4. **Graceful Degradation**: If Singapay API fails, users still see cached ledger balance

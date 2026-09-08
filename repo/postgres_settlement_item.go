@@ -20,9 +20,10 @@ func NewPostgresSettlementItemRepository(db DBTX) *PostgresSettlementItemReposit
 func (r *PostgresSettlementItemRepository) GetByID(ctx context.Context, id string) (*domain.SettlementItem, error) {
 	query := `
 		SELECT uuid, randid, settlement_batch_uuid, product_transaction_uuid, seller_account_id,
-		       invoice_number, sub_account, transaction_amount, pay_to_merchant,
-		       allocated_fee, is_matched, expected_net_amount, amount_discrepancy,
-		       csv_row_number, raw_csv_data, created_at, updated_at
+		       invoice_number, gateway_account_id, gateway_transaction_id, payment_channel,
+		       transaction_amount, pay_to_merchant, allocated_fee, fee_reported,
+		       is_matched, expected_net_amount, amount_discrepancy,
+		       raw_gateway_data, created_at, updated_at
 		FROM settlement_items
 		WHERE uuid = $1
 	`
@@ -34,12 +35,13 @@ func (r *PostgresSettlementItemRepository) GetByID(ctx context.Context, id strin
 func (r *PostgresSettlementItemRepository) GetBySettlementBatchID(ctx context.Context, batchID string) ([]*domain.SettlementItem, error) {
 	query := `
 		SELECT uuid, randid, settlement_batch_uuid, product_transaction_uuid, seller_account_id,
-		       invoice_number, sub_account, transaction_amount, pay_to_merchant,
-		       allocated_fee, is_matched, expected_net_amount, amount_discrepancy,
-		       csv_row_number, raw_csv_data, created_at, updated_at
+		       invoice_number, gateway_account_id, gateway_transaction_id, payment_channel,
+		       transaction_amount, pay_to_merchant, allocated_fee, fee_reported,
+		       is_matched, expected_net_amount, amount_discrepancy,
+		       raw_gateway_data, created_at, updated_at
 		FROM settlement_items
 		WHERE settlement_batch_uuid = $1
-		ORDER BY csv_row_number ASC
+		ORDER BY created_at ASC
 	`
 
 	rows, err := r.db.QueryContext(ctx, query, batchID)
@@ -54,9 +56,10 @@ func (r *PostgresSettlementItemRepository) GetBySettlementBatchID(ctx context.Co
 func (r *PostgresSettlementItemRepository) GetByProductTransactionID(ctx context.Context, productTxID string) ([]*domain.SettlementItem, error) {
 	query := `
 		SELECT uuid, randid, settlement_batch_uuid, product_transaction_uuid, seller_account_id,
-		       invoice_number, sub_account, transaction_amount, pay_to_merchant,
-		       allocated_fee, is_matched, expected_net_amount, amount_discrepancy,
-		       csv_row_number, raw_csv_data, created_at, updated_at
+		       invoice_number, gateway_account_id, gateway_transaction_id, payment_channel,
+		       transaction_amount, pay_to_merchant, allocated_fee, fee_reported,
+		       is_matched, expected_net_amount, amount_discrepancy,
+		       raw_gateway_data, created_at, updated_at
 		FROM settlement_items
 		WHERE product_transaction_uuid = $1
 		ORDER BY created_at DESC
@@ -74,12 +77,13 @@ func (r *PostgresSettlementItemRepository) GetByProductTransactionID(ctx context
 func (r *PostgresSettlementItemRepository) GetUnmatchedByBatchID(ctx context.Context, batchID string) ([]*domain.SettlementItem, error) {
 	query := `
 		SELECT uuid, randid, settlement_batch_uuid, product_transaction_uuid, seller_account_id,
-		       invoice_number, sub_account, transaction_amount, pay_to_merchant,
-		       allocated_fee, is_matched, expected_net_amount, amount_discrepancy,
-		       csv_row_number, raw_csv_data, created_at, updated_at
+		       invoice_number, gateway_account_id, gateway_transaction_id, payment_channel,
+		       transaction_amount, pay_to_merchant, allocated_fee, fee_reported,
+		       is_matched, expected_net_amount, amount_discrepancy,
+		       raw_gateway_data, created_at, updated_at
 		FROM settlement_items
 		WHERE settlement_batch_uuid = $1 AND is_matched = false
-		ORDER BY csv_row_number ASC
+		ORDER BY created_at ASC
 	`
 
 	rows, err := r.db.QueryContext(ctx, query, batchID)
@@ -92,18 +96,19 @@ func (r *PostgresSettlementItemRepository) GetUnmatchedByBatchID(ctx context.Con
 }
 
 func (r *PostgresSettlementItemRepository) Save(ctx context.Context, item *domain.SettlementItem) error {
-	rawCSVDataJSON, err := json.Marshal(item.RawCSVData)
+	rawGatewayDataJSON, err := json.Marshal(item.RawGatewayData)
 	if err != nil {
-		rawCSVDataJSON = []byte("{}")
+		rawGatewayDataJSON = []byte("{}")
 	}
 
 	query := `
 		INSERT INTO settlement_items (
 			uuid, randid, settlement_batch_uuid, product_transaction_uuid, seller_account_id,
-			invoice_number, sub_account, transaction_amount, pay_to_merchant,
-			allocated_fee, is_matched, expected_net_amount, amount_discrepancy,
-			csv_row_number, raw_csv_data, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+			invoice_number, gateway_account_id, gateway_transaction_id, payment_channel,
+			transaction_amount, pay_to_merchant, allocated_fee, fee_reported,
+			is_matched, expected_net_amount, amount_discrepancy,
+			raw_gateway_data, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		ON CONFLICT (uuid) DO UPDATE SET
 			product_transaction_uuid = EXCLUDED.product_transaction_uuid,
 			seller_account_id = EXCLUDED.seller_account_id,
@@ -130,15 +135,17 @@ func (r *PostgresSettlementItemRepository) Save(ctx context.Context, item *domai
 		productTxID,
 		sellerAccountID,
 		item.InvoiceNumber,
-		item.SubAccount,
+		item.GatewayAccountID,
+		item.GatewayTransactionID,
+		item.PaymentChannel,
 		item.TransactionAmount,
 		item.PayToMerchant,
 		item.AllocatedFee,
+		item.FeeReported,
 		item.IsMatched,
 		item.ExpectedNetAmount,
 		item.AmountDiscrepancy,
-		item.CSVRowNumber,
-		rawCSVDataJSON,
+		rawGatewayDataJSON,
 		item.CreatedAt,
 		item.UpdatedAt,
 	)
@@ -164,8 +171,10 @@ func (r *PostgresSettlementItemRepository) scanSettlementItem(row *sql.Row) (*do
 	var productTxID sql.NullString
 	var sellerAccountID sql.NullString
 	var invoiceNumber sql.NullString
-	var subAccount sql.NullString
-	var rawCSVDataJSON []byte
+	var gatewayAccountID sql.NullString
+	var gatewayTransactionID sql.NullString
+	var paymentChannel sql.NullString
+	var rawGatewayDataJSON []byte
 
 	err := row.Scan(
 		&item.UUID,
@@ -174,15 +183,17 @@ func (r *PostgresSettlementItemRepository) scanSettlementItem(row *sql.Row) (*do
 		&productTxID,
 		&sellerAccountID,
 		&invoiceNumber,
-		&subAccount,
+		&gatewayAccountID,
+		&gatewayTransactionID,
+		&paymentChannel,
 		&item.TransactionAmount,
 		&item.PayToMerchant,
 		&item.AllocatedFee,
+		&item.FeeReported,
 		&item.IsMatched,
 		&item.ExpectedNetAmount,
 		&item.AmountDiscrepancy,
-		&item.CSVRowNumber,
-		&rawCSVDataJSON,
+		&rawGatewayDataJSON,
 		&item.CreatedAt,
 		&item.UpdatedAt,
 	)
@@ -202,13 +213,19 @@ func (r *PostgresSettlementItemRepository) scanSettlementItem(row *sql.Row) (*do
 	if invoiceNumber.Valid {
 		item.InvoiceNumber = invoiceNumber.String
 	}
-	if subAccount.Valid {
-		item.SubAccount = subAccount.String
+	if gatewayAccountID.Valid {
+		item.GatewayAccountID = gatewayAccountID.String
+	}
+	if gatewayTransactionID.Valid {
+		item.GatewayTransactionID = gatewayTransactionID.String
+	}
+	if paymentChannel.Valid {
+		item.PaymentChannel = paymentChannel.String
 	}
 
-	item.RawCSVData = make(map[string]string)
-	if len(rawCSVDataJSON) > 0 {
-		_ = json.Unmarshal(rawCSVDataJSON, &item.RawCSVData)
+	item.RawGatewayData = make(map[string]string)
+	if len(rawGatewayDataJSON) > 0 {
+		_ = json.Unmarshal(rawGatewayDataJSON, &item.RawGatewayData)
 	}
 
 	return &item, nil
@@ -223,8 +240,10 @@ func (r *PostgresSettlementItemRepository) scanSettlementItems(rows *sql.Rows) (
 		var productTxID sql.NullString
 		var sellerAccountID sql.NullString
 		var invoiceNumber sql.NullString
-		var subAccount sql.NullString
-		var rawCSVDataJSON []byte
+		var gatewayAccountID sql.NullString
+		var gatewayTransactionID sql.NullString
+		var paymentChannel sql.NullString
+		var rawGatewayDataJSON []byte
 
 		err := rows.Scan(
 			&item.UUID,
@@ -233,15 +252,17 @@ func (r *PostgresSettlementItemRepository) scanSettlementItems(rows *sql.Rows) (
 			&productTxID,
 			&sellerAccountID,
 			&invoiceNumber,
-			&subAccount,
+			&gatewayAccountID,
+			&gatewayTransactionID,
+			&paymentChannel,
 			&item.TransactionAmount,
 			&item.PayToMerchant,
 			&item.AllocatedFee,
+			&item.FeeReported,
 			&item.IsMatched,
 			&item.ExpectedNetAmount,
 			&item.AmountDiscrepancy,
-			&item.CSVRowNumber,
-			&rawCSVDataJSON,
+			&rawGatewayDataJSON,
 			&item.CreatedAt,
 			&item.UpdatedAt,
 		)
@@ -258,13 +279,19 @@ func (r *PostgresSettlementItemRepository) scanSettlementItems(rows *sql.Rows) (
 		if invoiceNumber.Valid {
 			item.InvoiceNumber = invoiceNumber.String
 		}
-		if subAccount.Valid {
-			item.SubAccount = subAccount.String
+		if gatewayAccountID.Valid {
+			item.GatewayAccountID = gatewayAccountID.String
+		}
+		if gatewayTransactionID.Valid {
+			item.GatewayTransactionID = gatewayTransactionID.String
+		}
+		if paymentChannel.Valid {
+			item.PaymentChannel = paymentChannel.String
 		}
 
-		item.RawCSVData = make(map[string]string)
-		if len(rawCSVDataJSON) > 0 {
-			_ = json.Unmarshal(rawCSVDataJSON, &item.RawCSVData)
+		item.RawGatewayData = make(map[string]string)
+		if len(rawGatewayDataJSON) > 0 {
+			_ = json.Unmarshal(rawGatewayDataJSON, &item.RawGatewayData)
 		}
 
 		items = append(items, &item)

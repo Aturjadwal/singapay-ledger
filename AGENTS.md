@@ -7,8 +7,8 @@ This is a **Domain-Driven Design (DDD) Ledger System** for the Fotafoto photogra
 - **Wallet balances** (pending and available)
 - **Product sales** (photographers selling photos)
 - **Disbursements** (withdrawals to bank accounts)
-- **Balance reconciliation** with DOKU payment gateway
-- **Fee management** (platform fees + DOKU payment gateway fees)
+- **Balance reconciliation** with Singapay payment gateway
+- **Fee management** (platform fees + Singapay payment gateway fees)
 - **Discrepancy detection** with safety gates
 
 ## Architecture
@@ -34,7 +34,7 @@ This project uses **two coexisting architectural patterns**:
 
 - **Aggregate Roots**: Ledger, ProductTransaction, LedgerTransaction, Disbursement
 - **Repository Pattern**: Separate data access from domain logic
-- **Anti-Corruption Layer**: DOKU client translates between external API and domain model
+- **Anti-Corruption Layer**: Singapay client translates between external API and domain model
 - **Manual Reconciliation**: Balance updates via explicit CSV upload by admin
 - **CQRS-lite**: Separate aggregates for commands (Ledger) and queries (Transactions)
 - **Domain Error Handling**: Uses `ledgererr.AppError` pattern
@@ -44,7 +44,7 @@ This project uses **two coexisting architectural patterns**:
       - `CodeInternal` (500): Internal server errors
       - `CodeNotFound` (404): Resource not found
       - `CodeDatabaseError` (500001): Database operation failed
-      - `CodeDokuAPIError` (500002): DOKU payment gateway error
+      - `CodeGatewayAPIError` (500002): Singapay payment gateway error
       - `CodeSubaccountAlreadyExists` (409001): Duplicate subaccount
     - **All domain errors are defined in `ledgererr/error.go`**:
       - **Ledger**: `ErrLedgerNotFound` (404001), `ErrLedgerAlreadyExists` (409002), `ErrReconciliationDiscrepancyFound` (409003)
@@ -82,22 +82,22 @@ This project uses **two coexisting architectural patterns**:
 
 **State**:
 
-- `PendingBalance`: Money received but not yet settled by DOKU (actual from DOKU)
-- `AvailableBalance`: Money that can be withdrawn (actual from DOKU)
+- `PendingBalance`: Money received but not yet settled by Singapay (actual from Singapay)
+- `AvailableBalance`: Money that can be withdrawn (actual from Singapay)
 - `ExpectedPendingBalance`: What we calculate based on our transactions
 - `ExpectedAvailableBalance`: What we calculate based on our transactions
-- `LastSyncedAt`: Timestamp of last DOKU sync
+- `LastSyncedAt`: Timestamp of last Singapay sync
 
 **Key Methods**:
 
 - `AddPendingBalance(amount Money)`: Credit pending balance (increments ONLY expected_pending, not actual)
 - `DebitAvailableBalance(amount Money)`: Debit available balance (decrements BOTH expected_available AND actual_available)
-- `AddAvailableBalance(amount Money)`: Rollback available balance (increments both, used on DOKU failure)
-- `SyncWithDoku(actualPending, actualAvailable Money)`: Update actual balances from DOKU and reset expected balances
+- `AddAvailableBalance(amount Money)`: Rollback available balance (increments both, used on Singapay failure)
+- `SyncWithSingapay(actualPending, actualAvailable Money)`: Update actual balances from Singapay and reset expected balances
 - `GetSafeDisbursableBalance()`: Returns MIN(expected_available, actual_available) for safe withdrawals
 - `HasDiscrepancy()`: Check if expected and actual balances differ
 - `GetDiscrepancyDetails()`: Returns detailed discrepancy information
-- `NeedsSyncWithDoku()`: Check if sync needed (before 2 PM Jakarta time or >24h stale)
+- `NeedsSyncWithSingapay()`: Check if sync needed (before 2 PM Jakarta time or >24h stale)
 - `GetExpectedDiff()`: Returns difference between expected and actual (for monitoring)
 
 #### 2. ProductTransaction
@@ -110,7 +110,7 @@ This project uses **two coexisting architectural patterns**:
 
 **Responsibilities**:
 
-- Track fee breakdown (seller price, platform fee, DOKU fee)
+- Track fee breakdown (seller price, platform fee, gateway fee)
 - Calculate seller payout (full seller price - no deductions!)
 - Track payment channel and gateway transaction ID
 
@@ -120,29 +120,29 @@ This project uses **two coexisting architectural patterns**:
 Seller sets price: 10,000 IDR
 Platform fee (markup): 1,000 IDR
 Base amount: 11,000 IDR (seller + platform)
-DOKU fee (2.2% QRIS): 247 IDR (reverse calculated)
+gateway fee (2.2% QRIS): 247 IDR (reverse calculated)
 Total charged to buyer: 11,247 IDR
 
 Photographer gets: 10,000 IDR (full amount!)
 Platform gets: 1,000 IDR
-DOKU gets: 247 IDR
+Singapay gets: 247 IDR
 ```
 
-**DOKU Fee Reverse Calculation** (Important!):
+**Gateway fee Reverse Calculation** (Important!):
 
-DOKU charges percentage on the total amount they receive, not the base amount.
+Singapay charges percentage on the total amount they receive, not the base amount.
 To ensure seller+platform receive exact amounts, we reverse calculate:
 
 ```
 Formula: total_charged = base_amount / (1 - percentage/100)
-         doku_fee = total_charged - base_amount
+         gateway_fee = total_charged - base_amount
 
 Example with 2.2% QRIS:
   base_amount = 11,000 IDR
   total_charged = 11,000 / (1 - 0.022) = 11,000 / 0.978 = 11,247 IDR
-  doku_fee = 11,247 - 11,000 = 247 IDR
+  gateway_fee = 11,247 - 11,000 = 247 IDR
 
-Verification: DOKU takes 2.2% of 11,247 = 247 IDR → leaves 11,000 ✓
+Verification: Singapay takes 2.2% of 11,247 = 247 IDR → leaves 11,000 ✓
 ```
 
 #### 3. LedgerTransaction
@@ -155,8 +155,8 @@ Verification: DOKU takes 2.2% of 11,247 = 247 IDR → leaves 11,000 ✓
 
 - `CREDIT`: Money added to ledger
 - `DEBIT`: Money removed from ledger
-- `SETTLEMENT`: DOKU settled pending funds to available
-- `FEE`: DOKU settlement fees
+- `SETTLEMENT`: Singapay settled pending funds to available
+- `FEE`: Singapay settlement fees
 - `ADJUSTMENT`: Reconciliation adjustments
 
 **References**: Links to ProductTransaction or Disbursement via `ReferenceType` + `ReferenceID`
@@ -181,12 +181,12 @@ PENDING → PROCESSING → COMPLETED
 
 **Location**: `domain/reconciliation_log.go`
 
-**Purpose**: Audit trail of balance syncs with DOKU
+**Purpose**: Audit trail of balance syncs with Singapay
 
 **Captures**:
 
 - Previous state (pending/available before sync)
-- Current state (pending/available from DOKU)
+- Current state (pending/available from Singapay)
 - Detected changes (diffs)
 - Settlement detection (pattern matching)
 
@@ -212,7 +212,7 @@ PENDING → PROCESSING → COMPLETED
 - **Money**: Amount (int64 in smallest currency unit) + Currency
 - **Currency**: IDR, USD
 - **BankAccountInfo**: BankCode, AccountNumber, AccountName
-- **FeeBreakdown**: SellerPrice, PlatformFee, DokuFee, TotalCharged
+- **FeeBreakdown**: SellerPrice, PlatformFee, GatewayFee, TotalCharged
 - **ProductMetadata**: PhotoTitle, PhotoResolution, LicenseType, DownloadURL, PaymentGatewayID
 
 ## Critical Business Rules
@@ -221,7 +221,7 @@ PENDING → PROCESSING → COMPLETED
 
 **Problem**: How to charge fees without deducting from photographer?
 
-**Solution**: Markup model - buyer pays seller price + platform fee + DOKU fee
+**Solution**: Markup model - buyer pays seller price + platform fee + gateway fee
 
 **Example**:
 
@@ -229,23 +229,23 @@ PENDING → PROCESSING → COMPLETED
 Seller price: 10,000 IDR
 Platform fee: 1,000 IDR (10% or fixed amount)
 Base amount: 11,000 IDR
-DOKU fee: 247 IDR (2.2% QRIS, reverse calculated) OR 4,500 IDR (flat for VA)
+gateway fee: 247 IDR (2.2% QRIS, reverse calculated) OR 4,500 IDR (flat for VA)
 
 Buyer pays: 11,247 IDR (QRIS) or 15,500 IDR (VA)
 Seller receives: 10,000 IDR (100% of their price!)
 Platform earns: 1,000 IDR
-DOKU earns: 247 IDR (QRIS) or 4,500 IDR (VA)
+Singapay earns: 247 IDR (QRIS) or 4,500 IDR (VA)
 ```
 
-**Note**: DOKU percentage fees use reverse calculation to ensure seller+platform get exact amounts.
+**Note**: Singapay percentage fees use reverse calculation to ensure seller+platform get exact amounts.
 
 **Configuration**: Fees stored in database (`fee_configs` table), can be updated per payment channel
 
 ### 2. Balance Reconciliation via Settlement CSV
 
-**Problem**: Need to reconcile our transaction records with DOKU's settlement reports
+**Problem**: Need to reconcile our transaction records with Singapay's settlement reports
 
-**Solution**: Admin uploads DOKU settlement CSV via API endpoint, system processes and updates all balances
+**Solution**: Admin uploads Singapay settlement via API endpoint, system processes and updates all balances
 
 **Ledger Fields**:
 
@@ -254,24 +254,24 @@ DOKU earns: 247 IDR (QRIS) or 4,500 IDR (VA)
 - `expected_pending_balance`: What we calculate based on our transactions
 - `expected_available_balance`: What we calculate based on our transactions
 
-**DOKU Settlement Report Format**:
+**Singapay Settlement Report Format**:
 
 ```csv
 No,MERCHANT NAME,PAYMENT CHANNEL NAME,TRANSACTION DATE,INVOICE NUMBER,CUSTOMER NAME,REPORT CODE,AMOUNT,RECON CODE,FEE,DISCOUNT,PAY TO MERCHANT,PAY OUT DATE,TRANSACTION TYPE,PROMO CODE
-1,Mandiri DW,QRIS,08-10-2024,INV_TEST_042,QRIS DOKU,,90000000,,4500,0,20000,08-10-2024,Purchase,
+1,Mandiri DW,QRIS,08-10-2024,INV_TEST_042,QRIS Singapay,,90000000,,4500,0,20000,08-10-2024,Purchase,
 ```
 
 **Key Fields**:
 
 - **INVOICE NUMBER**: Maps to our `product_transactions.id` or external reference
-- **PAY TO MERCHANT**: Net amount seller receives (after DOKU fees)
-- **FEE**: DOKU payment gateway fee
+- **PAY TO MERCHANT**: Net amount seller receives (after gateway fees)
+- **FEE**: Singapay payment gateway fee
 - **PAY OUT DATE**: When funds settled to available balance
 
 **Reconciliation Flow**:
 
 ```
-1. Admin downloads settlement CSV from DOKU portal
+1. Admin downloads Singapay settlement portal
    ↓
 2. Admin uploads CSV via POST /api/v1/ledger/reconciliation
    ↓
@@ -285,13 +285,13 @@ No,MERCHANT NAME,PAYMENT CHANNEL NAME,TRANSACTION DATE,INVOICE NUMBER,CUSTOMER N
    ├─ Sum all (seller_price + platform_fee) from SETTLED transactions
    └─ This is what WE think should be available
    ↓
-7. Get actual_available_balance from DOKU GetBalance API:
-   ├─ DOKU returns: total_charged - doku_fee
+7. Get actual_available_balance from Singapay GetBalance API:
+   ├─ Singapay returns: total_charged - gateway_fee
    └─ Which equals: seller_price + platform_fee
    ↓
 8. Update ledger with BOTH values:
    ├─ expected_available_balance = our calculation
-   ├─ actual_available_balance = DOKU's truth
+   ├─ actual_available_balance = Singapay's truth
    └─ last_synced_at = NOW()
    ↓
 9. Compare and detect discrepancies:
@@ -314,24 +314,24 @@ No,MERCHANT NAME,PAYMENT CHANNEL NAME,TRANSACTION DATE,INVOICE NUMBER,CUSTOMER N
 - **CSV matching via INVOICE NUMBER**: Match product_transactions.invoice_number to CSV INVOICE NUMBER field
 - **Dual balance calculation**:
   - `expected_available`: Sum(seller_price + platform_fee) from our SETTLED transactions
-  - `actual_available`: DOKU GetBalance API response (equals total_charged - doku_fee)
+  - `actual_available`: Singapay GetBalance API response (equals total_charged - gateway_fee)
   - Both should be the same: seller_price + platform_fee
 - **Discrepancy detection**: If expected ≠ actual, create ReconciliationDiscrepancy
 - **Safe balance**: MIN(expected, actual) prevents overdrafts even with discrepancies
 - **Platform fee payout**: Automatic transfer to main SAC after reconciliation
 
-### 3. DOKU Balance Model
+### 3. Singapay Balance Model
 
-DOKU enforces a two-tier balance system:
+Singapay enforces a two-tier balance system:
 
 - **Pending Balance**: Funds received but not yet settled (typically 1-7 days)
 - **Available Balance**: Funds that can be disbursed
 
-Our ledger **mirrors this model** to maintain consistency with DOKU's actual state.
+Our ledger **mirrors this model** to maintain consistency with Singapay's actual state.
 
 ### 4. Settlement Transaction Matching
 
-**Problem**: DOKU settlement CSV lists transactions but we need to match them to our records
+**Problem**: Singapay settlement lists transactions but we need to match them to our records
 
 **Solution**: Match by INVOICE NUMBER field in CSV to our product_transactions.invoice_number
 
@@ -348,13 +348,13 @@ Our ledger **mirrors this model** to maintain consistency with DOKU's actual sta
 2. Find ProductTransaction by invoice_number
 3. Update transaction status: COMPLETED → SETTLED
 4. Record PAY TO MERCHANT amount (photographer's net)
-5. Record FEE amount (DOKU's cut)
+5. Record FEE amount (Singapay's cut)
 6. Link to settlement_batch_id
 7. Update settled_at timestamp
 8. Update ledger balances:
    - expected_available_balance = Sum(seller_price + platform_fee WHERE status='SETTLED')
-   - actual_available_balance = DOKU.GetBalance().available_balance
-   - Note: Both should equal (total_charged - doku_fee)
+   - actual_available_balance = Singapay.GetBalance().available_balance
+   - Note: Both should equal (total_charged - gateway_fee)
    - IF expected != actual THEN create ReconciliationDiscrepancy
 9. Update LedgerTransaction status: PENDING → COMPLETED
 ```
@@ -364,16 +364,16 @@ Our ledger **mirrors this model** to maintain consistency with DOKU's actual sta
 - **Unmatched CSV entries**: Log as "unknown settlement" for investigation
 - **Missing transactions**: Transactions not in CSV remain PENDING
 - **Duplicate invoice numbers**: Flag as error, requires manual resolution
-- **Amount mismatch**: Log discrepancy but proceed with CSV amount (DOKU is authoritative)
+- **Amount mismatch**: Log discrepancy but proceed with CSV amount (Singapay is authoritative)
 
 ### 5. Payment Flow
 
 ```
 1. Buyer purchases product
    ↓
-2. Calculate fees (seller price + platform fee + DOKU fee)
+2. Calculate fees (seller price + platform fee + gateway fee)
    ↓
-3. Charge buyer the TOTAL amount via DOKU
+3. Charge buyer the TOTAL amount via Singapay
    ↓
 4. Create ProductTransaction (PENDING) with invoice_number
    ↓
@@ -381,9 +381,9 @@ Our ledger **mirrors this model** to maintain consistency with DOKU's actual sta
    ↓
 6. Return payment URL to user
    ↓
-   [User pays via DOKU]
+   [User pays via Singapay]
    ↓
-7. DOKU webhook received
+7. money-in webhook received
    ↓
 8. Update ProductTransaction status: PENDING → COMPLETED
    ↓
@@ -393,22 +393,22 @@ Our ledger **mirrors this model** to maintain consistency with DOKU's actual sta
    ↓
 11. Store platform_fee in product_transaction for later payout
    ↓
-   [Days later: Admin uploads DOKU settlement CSV]
+   [Days later: Admin uploads Singapay settlement]
    ↓
 12. Reconciliation endpoint processes CSV
     ↓
-13. Match transaction by INVOICE NUMBER (invoice_number = DOKU CSV INVOICE NUMBER)
+13. Match transaction by INVOICE NUMBER (invoice_number = Singapay CSV INVOICE NUMBER)
     ↓
 14. Update ProductTransaction status: COMPLETED → SETTLED
     ↓
 15. Calculate and verify ledger balances:
     ├─ expected_available_balance = Sum(seller_price + platform_fee) from settled txs
-    ├─ actual_available_balance = DOKU GetBalance API (total_charged - doku_fee)
+    ├─ actual_available_balance = Singapay GetBalance API (total_charged - gateway_fee)
     └─ If expected != actual → Create ReconciliationDiscrepancy
     ↓
 16. Update LedgerTransaction status: PENDING → COMPLETED
     ↓
-17. Verify with DOKU GetBalance API
+17. Verify with Singapay GetBalance API
     ↓
 18. Payout accumulated platform fees to main SAC
 ```
@@ -417,10 +417,10 @@ Our ledger **mirrors this model** to maintain consistency with DOKU's actual sta
 
 - **NO balances updated** during payment completion (Step 2)
 - **Both expected_available and actual_available updated** during reconciliation (Step 3)
-- **DOKU settlement CSV is source of truth** for all balance updates
+- **Singapay settlement is source of truth** for all balance updates
 - **Platform fees accumulate** and payout after reconciliation
 - **LedgerTransaction created as PENDING** during payment, marked COMPLETED during reconciliation
-- **invoice_number generated immediately** when transaction created (not from DOKU CSV)
+- **invoice_number generated immediately** when transaction created (not from Singapay CSV)
 
 ### 6. Disbursement Flow (with Safe Balance)
 
@@ -441,7 +441,7 @@ Our ledger **mirrors this model** to maintain consistency with DOKU's actual sta
    ↓
 8. Save ledger and disbursement in transaction
    ↓
-9. Call DOKU disbursement API
+9. Call Singapay disbursement API
    ↓
    ├─ SUCCESS → Mark as PROCESSING
    │              Actual_available will update on next reconciliation
@@ -455,7 +455,7 @@ Our ledger **mirrors this model** to maintain consistency with DOKU's actual sta
 
 1. **Safe Balance**: MIN(expected, actual) prevents overdrafts
 2. **Non-blocking Discrepancies**: Users can withdraw up to safe amount
-3. **Automatic Rollback**: On DOKU failure, restore expected balance
+3. **Automatic Rollback**: On Singapay failure, restore expected balance
 4. **Staleness Monitoring**: Warn if balance not reconciled >24h
 
 ### 7. Balance Update Strategy
@@ -467,22 +467,22 @@ Our ledger **mirrors this model** to maintain consistency with DOKU's actual sta
 | **Payment (Product Sale)** | ❌ Leave unchanged                  | ❌ Leave unchanged     | Wait for CSV reconciliation             |
 | **Disbursement (Success)** | ✅ Debit immediately                | ❌ Leave unchanged     | Waits for CSV reconciliation to confirm |
 | **Disbursement (Failed)**  | ✅ Rollback                         | ❌ Leave unchanged     | Restore expected balance only           |
-| **CSV Reconciliation**     | ✅ Sum(seller_price + platform_fee) | ✅ DOKU GetBalance API | Two sources compared for discrepancy    |
+| **CSV Reconciliation**     | ✅ Sum(seller_price + platform_fee) | ✅ Singapay GetBalance API | Two sources compared for discrepancy    |
 
 **Why NOT Update Actual During Operations?**
 
-- **Single Source of Truth**: Only DOKU settlement CSV updates actual balances
+- **Single Source of Truth**: Only Singapay settlement updates actual balances
 - **Simpler Rollback**: On failure, rollback expected only (actual never changed)
-- **Clear Semantics**: actual = "from DOKU CSV", expected = "from our transactions"
+- **Clear Semantics**: actual = "from Singapay CSV", expected = "from our transactions"
 - **Reconciliation Resets**: Reconciliation makes expected = actual (fresh start)
 
 **Balance Semantics**:
 
 ```
-actual_available = "From DOKU GetBalance API" (authoritative, what DOKU says)
+actual_available = "From Singapay GetBalance API" (authoritative, what Singapay says)
 
 Sources that update actual_available:
-1. ✅ CSV reconciliation (calls DOKU GetBalance API)
+1. ✅ CSV reconciliation (calls Singapay GetBalance API)
 2. ❌ Disbursements do NOT update actual (waits for next reconciliation)
 3. ❌ Nothing else touches actual!
 
@@ -491,12 +491,12 @@ expected_available = "What we calculate from our transactions"
 Sources that update expected_available:
 1. ✅ CSV reconciliation (Sum of [seller_price + platform_fee] from settled transactions)
 2. ✅ Disbursements (debit immediately when requested)
-3. ✅ Disbursement rollback (credit back on DOKU failure)
+3. ✅ Disbursement rollback (credit back on Singapay failure)
 4. ❌ NOT updated during payments!
 
 Discrepancy Detection:
 - After reconciliation: Compare expected vs actual
-- Formula: expected = Sum(seller_price + platform_fee), actual = DOKU API (total_charged - doku_fee)
+- Formula: expected = Sum(seller_price + platform_fee), actual = Singapay API (total_charged - gateway_fee)
 - Both should equal: seller_price + platform_fee
 - If expected != actual → Create ReconciliationDiscrepancy record
 - Alert finance team for investigation
@@ -505,13 +505,13 @@ Discrepancy Detection:
 
 ### 8. Transaction Settlement Tracking (FIFO)
 
-**Problem**: DOKU only provides aggregate balance changes, not per-transaction settlement notifications
+**Problem**: Singapay only provides aggregate balance changes, not per-transaction settlement notifications
 
 **Solution**: FIFO matching algorithm to link transactions to settlements
 
 ### 8. Transaction Settlement Tracking (FIFO)
 
-**Problem**: DOKU settlement CSV lists transactions but we need to match them to our records and track settlement history
+**Problem**: Singapay settlement lists transactions but we need to match them to our records and track settlement history
 
 **Solution**: Match by INVOICE NUMBER field in CSV, with FIFO fallback
 
@@ -519,15 +519,15 @@ Discrepancy Detection:
 
 **SettlementBatch** (`domain/settlement_batch.go`):
 
-- Represents a CSV settlement upload from DOKU
-- Contains gross amount, net amount, and DOKU fees
+- Represents a CSV settlement upload from Singapay
+- Contains gross amount, net amount, and gateway fees
 - Links to multiple ProductTransactions via SettlementItems
 - Tracks upload metadata (filename, uploaded_by, processed_at)
 
 **SettlementItem** (`domain/settlement_item.go`):
 
 - Join entity between SettlementBatch and ProductTransaction
-- Contains proportionally allocated DOKU fees
+- Contains proportionally allocated gateway fees
 - Links transaction to specific CSV row
 
 **Enhanced ProductTransaction Status**:
@@ -539,7 +539,7 @@ PENDING → SETTLED → COMPLETED
 **CSV Matching Algorithm**:
 
 ```
-1. Admin uploads DOKU settlement CSV
+1. Admin uploads Singapay settlement
 2. For each row in CSV:
    a. Parse INVOICE NUMBER field
    b. Try to find ProductTransaction by:
@@ -548,9 +548,9 @@ PENDING → SETTLED → COMPLETED
    c. If not found: Use FIFO (oldest PENDING transaction)
 3. Update transaction status: PENDING → SETTLED
 4. Record PAY TO MERCHANT amount (photographer's net)
-5. Record FEE amount (DOKU's cut)
+5. Record FEE amount (Singapay's cut)
 6. Create SettlementItem linking transaction to batch
-7. Allocate DOKU fees proportionally if needed
+7. Allocate gateway fees proportionally if needed
 8. Mark with settlement_batch_id and settled_at timestamp
 ```
 
@@ -565,7 +565,7 @@ CREATE TABLE settlement_batches (
   settlement_date DATE NOT NULL,
   gross_amount BIGINT NOT NULL,
   net_amount BIGINT NOT NULL,
-  doku_fee BIGINT NOT NULL,
+  gateway_fee BIGINT NOT NULL,
   uploaded_by VARCHAR(255) NOT NULL,
   uploaded_at TIMESTAMP NOT NULL,
   processed_at TIMESTAMP,
@@ -581,7 +581,7 @@ CREATE TABLE settlement_items (
   id UUID PRIMARY KEY,
   settlement_batch_id UUID NOT NULL REFERENCES settlement_batches(id),
   product_transaction_id UUID NOT NULL REFERENCES product_transactions(id),
-  doku_transaction_id VARCHAR(255), -- INVOICE NUMBER from CSV
+  gateway_transaction_id VARCHAR(255), -- Singapay's own transaction id
   transaction_amount BIGINT NOT NULL,
   allocated_fee BIGINT NOT NULL,
   matched_strategy VARCHAR(50) NOT NULL, -- EXACT_ID, EXTERNAL_REF, FIFO
@@ -592,17 +592,17 @@ CREATE TABLE settlement_items (
 -- Add columns to product_transactions
 ALTER TABLE product_transactions ADD COLUMN settlement_batch_id UUID REFERENCES settlement_batches(id);
 ALTER TABLE product_transactions ADD COLUMN settled_at TIMESTAMP;
-ALTER TABLE product_transactions ADD COLUMN doku_transaction_id VARCHAR(255); -- INVOICE NUMBER
+ALTER TABLE product_transactions ADD COLUMN gateway_transaction_id VARCHAR(255); -- Singapay transaction id
 
 -- Indexes for fast matching
-CREATE INDEX idx_product_tx_doku_id ON product_transactions(doku_transaction_id);
+CREATE INDEX idx_product_tx_gateway_id ON product_transactions(gateway_transaction_id);
 CREATE INDEX idx_settlement_batch_date ON settlement_batches(ledger_id, settlement_date);
 ```
 
 **Benefits**:
 
 - Finance team can answer: "Which transactions were settled on Feb 15?"
-- Fee tracking: Know exact DOKU fees per transaction
+- Fee tracking: Know exact gateway fees per transaction
 - Audit trail: Complete settlement history with CSV source
 - ~95% accuracy with INVOICE NUMBER matching (good enough for business needs)
 - Unmatched transactions logged for investigation
@@ -617,7 +617,7 @@ CREATE INDEX idx_settlement_batch_date ON settlement_batches(ledger_id, settleme
 
 **1. Daily Reconciliation** (Recommended):
 
-- Admin downloads settlement CSV from DOKU portal after 2 PM Jakarta time
+- Admin downloads Singapay settlement portal after 2 PM Jakarta time
 - Uploads to `/api/v1/ledger/reconciliation` endpoint
 - System processes all settled transactions
 - Platform fees paid out to main SAC
@@ -732,18 +732,18 @@ This follows **Dependency Inversion Principle** - domain doesn't depend on infra
 
 ## External Dependencies
 
-### DOKU Payment Gateway
+### Singapay Payment Gateway
 
-**Location**: `internal/infrastructure/payment/doku.go` (already exists)
+**Location**: `internal/infrastructure/payment/singapay.go` (already exists)
 
-**Anti-Corruption Layer**: Translate between DOKU's API model and our domain model
+**Anti-Corruption Layer**: Translate between Singapay's API model and our domain model
 
 **Key APIs**:
 
 1. **GetBalance**: Fetch current pending and available balance (used to verify after reconciliation)
 2. **RequestDisbursement**: Initiate withdrawal to bank account
 
-**Rate Limiting**: DOKU APIs have rate limits. GetBalance only called during reconciliation for verification.
+**Rate Limiting**: Singapay APIs have rate limits. GetBalance only called during reconciliation for verification.
 
 **Failure Handling**:
 
@@ -762,7 +762,7 @@ This follows **Dependency Inversion Principle** - domain doesn't depend on infra
 - Process reconciliation CSV upload
 - Match transactions via INVOICE NUMBER
 - Update ledger balances from settlement report
-- Verify with DOKU GetBalance API
+- Verify with Singapay GetBalance API
 - Create reconciliation logs
 - Payout platform fees to main SAC
 - Handle discrepancy detection
@@ -772,7 +772,7 @@ This follows **Dependency Inversion Principle** - domain doesn't depend on infra
 ```go
 GetBalance(ctx, accountID) (*BalanceResponse, error)
 ProcessReconciliation(ctx, csvFile, uploadedBy) (*ReconciliationSummary, error)
-verifyWithDoku(ctx, ledger) error // private, compares CSV totals with DOKU API
+verifyWithSingapay(ctx, ledger) error // private, compares CSV totals with Singapay API
 payoutPlatformFees(ctx, amount) error // private, transfer to main SAC
 ```
 
@@ -804,7 +804,7 @@ ProcessProductSale(ctx, buyerID, sellerID, productID, sellerPrice, paymentChanne
 - Validate withdrawal request
 - Debit available balance
 - Update expected balance
-- Call DOKU API
+- Call Singapay API
 - Handle failures
 
 **Key Methods**:
@@ -824,7 +824,7 @@ GET /api/v1/balance
 - Note: Simple read from database, NO sync logic
 
 POST /api/v1/ledger/reconciliation
-- Uploads DOKU settlement CSV and processes reconciliation
+- Uploads Singapay settlement and processes reconciliation
 - Body: multipart/form-data with CSV file
 - Returns: ReconciliationSummary (matched/unmatched counts, balance updates, discrepancies)
 - Side effects: Updates all balances, payouts platform fees to main SAC
@@ -870,7 +870,7 @@ Returns: {
   "transaction_id": "...",
   "seller_price": 10000,
   "platform_fee": 1000,
-  "doku_fee": 247,
+  "gateway_fee": 247,
   "total_charged": 11247,
   "payment_url": "/payment/...",
   "message": "Purchase initiated"
@@ -892,7 +892,7 @@ GET /api/v1/admin/discrepancies?status=PENDING&severity=CRITICAL
 
 POST /api/v1/admin/discrepancies/{id}/resolve
 Body: {
-  "action": "ACCEPT_DOKU" | "ACCEPT_EXPECTED" | "MANUAL_ADJUST",
+  "action": "ACCEPT_Singapay" | "ACCEPT_EXPECTED" | "MANUAL_ADJUST",
   "notes": "Investigation notes",
   "manual_pending": 12345, // optional, for MANUAL_ADJUST
   "manual_available": 67890
@@ -907,7 +907,7 @@ Body: {
 ```sql
 -- Core ledger table
 ledgers (
-  id, account_id, doku_sub_account_id,
+  id, account_id, singapay_account_id,
   pending_balance, available_balance, currency,
   last_synced_at, created_at, updated_at
 )
@@ -924,7 +924,7 @@ ledger_transactions (
 product_transactions (
   id, type, buyer_account_id, seller_account_id,
   product_id, invoice_number,
-  seller_price, platform_fee, doku_fee, total_charged, currency,
+  seller_price, platform_fee, gateway_fee, total_charged, currency,
   status, metadata, created_at, completed_at, settled_at
 )
 
@@ -946,7 +946,7 @@ reconciliation_logs (
 -- Safety gate: track expected balances
 expected_balances (
   id, ledger_id, expected_pending, expected_available,
-  last_calculated_at, verified_with_doku, last_verified_at,
+  last_calculated_at, verified_with_gateway, last_verified_at,
   created_at, updated_at
 )
 
@@ -971,7 +971,7 @@ fee_configs (
 ```sql
 -- Optimize balance lookups
 INDEX idx_account_id ON ledgers(account_id)
-INDEX idx_doku_sub_account ON ledgers(doku_sub_account_id)
+INDEX idx_singapay_account ON ledgers(singapay_account_id)
 
 -- Optimize transaction history queries
 INDEX idx_ledger_created ON ledger_transactions(ledger_id, created_at DESC)
@@ -993,17 +993,17 @@ INDEX idx_discrepancy_status ON reconciliation_discrepancies(status, severity)
 # Database
 DATABASE_URL=postgresql://user:pass@localhost:5432/fotafoto_db
 
-# DOKU API
-DOKU_API_KEY=your-api-key
-DOKU_API_SECRET=your-api-secret
-DOKU_BASE_URL=https://api.doku.com
-DOKU_MAIN_SAC_ID=main-sac-account-id  # For platform fee payouts
+# Singapay API
+Singapay_API_KEY=your-api-key
+Singapay_API_SECRET=your-api-secret
+Singapay_BASE_URL=https://api.singapay.com
+Singapay_MAIN_SAC_ID=main-sac-account-id  # For platform fee payouts
 
 # Server
 SERVER_PORT=8080
 
 # Application
-RECONCILIATION_TOLERANCE=0.01  # 1% tolerance when comparing CSV totals with DOKU API
+RECONCILIATION_TOLERANCE=0.01  # 1% tolerance when comparing CSV totals with Singapay API
 STALENESS_WARNING_HOURS=24     # Warn admin if last reconciliation > 24h ago
 STALENESS_CRITICAL_HOURS=72    # Critical alert if last reconciliation > 72h ago
 ```
@@ -1024,7 +1024,7 @@ STALENESS_CRITICAL_HOURS=72    # Critical alert if last reconciliation > 72h ago
 - Infrastructure: Fee repository
 - API controllers (Balance, Sales, Disbursement, Admin)
 - Database migrations
-- Integration with existing DOKU client
+- Integration with existing Singapay client
 
 ### 📝 Migration Files Needed
 
@@ -1049,25 +1049,25 @@ migrations/008_create_reconciliation_discrepancies.sql
 ### Integration Tests
 
 - Database repositories: Use testcontainers for PostgreSQL
-- DOKU client: Mock HTTP responses (client already exists at `github.com/21strive/doku`)
+- Singapay client: Mock HTTP responses (client already exists at `github.com/21strive/singapay`)
 
 ### End-to-End Tests
 
 - Full flow: Purchase product → Check balance → Request disbursement
-- Use test DOKU sandbox environment
+- Use test Singapay sandbox environment
 
 ## Known Limitations & Trade-offs
 
 ### 1. Manual Reconciliation Required
 
-- **Limitation**: DOKU doesn't provide webhooks or automated settlement data feed
+- **Limitation**: Singapay doesn't provide webhooks or automated settlement data feed
 - **Trade-off**: Admin must manually download and upload settlement CSV
 - **Impact**: Balance freshness depends on admin uploading daily reports
 - **Mitigation**: Monitor staleness, alert admin if >24h without reconciliation
 
 ### 2. Disbursement Failure Risk
 
-- **Risk**: If DOKU API fails after we debit expected balance, we have a temporary mismatch
+- **Risk**: If Singapay API fails after we debit expected balance, we have a temporary mismatch
 - **Mitigation**:
   - Mark as FAILED
   - Rollback expected_available balance immediately
@@ -1098,7 +1098,7 @@ Run migrations in order using migration tool (e.g., golang-migrate, Goose)
 
 **Alerts**:
 
-- DOKU API error rate > 5% → Alert DevOps
+- Singapay API error rate > 5% → Alert DevOps
 - Disbursement failure → Immediate alert for manual review
 - Balance discrepancy detected → Alert finance team (non-blocking)
 - Staleness > 24h → Warn admin to upload CSV
@@ -1152,7 +1152,7 @@ See [`diagrams/README.md`](diagrams/README.md) for full documentation of all dia
 - Different bounded contexts (Sales vs Financial)
 - Different lifecycles and query patterns
 
-**Why mirror DOKU's pending/available model?**
+**Why mirror Singapay's pending/available model?**
 
 - External system constraint (can't disburse from pending)
 - Anti-Corruption Layer pattern
@@ -1165,14 +1165,14 @@ See [`diagrams/README.md`](diagrams/README.md) for full documentation of all dia
 
 **Why expected balance tracking?**
 
-- Safety gate against DOKU incidents
+- Safety gate against Singapay incidents
 - Early detection of discrepancies
 - Audit trail for investigations
 
 **Why manual CSV reconciliation instead of automatic API polling?**
 
 - Explicit control by finance team
-- Settlement CSV is single source of truth from DOKU
+- Settlement CSV is single source of truth from Singapay
 - Simpler architecture (no background jobs, no cron schedulers)
 - Better auditability (clear record of who uploaded when)
 - Easy error recovery (retry failed uploads immediately)

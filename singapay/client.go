@@ -108,8 +108,9 @@ type accessTokenData struct {
 // AccessToken returns a valid bearer token, fetching one only when the cache is empty or
 // close to expiry.
 //
-// Caching matters more here than it looks: the DOKU path asks for a fresh token on every
-// bank-account validation, and a Singapay token is good for roughly sixty hours.
+// Caching matters more here than it looks. A token is good for roughly sixty hours, so a
+// client that fetches one per call spends an extra round trip on every bank-account
+// validation for nothing.
 func (c *Client) AccessToken(ctx context.Context) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

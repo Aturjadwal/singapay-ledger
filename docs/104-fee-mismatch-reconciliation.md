@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the reconciliation mechanism when a discrepancy exists between `ExpectedDokuFee` (recorded at payment time) and `ActualDokuFee` (from the DOKU settlement CSV).
+This document describes the reconciliation mechanism when a discrepancy exists between `ExpectedGatewayFee` (recorded at payment time) and `ActualGatewayFee` (from the Singapay settlement).
 
 ---
 
@@ -10,10 +10,10 @@ This document describes the reconciliation mechanism when a discrepancy exists b
 
 | Term | Definition |
 |---|---|
-| `ExpectedDokuFee` | DOKU fee predicted at payment time (stored in `ProductTransaction.Fee.DokuFee`) |
-| `ActualDokuFee` | Actual DOKU fee from the `FEE` column in the settlement CSV |
-| `feeDelta` | `ActualDokuFee - ExpectedDokuFee` |
-| `PayToMerchant` | `PAY TO MERCHANT` column in CSV — amount DOKU sends to the merchant SAC |
+| `ExpectedGatewayFee` | gateway fee predicted at payment time (stored in `ProductTransaction.Fee.GatewayFee`) |
+| `ActualGatewayFee` | Actual gateway fee from the `FEE` column in the settlement CSV |
+| `feeDelta` | `ActualGatewayFee - ExpectedGatewayFee` |
+| `PayToMerchant` | `PAY TO MERCHANT` column in CSV — amount Singapay sends to the merchant SAC |
 | `ExpectedNetAmount` | Amount we expect in `PayToMerchant` based on the fee model |
 | `AmountDiscrepancy` | `PayToMerchant - ExpectedNetAmount` |
 
@@ -23,24 +23,24 @@ This document describes the reconciliation mechanism when a discrepancy exists b
 
 ### `GATEWAY_ON_CUSTOMER`
 
-Customer bears the DOKU fee.
+Customer bears the gateway fee.
 
 ```
-TotalCharged      = SellerPrice + PlatformFee + DokuFee
+TotalCharged      = SellerPrice + PlatformFee + GatewayFee
 SellerNetAmount   = SellerPrice  (seller receives 100% of their price)
 ExpectedNetAmount = SellerNetAmount + PlatformFee
-PayToMerchant     = TotalCharged - ActualDokuFee
+PayToMerchant     = TotalCharged - ActualGatewayFee
 ```
 
 ### `GATEWAY_ON_SELLER`
 
-Seller bears the DOKU fee.
+Seller bears the gateway fee.
 
 ```
 TotalCharged      = SellerPrice + PlatformFee
-SellerNetAmount   = SellerPrice - DokuFee   (seller's share only; platform tracked separately)
+SellerNetAmount   = SellerPrice - GatewayFee   (seller's share only; platform tracked separately)
 ExpectedNetAmount = SellerNetAmount + PlatformFee
-PayToMerchant     = TotalCharged - ActualDokuFee
+PayToMerchant     = TotalCharged - ActualGatewayFee
 ```
 
 ---
@@ -51,7 +51,7 @@ Adjustment logic differs by fee model because who bears the gateway cost determi
 
 ### `GATEWAY_ON_CUSTOMER`
 
-Customer already paid `ExpectedDokuFee` upfront. Any delta is absorbed internally.
+Customer already paid `ExpectedGatewayFee` upfront. Any delta is absorbed internally.
 
 | Case | Rule | BLOCK condition |
 |---|---|---|
@@ -80,10 +80,10 @@ Seller agreed to bear the gateway fee. Any delta on the gateway cost falls on th
 ```
 SellerPrice     = 100,000
 PlatformFee     =   5,000
-ExpectedDokuFee =   3,000
+ExpectedGatewayFee =   3,000
 TotalCharged    = 108,000
 
-ActualDokuFee (from CSV) =  4,000
+ActualGatewayFee (from CSV) =  4,000
 feeDelta                 = +1,000
 adjustedPlatformFee      =  4,000
 ```
@@ -94,7 +94,7 @@ adjustedPlatformFee      =  4,000
 |---|---|---|---|---|
 | 1 | Seller | +100,000 | PENDING | `PRODUCT_PAYMENT` |
 | 2 | Platform | +5,000 | PENDING | `PLATFORM_COMMISSION` |
-| 3 | DOKU | +3,000 | PENDING | `PROCESSOR_FEE` |
+| 3 | Singapay | +3,000 | PENDING | `PROCESSOR_FEE` |
 
 ### Phase 3 — Settlement Entries
 
@@ -105,7 +105,7 @@ adjustedPlatformFee      =  4,000
 | 6 | Platform | -4,000 | PENDING | `SETTLEMENT_CLEAR` | clear platform PENDING (adjusted) |
 | 7 | Platform | +4,000 | AVAILABLE | `SETTLEMENT_NET` | platform receives 4,000 |
 | 8 | Platform | -1,000 | PENDING | `FEE_ADJUSTMENT` | write-off remaining PENDING |
-| 9 | DOKU | -3,000 | PENDING | `SETTLEMENT` | clear DOKU PENDING |
+| 9 | Singapay | -3,000 | PENDING | `SETTLEMENT` | clear Singapay PENDING |
 
 ### Final State
 
@@ -116,8 +116,8 @@ Seller   AVAILABLE = +100,000                   = 100,000
 Platform PENDING   = +5,000 - 4,000 - 1,000    =       0  ✓
 Platform AVAILABLE = +4,000                     =   4,000
 
-DOKU     PENDING   = +3,000 - 3,000             =       0  ✓
-DOKU     AVAILABLE =                            =       0
+Singapay     PENDING   = +3,000 - 3,000             =       0  ✓
+Singapay     AVAILABLE =                            =       0
 ```
 
 **PayToMerchant check:**
@@ -133,7 +133,7 @@ PayToMerchant from CSV                = 108,000 - 4,000 = 104,000  ✓
 ### Setup
 
 ```
-ActualDokuFee (from CSV) =  2,000
+ActualGatewayFee (from CSV) =  2,000
 feeDelta                 = -1,000
 adjustedSellerNet        = 101,000
 ```
@@ -147,7 +147,7 @@ adjustedSellerNet        = 101,000
 | 6 | Seller | +1,000 | AVAILABLE | `FEE_ADJUSTMENT` | surplus credited directly to AVAILABLE |
 | 7 | Platform | -5,000 | PENDING | `SETTLEMENT_CLEAR` | clear platform PENDING |
 | 8 | Platform | +5,000 | AVAILABLE | `SETTLEMENT_NET` | platform unchanged |
-| 9 | DOKU | -3,000 | PENDING | `SETTLEMENT` | clear DOKU PENDING |
+| 9 | Singapay | -3,000 | PENDING | `SETTLEMENT` | clear Singapay PENDING |
 
 ### Final State
 
@@ -158,7 +158,7 @@ Seller   AVAILABLE = +100,000 + 1,000           = 101,000
 Platform PENDING   = +5,000 - 5,000             =       0  ✓
 Platform AVAILABLE = +5,000                     =   5,000
 
-DOKU     PENDING   = +3,000 - 3,000             =       0  ✓
+Singapay     PENDING   = +3,000 - 3,000             =       0  ✓
 ```
 
 **PayToMerchant check:**
@@ -176,11 +176,11 @@ PayToMerchant from CSV                = 108,000 - 2,000 = 106,000  ✓
 ```
 SellerPrice     = 100,000
 PlatformFee     =   5,000
-ExpectedDokuFee =   3,000
-TotalCharged    = 105,000    (= SellerPrice + PlatformFee; customer does NOT pay DOKU fee)
-SellerNetAmount =  97,000    (= SellerPrice - ExpectedDokuFee)
+ExpectedGatewayFee =   3,000
+TotalCharged    = 105,000    (= SellerPrice + PlatformFee; customer does NOT pay gateway fee)
+SellerNetAmount =  97,000    (= SellerPrice - ExpectedGatewayFee)
 
-ActualDokuFee (from CSV) =  4,000
+ActualGatewayFee (from CSV) =  4,000
 feeDelta                 = +1,000
 adjustedSellerNet        =  96,000   (= 97,000 - 1,000)
 ```
@@ -191,7 +191,7 @@ adjustedSellerNet        =  96,000   (= 97,000 - 1,000)
 |---|---|---|---|---|
 | 1 | Seller | +97,000 | PENDING | `PRODUCT_PAYMENT` |
 | 2 | Platform | +5,000 | PENDING | `PLATFORM_COMMISSION` |
-| 3 | DOKU | +3,000 | PENDING | `PROCESSOR_FEE` |
+| 3 | Singapay | +3,000 | PENDING | `PROCESSOR_FEE` |
 
 > Total PENDING = 97,000 + 5,000 + 3,000 = 105,000 = TotalCharged ✓
 
@@ -204,7 +204,7 @@ adjustedSellerNet        =  96,000   (= 97,000 - 1,000)
 | 6 | Seller | -1,000 | PENDING | `FEE_ADJUSTMENT` | write-off extra fee absorbed by seller |
 | 7 | Platform | -5,000 | PENDING | `SETTLEMENT_CLEAR` | clear platform PENDING |
 | 8 | Platform | +5,000 | AVAILABLE | `SETTLEMENT_NET` | platform unchanged |
-| 9 | DOKU | -3,000 | PENDING | `SETTLEMENT` | clear DOKU PENDING (ExpectedDokuFee) |
+| 9 | Singapay | -3,000 | PENDING | `SETTLEMENT` | clear Singapay PENDING (ExpectedGatewayFee) |
 
 ### Final State
 
@@ -215,8 +215,8 @@ Seller   AVAILABLE = +96,000                    =  96,000
 Platform PENDING   = +5,000 - 5,000            =       0  ✓
 Platform AVAILABLE = +5,000                     =   5,000
 
-DOKU     PENDING   = +3,000 - 3,000             =       0  ✓
-DOKU     AVAILABLE =                            =       0
+Singapay     PENDING   = +3,000 - 3,000             =       0  ✓
+Singapay     AVAILABLE =                            =       0
 ```
 
 **PayToMerchant check:**
@@ -232,7 +232,7 @@ PayToMerchant from CSV                = 105,000 - 4,000 = 101,000  ✓
 ### Setup
 
 ```
-ActualDokuFee (from CSV) =  2,000
+ActualGatewayFee (from CSV) =  2,000
 feeDelta                 = -1,000
 adjustedSellerNet        =  98,000   (= 97,000 + 1,000)
 ```
@@ -243,10 +243,10 @@ adjustedSellerNet        =  98,000   (= 97,000 + 1,000)
 |---|---|---|---|---|---|
 | 4 | Seller | -97,000 | PENDING | `SETTLEMENT_CLEAR` | clear original PENDING |
 | 5 | Seller | +97,000 | AVAILABLE | `SETTLEMENT_NET` | from PENDING |
-| 6 | Seller | +1,000 | AVAILABLE | `FEE_ADJUSTMENT` | surplus — DOKU charged less than expected |
+| 6 | Seller | +1,000 | AVAILABLE | `FEE_ADJUSTMENT` | surplus — Singapay charged less than expected |
 | 7 | Platform | -5,000 | PENDING | `SETTLEMENT_CLEAR` | clear platform PENDING |
 | 8 | Platform | +5,000 | AVAILABLE | `SETTLEMENT_NET` | platform unchanged |
-| 9 | DOKU | -3,000 | PENDING | `SETTLEMENT` | clear DOKU PENDING (ExpectedDokuFee) |
+| 9 | Singapay | -3,000 | PENDING | `SETTLEMENT` | clear Singapay PENDING (ExpectedGatewayFee) |
 
 ### Final State
 
@@ -257,7 +257,7 @@ Seller   AVAILABLE = +97,000 + 1,000            =  98,000
 Platform PENDING   = +5,000 - 5,000             =       0  ✓
 Platform AVAILABLE = +5,000                     =   5,000
 
-DOKU     PENDING   = +3,000 - 3,000             =       0  ✓
+Singapay     PENDING   = +3,000 - 3,000             =       0  ✓
 ```
 
 **PayToMerchant check:**
@@ -270,7 +270,7 @@ PayToMerchant from CSV                = 105,000 - 2,000 = 103,000  ✓
 
 ## BLOCK Conditions
 
-A transaction is **irreconcilable** (BLOCK) when the absorbing party would receive a negative net amount — meaning DOKU's actual fee exceeds what is available to absorb.
+A transaction is **irreconcilable** (BLOCK) when the absorbing party would receive a negative net amount — meaning Singapay's actual fee exceeds what is available to absorb.
 
 ### `GATEWAY_ON_CUSTOMER`
 
@@ -278,10 +278,10 @@ The platform absorbs `feeDelta > 0`.
 
 ```
 BLOCK when: PlatformFee - feeDelta < 0
-        i.e. ActualDokuFee - ExpectedDokuFee > PlatformFee
+        i.e. ActualGatewayFee - ExpectedGatewayFee > PlatformFee
 ```
 
-This means DOKU's overcharge exceeds the entire platform fee. The platform would owe money it never collected — there is no valid accounting outcome. The transaction must be investigated and resolved manually.
+This means Singapay's overcharge exceeds the entire platform fee. The platform would owe money it never collected — there is no valid accounting outcome. The transaction must be investigated and resolved manually.
 
 **Example:** PlatformFee = 500, feeDelta = +600 → adjustedPlatformFee = −100 → **BLOCK**
 
@@ -291,15 +291,15 @@ The seller absorbs `feeDelta > 0`.
 
 ```
 BLOCK when: SellerNetAmount - feeDelta < 0
-        i.e. ActualDokuFee > SellerPrice
-             (since SellerNetAmount = SellerPrice - ExpectedDokuFee,
-              and feeDelta = ActualDokuFee - ExpectedDokuFee,
-              so SellerNetAmount - feeDelta = SellerPrice - ActualDokuFee)
+        i.e. ActualGatewayFee > SellerPrice
+             (since SellerNetAmount = SellerPrice - ExpectedGatewayFee,
+              and feeDelta = ActualGatewayFee - ExpectedGatewayFee,
+              so SellerNetAmount - feeDelta = SellerPrice - ActualGatewayFee)
 ```
 
-This means DOKU's actual fee exceeded the seller's entire price — the seller would receive negative proceeds. This is an abnormal situation (likely a data entry or integration error) and must be handled manually.
+This means Singapay's actual fee exceeded the seller's entire price — the seller would receive negative proceeds. This is an abnormal situation (likely a data entry or integration error) and must be handled manually.
 
-**Example:** SellerPrice = 10,000, ExpectedDokuFee = 500, SellerNetAmount = 9,500, ActualDokuFee = 11,000, feeDelta = +10,500 → adjustedSellerNet = −1,000 → **BLOCK**
+**Example:** SellerPrice = 10,000, ExpectedGatewayFee = 500, SellerNetAmount = 9,500, ActualGatewayFee = 11,000, feeDelta = +10,500 → adjustedSellerNet = −1,000 → **BLOCK**
 
 ### Handling BLOCKed Transactions
 
@@ -318,10 +318,10 @@ When a BLOCK condition is detected:
 
 | Fee Model | Case | Account | Bucket | Direction | Nature |
 |---|---|---|---|---|---|
-| `GATEWAY_ON_CUSTOMER` | feeDelta > 0 | Platform | PENDING | - (debit) | Write-off. DOKU took more than expected; platform absorbs the delta. Does not reduce AVAILABLE. |
-| `GATEWAY_ON_CUSTOMER` | feeDelta < 0 | Seller | AVAILABLE | + (credit) | Direct credit. DOKU charged less; surplus passed to seller. |
-| `GATEWAY_ON_SELLER` | feeDelta > 0 | Seller | PENDING | - (debit) | Write-off. DOKU took more than expected; seller absorbs the delta. Does not reduce AVAILABLE. |
-| `GATEWAY_ON_SELLER` | feeDelta < 0 | Seller | AVAILABLE | + (credit) | Direct credit. DOKU charged less; surplus passed to seller. |
+| `GATEWAY_ON_CUSTOMER` | feeDelta > 0 | Platform | PENDING | - (debit) | Write-off. Singapay took more than expected; platform absorbs the delta. Does not reduce AVAILABLE. |
+| `GATEWAY_ON_CUSTOMER` | feeDelta < 0 | Seller | AVAILABLE | + (credit) | Direct credit. Singapay charged less; surplus passed to seller. |
+| `GATEWAY_ON_SELLER` | feeDelta > 0 | Seller | PENDING | - (debit) | Write-off. Singapay took more than expected; seller absorbs the delta. Does not reduce AVAILABLE. |
+| `GATEWAY_ON_SELLER` | feeDelta < 0 | Seller | AVAILABLE | + (credit) | Direct credit. Singapay charged less; surplus passed to seller. |
 
 ---
 
@@ -331,10 +331,10 @@ When a BLOCK condition is detected:
 |---|---|---|---|
 | `PRODUCT_PAYMENT` | PENDING | + | Phase 2: payment success (Seller) |
 | `PLATFORM_COMMISSION` | PENDING | + | Phase 2: payment success (Platform) |
-| `PROCESSOR_FEE` | PENDING | + | Phase 2: payment success (DOKU) |
+| `PROCESSOR_FEE` | PENDING | + | Phase 2: payment success (Singapay) |
 | `SETTLEMENT_CLEAR` | PENDING | - | Phase 3: settlement CSV |
 | `SETTLEMENT_NET` | AVAILABLE | + | Phase 3: settlement CSV |
-| `SETTLEMENT` | PENDING | - | Phase 3: clear DOKU PENDING |
+| `SETTLEMENT` | PENDING | - | Phase 3: clear Singapay PENDING |
 | `FEE_ADJUSTMENT` | PENDING / AVAILABLE | - / + | Phase 3: fee mismatch adjustment |
 | `DISBURSEMENT` | AVAILABLE | - | Seller withdrawal |
 
@@ -356,7 +356,7 @@ FeeAdjustment int64  // feeDelta applied (0 if no mismatch)
 
 **`ledger.go`** — replace `HasAmountDiscrepancy()` block with fee adjustment logic:
 ```
-feeDelta = ActualDokuFee - ExpectedDokuFee
+feeDelta = ActualGatewayFee - ExpectedGatewayFee
 
 if feeDelta > 0:
     switch feeModel:
@@ -380,5 +380,5 @@ else:
 
 - `ProductTransaction.Fee` — retains original values from payment time (historical record)
 - Existing `ledger_entries` rows — never modified (immutable by design)
-- DOKU is always cleared using `ExpectedDokuFee`
+- Singapay is always cleared using `ExpectedGatewayFee`
 - Matching logic is unchanged

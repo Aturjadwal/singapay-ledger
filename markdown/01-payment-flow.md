@@ -2,7 +2,7 @@
 
 ## Overview
 
-The payment flow handles the creation and confirmation of payments from customers through the DOKU payment gateway. When a payment is confirmed, the **gross amount** (what customer actually paid) is added to the user's pending balance. After settlement, the **net amount** (after DOKU fees) becomes available in the user's balance.
+The payment flow handles the creation and confirmation of payments from customers through the Singapay payment gateway. When a payment is confirmed, the **gross amount** (what customer actually paid) is added to the user's pending balance. After settlement, the **net amount** (after gateway fees) becomes available in the user's balance.
 
 **Key Concept**: `LedgerPayment.Amount` stores the **gross amount** (customer payment), not the net amount (service price). This ensures accurate tracking of money flow through the system.
 
@@ -55,7 +55,7 @@ The payment flow handles the creation and confirmation of payments from customer
 ## Create Payment Flow
 
 ### When to Call
-Called by the setter-service after creating a payment link with DOKU API.
+Called by the setter-service after creating a payment link with Singapay API.
 
 ### Request Structure
 
@@ -72,7 +72,7 @@ type LedgerPaymentCreatePaymentRequest struct {
 }
 ```
 
-**Important**: `Amount` must be the **gross amount** (what customer pays), not the service price. This is calculated using `DokuSettlementUseCase.CalculateGrossAmount()` before creating the payment.
+**Important**: `Amount` must be the **gross amount** (what customer pays), not the service price. This is calculated using `SingapaySettlementUseCase.CalculateGrossAmount()` before creating the payment.
 
 ### Flow Diagram
 
@@ -84,11 +84,11 @@ type LedgerPaymentCreatePaymentRequest struct {
 │  1. Setter-service calculates gross amount:                                    │
 │     - Service price (net): IDR 100,000                                         │
 │     - Call CalculateGrossAmount(paymentMethod, 100000)                         │
-│     - Gross amount: IDR 100,700 (includes DOKU fees)                           │
+│     - Gross amount: IDR 100,700 (includes gateway fees)                           │
 │                                                                                 │
-│  2. Setter-service calls DOKU API to create payment link with gross amount     │
+│  2. Setter-service calls Singapay API to create payment link with gross amount     │
 │                                                                                 │
-│  3. DOKU returns:                                                               │
+│  3. Singapay returns:                                                               │
 │     - token_id (session ID)                                                    │
 │     - payment_url (checkout URL)                                               │
 │     - request_id (for webhook matching)                                        │
@@ -159,7 +159,7 @@ func (u *ledgerPaymentUseCase) CreatePayment(
 ## Confirm Payment Flow
 
 ### When to Call
-Called by setter-service when DOKU webhook confirms successful payment.
+Called by setter-service when money-in webhook confirms successful payment.
 
 ### Request Structure
 
@@ -172,7 +172,7 @@ type LedgerPaymentConfirmPaymentRequest struct {
 }
 ```
 
-### DOKU Webhook Sample
+### Singapay Webhook Sample
 
 ```json
 {
@@ -203,7 +203,7 @@ type LedgerPaymentConfirmPaymentRequest struct {
 │                                                                                 │
 │  Example: Customer paid IDR 100,700 (gross) for IDR 100,000 service (net)      │
 │                                                                                 │
-│  1. DOKU sends webhook to setter-service                                       │
+│  1. Singapay sends webhook to setter-service                                       │
 │     - transaction.status = "SUCCESS"                                           │
 │     - original_request_id matches our gateway_request_id                       │
 │     - channel.id = actual payment method used (e.g., "QRIS")                   │
@@ -226,14 +226,14 @@ type LedgerPaymentConfirmPaymentRequest struct {
 │     - income_accumulation += 100,700 (gross amount)                            │
 │                                                                                 │
 │  5. Create Settlement record (IN_PROGRESS):                                    │
-│     - Calculate fee using actual payment method from DOKU                      │
+│     - Calculate fee using actual payment method from Singapay                      │
 │     - batch_number = invoice_number (for idempotency)                          │
 │     - gross_amount = 100,700 (what customer paid)                              │
-│     - net_amount = 100,000 (after DOKU fees)                                   │
-│     - fee_amount = 700 (DOKU fee)                                              │
+│     - net_amount = 100,000 (after gateway fees)                                   │
+│     - fee_amount = 700 (gateway fee)                                              │
 │     - See: 02-settlement-flow.md for details                                   │
 │                                                                                 │
-│  6. After DOKU settles (D+1):                                                  │
+│  6. After Singapay settles (D+1):                                                  │
 │     - pending_balance -= 100,700                                                │
 │     - balance += 100,000 (net amount user can withdraw)                        │
 │                                                                                 │
@@ -397,19 +397,19 @@ func (u *ledgerPaymentUseCase) ExpirePayments(sqlTransaction *sqlx.Tx) (int, *mo
 
 | Term | Description | Example |
 |------|-------------|---------|
-| **Gross Amount** | What customer pays (includes DOKU fees) | IDR 100,700 |
+| **Gross Amount** | What customer pays (includes gateway fees) | IDR 100,700 |
 | **Net Amount** | What service provider receives (after fees) | IDR 100,000 |
-| **Fee Amount** | DOKU transaction fee + tax | IDR 700 |
+| **Fee Amount** | Singapay transaction fee + tax | IDR 700 |
 
 ### Example Flow
 
 ```
 Service Price:     IDR 100,000 (net - what provider wants to receive)
-DOKU Fee (QRIS):   IDR 700 (flat fee, no tax for QRIS)
+Gateway fee (QRIS):   IDR 700 (flat fee, no tax for QRIS)
 Customer Pays:     IDR 100,700 (gross)
 
 After Payment Confirmed:
-  pending_balance = 100,700 (gross - money held by DOKU)
+  pending_balance = 100,700 (gross - money held by Singapay)
   
 After Settlement (D+1):
   pending_balance = 0

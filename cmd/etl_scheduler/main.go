@@ -16,8 +16,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/21strive/doku/app/usecases"
-
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 
@@ -132,14 +130,10 @@ func run(args []string) error {
 	}
 	logger.Info("redis connected")
 
-	dokuClient := usecases.NewDokuUseCase(
-		getenv("DOKU_CLIENT_ID", getenv("DOKU_API_CLIENT_ID", "")),
-		getenv("DOKU_SECRET_KEY", getenv("DOKU_API_SECRET_KEY", "")),
-		getenv("DOKU_PRIVATE_KEY", ""),
-		getenv("DOKU_ENV", "sandbox") == "production",
-	)
-
-	client := analytics.NewLedgerAnalyticsClient(ledgerDB, ledgerAnalyticsDB, redisClient, logger, dokuClient)
+	// No gateway credentials here any more: the analytics client is pure SQL. dim_bank
+	// used to be filled from the gateway's supported-bank catalogue; Singapay has none,
+	// so it is derived from observed disbursements instead.
+	client := analytics.NewLedgerAnalyticsClient(ledgerDB, ledgerAnalyticsDB, redisClient, logger)
 	opts := analytics.ETLOptions{
 		EndTime:            cfg.endTime,
 		RecalculateDate:    cfg.recalculateDate,
@@ -186,7 +180,6 @@ func parseConfig(args []string) (*config, error) {
 		fmt.Fprintln(fs.Output(), "  DB_MAXCONNS, DB_MAXIDLECONNS")
 		fmt.Fprintln(fs.Output(), "  REDIS_HOST, REDIS_USER, REDIS_PASS, REDIS_CLUSTER, REDIS_DB")
 		fmt.Fprintln(fs.Output(), "  ETL_MODE, ETL_INTERVAL, ETL_ONCE, ETL_END_TIME, ETL_RECALCULATE_DATE, ETL_RECALCULATE_END_DATE")
-		fmt.Fprintln(fs.Output(), "  DOKU_CLIENT_ID, DOKU_SECRET_KEY, DOKU_PRIVATE_KEY")
 		fmt.Fprintln(fs.Output(), "")
 		fmt.Fprintln(fs.Output(), "Examples:")
 		fmt.Fprintln(fs.Output(), "  etl_scheduler --once --mode full")

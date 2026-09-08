@@ -36,9 +36,9 @@ func TestAppError_Error(t *testing.T) {
 
 	t.Run("error message with origin", func(t *testing.T) {
 		originErr := errors.New("connection timeout")
-		err := ledgererr.NewError(ledgererr.CodeDokuAPIError, "DOKU API failed", originErr)
+		err := ledgererr.NewError(ledgererr.CodeGatewayAPIError, "gateway API failed", originErr)
 
-		assert.Equal(t, "DOKU API failed: connection timeout", err.Error())
+		assert.Equal(t, "gateway API failed: connection timeout", err.Error())
 	})
 
 	t.Run("error message with nested AppError", func(t *testing.T) {
@@ -91,9 +91,9 @@ func TestAppError_ErrCode(t *testing.T) {
 	})
 
 	t.Run("get code with non-AppError origin", func(t *testing.T) {
-		err := ledgererr.NewError(ledgererr.CodeDokuAPIError, "doku error", errors.New("standard error"))
+		err := ledgererr.NewError(ledgererr.CodeGatewayAPIError, "gateway error", errors.New("standard error"))
 
-		assert.Equal(t, ledgererr.CodeDokuAPIError, err.ErrCode())
+		assert.Equal(t, ledgererr.CodeGatewayAPIError, err.ErrCode())
 	})
 
 	t.Run("get code from deeply nested AppErrors", func(t *testing.T) {
@@ -245,11 +245,11 @@ func TestIsErrorCode(t *testing.T) {
 	})
 
 	t.Run("detect code with multiple nesting levels", func(t *testing.T) {
-		level1 := ledgererr.NewError(ledgererr.CodeDokuAPIError, "doku", nil)
+		level1 := ledgererr.NewError(ledgererr.CodeGatewayAPIError, "gateway", nil)
 		level2 := ledgererr.NewError(ledgererr.CodeDatabaseError, "db", level1)
 		level3 := ledgererr.NewError(ledgererr.CodeInternal, "internal", level2)
 
-		assert.True(t, ledgererr.IsErrorCode(ledgererr.CodeDokuAPIError, level3))
+		assert.True(t, ledgererr.IsErrorCode(ledgererr.CodeGatewayAPIError, level3))
 	})
 
 	t.Run("identify ErrLedgerAlreadyExists by error code", func(t *testing.T) {
@@ -272,7 +272,7 @@ func TestErrorCodes(t *testing.T) {
 		assert.Equal(t, ledgererr.ErrorCode(500), ledgererr.CodeInternal)
 		assert.Equal(t, ledgererr.ErrorCode(404), ledgererr.CodeNotFound)
 		assert.Equal(t, ledgererr.ErrorCode(500001), ledgererr.CodeDatabaseError)
-		assert.Equal(t, ledgererr.ErrorCode(500002), ledgererr.CodeDokuAPIError)
+		assert.Equal(t, ledgererr.ErrorCode(500002), ledgererr.CodeGatewayAPIError)
 		assert.Equal(t, ledgererr.ErrorCode(409001), ledgererr.CodeSubaccountAlreadyExists)
 	})
 
@@ -281,7 +281,7 @@ func TestErrorCodes(t *testing.T) {
 			ledgererr.CodeInternal,
 			ledgererr.CodeNotFound,
 			ledgererr.CodeDatabaseError,
-			ledgererr.CodeDokuAPIError,
+			ledgererr.CodeGatewayAPIError,
 			ledgererr.CodeSubaccountAlreadyExists,
 		}
 

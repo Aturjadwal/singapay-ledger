@@ -58,17 +58,17 @@ func (c *LedgerAnalyticsClient) RunDimAccountETL(ctx context.Context, opts ETLOp
 		defer tx.Rollback()
 
 		type changedAccount struct {
-			accountUUID      string
-			ownerType        string
-			ownerID          string
-			currency         string
-			dokuSubAccountID string
+			accountUUID       string
+			ownerType         string
+			ownerID           string
+			currency          string
+			singapayAccountID string
 		}
 
 		// Step 3a: Identify changed accounts from ledgerDB
 		// We fetch all accounts updated in the window (watermark, batchEnd]
 		queryChanged := `
-			SELECT uuid, owner_type, owner_id, currency, doku_subaccount_id
+			SELECT uuid, owner_type, owner_id, currency, singapay_account_id
 			FROM ledger_accounts
 			WHERE (
 				(NOT $3 AND updated_at > $1 AND updated_at <= $2)
@@ -87,9 +87,9 @@ func (c *LedgerAnalyticsClient) RunDimAccountETL(ctx context.Context, opts ETLOp
 		for rows.Next() {
 			var accountUUID, ownerType, currency string
 			var ownerID sql.NullString
-			var dokuID sql.NullString
+			var singapayID sql.NullString
 
-			if err := rows.Scan(&accountUUID, &ownerType, &ownerID, &currency, &dokuID); err != nil {
+			if err := rows.Scan(&accountUUID, &ownerType, &ownerID, &currency, &singapayID); err != nil {
 				_ = rows.Close()
 				c.LogMicrobatchEnd(ctx, logID, StatusFailed, 0, err.Error())
 				return fmt.Errorf("failed to scan account row: %w", err)
@@ -100,17 +100,17 @@ func (c *LedgerAnalyticsClient) RunDimAccountETL(ctx context.Context, opts ETLOp
 				ownerIDValue = ownerID.String
 			}
 
-			dokuSubAccountID := ""
-			if dokuID.Valid {
-				dokuSubAccountID = dokuID.String
+			singapayAccountID := ""
+			if singapayID.Valid {
+				singapayAccountID = singapayID.String
 			}
 
 			changedAccounts = append(changedAccounts, changedAccount{
-				accountUUID:      accountUUID,
-				ownerType:        ownerType,
-				ownerID:          ownerIDValue,
-				currency:         currency,
-				dokuSubAccountID: dokuSubAccountID,
+				accountUUID:       accountUUID,
+				ownerType:         ownerType,
+				ownerID:           ownerIDValue,
+				currency:          currency,
+				singapayAccountID: singapayAccountID,
 			})
 		}
 
@@ -131,19 +131,19 @@ func (c *LedgerAnalyticsClient) RunDimAccountETL(ctx context.Context, opts ETLOp
 			ownerType := acct.ownerType
 			ownerID := acct.ownerID
 			currency := acct.currency
-			dokuSubAccountID := acct.dokuSubAccountID
+			singapayAccountID := acct.singapayAccountID
 
 			// Check if we need to create a new version
 			var currentUUID, curOwnerType, curCurrency string
 			var curOwnerID sql.NullString
-			var curDokuID sql.NullString
+			var curSingapayID sql.NullString
 
 			checkQuery := `
-				SELECT uuid, owner_type, owner_id, currency, doku_subaccount_id
+				SELECT uuid, owner_type, owner_id, currency, singapay_account_id
 				FROM dim_account
 				WHERE account_id = $1 AND is_current = true
 			`
-			err := tx.QueryRowContext(ctx, checkQuery, accountUUID).Scan(&currentUUID, &curOwnerType, &curOwnerID, &curCurrency, &curDokuID)
+			err := tx.QueryRowContext(ctx, checkQuery, accountUUID).Scan(&currentUUID, &curOwnerType, &curOwnerID, &curCurrency, &curSingapayID)
 
 			needsUpdate := false
 			if err == sql.ErrNoRows {
@@ -157,12 +157,12 @@ func (c *LedgerAnalyticsClient) RunDimAccountETL(ctx context.Context, opts ETLOp
 				if curOwnerID.Valid {
 					curOwnerIDValue = curOwnerID.String
 				}
-				curDokuSubAccountID := ""
-				if curDokuID.Valid {
-					curDokuSubAccountID = curDokuID.String
+				curSingapayAccountID := ""
+				if curSingapayID.Valid {
+					curSingapayAccountID = curSingapayID.String
 				}
 
-				if curOwnerType != ownerType || curOwnerIDValue != ownerID || curCurrency != currency || curDokuSubAccountID != dokuSubAccountID {
+				if curOwnerType != ownerType || curOwnerIDValue != ownerID || curCurrency != currency || curSingapayAccountID != singapayAccountID {
 					needsUpdate = true
 				}
 			}
@@ -188,7 +188,7 @@ func (c *LedgerAnalyticsClient) RunDimAccountETL(ctx context.Context, opts ETLOp
 			insertQuery := `
 				INSERT INTO dim_account (
 					uuid, randid, created_at, updated_at,
-					account_id, owner_type, owner_id, currency, doku_subaccount_id,
+					account_id, owner_type, owner_id, currency, singapay_account_id,
 					effective_date, end_date, is_current
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, true)
 			`
@@ -196,7 +196,7 @@ func (c *LedgerAnalyticsClient) RunDimAccountETL(ctx context.Context, opts ETLOp
 			newRandID := uuid.New().String()
 			if _, err := tx.ExecContext(ctx, insertQuery,
 				newUUID, newRandID, time.Now(), time.Now(),
-				accountUUID, ownerType, ownerID, currency, dokuSubAccountID,
+				accountUUID, ownerType, ownerID, currency, singapayAccountID,
 				batchEnd, // Effective from this batch timestamp
 			); err != nil {
 				c.LogMicrobatchEnd(ctx, logID, StatusFailed, processedCount, err.Error())

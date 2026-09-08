@@ -341,7 +341,7 @@ const (
 // Settlement is a settlement batch.
 //
 // It reports totals only. There is no list of the transactions it covers, which is the
-// gap between this and DOKU's settlement CSV: the rows have to be fetched separately from
+// gap a settlement file would have closed: the rows have to be fetched separately from
 // each product's transaction list, filtered on settle_at within StartDate..EndDate.
 type Settlement struct {
 	ID          int64            `json:"id"`

@@ -24,7 +24,7 @@ func NewPostgresProductTransactionRepository(db DBTX) *PostgresProductTransactio
 func (r *PostgresProductTransactionRepository) GetByID(ctx context.Context, id string) (*domain.ProductTransaction, error) {
 	query := `
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
-		       seller_price, platform_fee, doku_fee, total_charged, seller_net_amount, fee_model, currency,
+		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
 		FROM product_transactions
@@ -37,7 +37,7 @@ func (r *PostgresProductTransactionRepository) GetByID(ctx context.Context, id s
 func (r *PostgresProductTransactionRepository) GetByInvoiceNumber(ctx context.Context, invoiceNumber string) (*domain.ProductTransaction, error) {
 	query := `
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
-		       seller_price, platform_fee, doku_fee, total_charged, seller_net_amount, fee_model, currency,
+		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
 		FROM product_transactions
@@ -51,7 +51,7 @@ func (r *PostgresProductTransactionRepository) GetBySellerAccountID(ctx context.
 	offset := (page - 1) * pageSize
 	query := `
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
-		       seller_price, platform_fee, doku_fee, total_charged, seller_net_amount, fee_model, currency,
+		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
 		FROM product_transactions
@@ -67,7 +67,7 @@ func (r *PostgresProductTransactionRepository) GetByBuyerAccountID(ctx context.C
 	offset := (page - 1) * pageSize
 	query := `
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
-		       seller_price, platform_fee, doku_fee, total_charged, seller_net_amount, fee_model, currency,
+		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
 		FROM product_transactions
@@ -97,7 +97,7 @@ func (r *PostgresProductTransactionRepository) GetBySellerAccountIDWithCursor(ct
 		// First page: no cursor, start from beginning
 		query = fmt.Sprintf(`
 			SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
-			       seller_price, platform_fee, doku_fee, total_charged, seller_net_amount, fee_model, currency,
+			       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 			       status, created_at, updated_at, completed_at, settled_at,
 			       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
 			FROM product_transactions
@@ -112,7 +112,7 @@ func (r *PostgresProductTransactionRepository) GetBySellerAccountIDWithCursor(ct
 		if sortOrder == "DESC" {
 			query = `
 				SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
-				       seller_price, platform_fee, doku_fee, total_charged, seller_net_amount, fee_model, currency,
+				       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 				       status, created_at, updated_at, completed_at, settled_at,
 				       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
 				FROM product_transactions
@@ -125,7 +125,7 @@ func (r *PostgresProductTransactionRepository) GetBySellerAccountIDWithCursor(ct
 		} else {
 			query = `
 				SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
-				       seller_price, platform_fee, doku_fee, total_charged, seller_net_amount, fee_model, currency,
+				       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 				       status, created_at, updated_at, completed_at, settled_at,
 				       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
 				FROM product_transactions
@@ -145,7 +145,7 @@ func (r *PostgresProductTransactionRepository) GetBySellerAccountIDWithCursor(ct
 func (r *PostgresProductTransactionRepository) GetPendingBySellerAccountID(ctx context.Context, sellerAccountID string) ([]*domain.ProductTransaction, error) {
 	query := `
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
-		       seller_price, platform_fee, doku_fee, total_charged, seller_net_amount, fee_model, currency,
+		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
 		FROM product_transactions
@@ -159,7 +159,7 @@ func (r *PostgresProductTransactionRepository) GetPendingBySellerAccountID(ctx c
 func (r *PostgresProductTransactionRepository) GetCompletedNotSettled(ctx context.Context, sellerAccountID string) ([]*domain.ProductTransaction, error) {
 	query := `
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
-		       seller_price, platform_fee, doku_fee, total_charged, seller_net_amount, fee_model, currency,
+		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
 		FROM product_transactions
@@ -173,7 +173,7 @@ func (r *PostgresProductTransactionRepository) GetCompletedNotSettled(ctx contex
 func (r *PostgresProductTransactionRepository) GetAllBySellerID(ctx context.Context, sellerAccountID string) ([]*domain.ProductTransaction, error) {
 	query := `
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
-		       seller_price, platform_fee, doku_fee, total_charged, seller_net_amount, fee_model, currency,
+		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
 		FROM product_transactions
@@ -198,7 +198,7 @@ func (r *PostgresProductTransactionRepository) Save(ctx context.Context, tx *dom
 	query := `
 		INSERT INTO product_transactions (
 			uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
-			seller_price, platform_fee, doku_fee, total_charged, seller_net_amount, fee_model, currency,
+			seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 			status, created_at, updated_at, completed_at, settled_at,
 			platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
@@ -227,7 +227,7 @@ func (r *PostgresProductTransactionRepository) Save(ctx context.Context, tx *dom
 		tx.InvoiceNumber,
 		tx.Fee.SellerPrice,
 		tx.Fee.PlatformFee,
-		tx.Fee.DokuFee,
+		tx.Fee.GatewayFee,
 		tx.Fee.TotalCharged,
 		tx.Fee.SellerNetAmount,
 		tx.Fee.FeeModel,
@@ -337,7 +337,7 @@ func (r *PostgresProductTransactionRepository) scanRow(rows *sql.Rows) (*domain.
 		InvoiceNumber            string
 		SellerPrice              int64
 		PlatformFee              int64
-		DokuFee                  int64
+		GatewayFee               int64
 		TotalCharged             int64
 		SellerNetAmount          int64
 		FeeModel                 string
@@ -363,7 +363,7 @@ func (r *PostgresProductTransactionRepository) scanRow(rows *sql.Rows) (*domain.
 		&row.InvoiceNumber,
 		&row.SellerPrice,
 		&row.PlatformFee,
-		&row.DokuFee,
+		&row.GatewayFee,
 		&row.TotalCharged,
 		&row.SellerNetAmount,
 		&row.FeeModel,
@@ -413,7 +413,7 @@ func (r *PostgresProductTransactionRepository) scanRow(rows *sql.Rows) (*domain.
 		Fee: domain.FeeBreakdown{
 			SellerPrice:     row.SellerPrice,
 			PlatformFee:     row.PlatformFee,
-			DokuFee:         row.DokuFee,
+			GatewayFee:      row.GatewayFee,
 			TotalCharged:    row.TotalCharged,
 			SellerNetAmount: row.SellerNetAmount,
 			FeeModel:        domain.FeeModel(row.FeeModel),
@@ -436,8 +436,9 @@ func (r *PostgresProductTransactionRepository) scanRow(rows *sql.Rows) (*domain.
 	return tx, nil
 }
 
-// SaveTransferRequestID persists the DOKU request-id that will be used for the platform fee transfer.
-// Must be called before invoking the DOKU transfer API so the id is available for idempotent retries.
+// SaveTransferRequestID persists the merchant_ref_no that will be used for the platform fee
+// transfer. Must be written before the account transfer is sent so the reference is
+// available for idempotent retries.
 func (r *PostgresProductTransactionRepository) SaveTransferRequestID(ctx context.Context, id string, requestID string) error {
 	query := `
 		UPDATE product_transactions
@@ -496,7 +497,7 @@ func (r *PostgresProductTransactionRepository) MarkPlatformFeeTransferred(ctx co
 func (r *PostgresProductTransactionRepository) GetSettledWithoutPlatformFeeTransfer(ctx context.Context, limit int) ([]*domain.ProductTransaction, error) {
 	query := `
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
-		       seller_price, platform_fee, doku_fee, total_charged, seller_net_amount, fee_model, currency,
+		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
 		FROM product_transactions
@@ -504,6 +505,29 @@ func (r *PostgresProductTransactionRepository) GetSettledWithoutPlatformFeeTrans
 		  AND platform_fee_transferred = false 
 		  AND platform_fee > 0
 		ORDER BY settled_at ASC
+		LIMIT $1
+	`
+
+	return r.scanMany(ctx, query, limit)
+}
+
+// GetAwaitingSettlement returns COMPLETED transactions whose funds have not settled yet,
+// oldest first.
+//
+// This is what makes reconciliation possible without a settlement file. Singapay announces
+// a batch and a date window and nothing else, so the reconciler has to know which invoices
+// it is waiting on before it can go looking for them — and that set is exactly this. It
+// also bounds the work: only accounts holding unsettled money are queried at the gateway,
+// rather than every sub-account the merchant owns.
+func (r *PostgresProductTransactionRepository) GetAwaitingSettlement(ctx context.Context, limit int) ([]*domain.ProductTransaction, error) {
+	query := `
+		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
+		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
+		       status, created_at, updated_at, completed_at, settled_at,
+		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
+		FROM product_transactions
+		WHERE status = 'COMPLETED'
+		ORDER BY completed_at ASC
 		LIMIT $1
 	`
 

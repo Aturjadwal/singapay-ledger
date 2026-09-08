@@ -7,7 +7,23 @@ dokumentasi publik Singapay ditambah OpenAPI spec resminya
 yang jauh lebih lengkap dan lebih akurat daripada halaman guide-nya — **kalau guide dan
 spec berbeda, spec yang dipakai** (dan perbedaannya dicatat di §9).
 
-Status: dokumen riset/desain. Belum ada kode yang diubah.
+> **Status: SUDAH DIKERJAKAN, kecuali rekonsiliasi.**
+>
+> Dokumen ini ditulis sebagai riset sebelum migrasi. Migrasinya sudah dilakukan: paket
+> `github.com/21strive/doku` sudah dilepas, `LedgerClient` sudah memanggil Singapay untuk
+> pembuatan akun, pembayaran, webhook, validasi rekening, payout, dan transfer platform fee.
+> Lihat [CHANGELOG.md](../CHANGELOG.md).
+>
+> Yang **belum**: rekonsiliasi settlement (§7). `ProcessReconciliation` menolak jalan, jadi
+> saldo `PENDING` belum pernah menjadi `AVAILABLE`. Alasannya ada di §9.1, §9.4, §9.7 dan
+> §9.12 — empat pertanyaan yang harus dijawab dulu ke sandbox. Ringkasannya di
+> [102-settlement-reconciliation.md](./102-settlement-reconciliation.md).
+>
+> Dokumen ini sengaja dipertahankan apa adanya, termasuk penyebutan gateway lama, karena
+> nilainya justru pada perbandingan itu: ia mencatat **kenapa** setiap keputusan diambil dan
+> apa yang masih terbuka. Referensi ke file yang sudah tidak ada (`doku_subaccount.go`,
+> `DokuSettlementCSVParser`) dibiarkan sebagai catatan sejarah — penggantinya
+> `singapay_account.go` dan tidak ada lagi parser CSV.
 
 ---
 

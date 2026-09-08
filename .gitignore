@@ -5,3 +5,6 @@ node_modules
 dist
 .env*
 .envrc
+
+# Compiled test binaries (go test -c). One was tracked at 7.5MB before this.
+*.test

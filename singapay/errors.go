@@ -41,8 +41,8 @@ const (
 // Outcome says what a failed money-out call implies about the money itself.
 //
 // This is the distinction that decides whether a reserved balance may be released. The
-// DOKU path answers it with an HTTP heuristic — 4xx means a definite refusal, 5xx means
-// unknown — and that heuristic is wrong here. Singapay answers HTTP 400 for SP001, SP002,
+// obvious approach is an HTTP heuristic — 4xx means a definite refusal, 5xx means unknown
+// — and that heuristic is wrong here. Singapay answers HTTP 400 for SP001, SP002,
 // SP004 and SP005, and its own documentation says to call inquiry-status for every one of
 // them because the transfer may still settle. Releasing the reservation on those is
 // exactly how a payout gets made twice.

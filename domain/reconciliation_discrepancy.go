@@ -15,7 +15,7 @@ type ReconciliationDiscrepancy struct {
 	LedgerUUID          string
 	SettlementBatchUUID string // Which batch caused this discrepancy
 
-	// Balance comparison (our calculation vs DOKU GetBalance API)
+	// Balance comparison (our calculation vs Singapay's balance inquiry)
 	ExpectedPending   int64
 	ActualPending     int64
 	ExpectedAvailable int64

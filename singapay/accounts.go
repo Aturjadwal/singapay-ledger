@@ -83,18 +83,18 @@ type CreateAccountRequest struct {
 	// InviteMembers grants dashboard access to additional emails. The calling
 	// merchant's own login is always granted regardless.
 	//
-	// Note this is the only place an email appears: unlike DOKU, Singapay does not
-	// identify a sub-account by email and imposes no length limit on one.
+	// Note this is the only place an email appears. Singapay does not identify a
+	// sub-account by email — the ULID does that — and imposes no length limit on one.
 	InviteMembers []string `json:"invite_members,omitempty"`
 }
 
 // CreateAccount provisions a sub-account.
 //
-// There is no idempotency key and no duplicate check. DOKU answers 409 when an email
-// already owns a sub-account, and calling code can lean on that; Singapay will happily
-// create a second account with the same name. A retry after a timeout therefore risks
-// creating an account that holds money and that nothing references — the caller must
-// guarantee at-most-once itself, ideally by writing its own record before calling.
+// There is no idempotency key and no duplicate check: Singapay will happily create a
+// second account with the same name, and nothing in the response distinguishes it from the
+// first. A retry after a timeout therefore risks creating an account that holds money and
+// that nothing references — the caller must guarantee at-most-once itself, ideally by
+// checking its own records before calling.
 func (c *Client) CreateAccount(ctx context.Context, req CreateAccountRequest) (*Account, error) {
 	if req.Type == "" {
 		req.Type = AccountTypeOwned

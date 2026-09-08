@@ -117,7 +117,7 @@ func TestDisburseFailure(t *testing.T) {
 	if e.Code != CodeTransactionFailure {
 		t.Errorf("Code = %q, want SP001", e.Code)
 	}
-	// SP001 arrives as HTTP 400, and the DOKU heuristic would call that a definite
+	// SP001 arrives as HTTP 400, and an HTTP-status heuristic would call that a definite
 	// refusal and release the reservation. Singapay says to inquire instead.
 	if e.Outcome() != OutcomeUnknown {
 		t.Errorf("Outcome = %v, want unknown", e.Outcome())

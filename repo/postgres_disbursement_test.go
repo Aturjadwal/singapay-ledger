@@ -20,7 +20,7 @@ var disbursementColumns = []string{
 	"uuid", "randid", "account_uuid", "amount", "currency", "status",
 	"bank_code", "account_number", "account_name",
 	"description", "external_transaction_id", "failure_reason",
-	"payout_request_id", "created_at", "updated_at", "processed_at",
+	"payout_request_id", "gateway_fee", "created_at", "updated_at", "processed_at",
 }
 
 // disbursementRow builds one row. failureReason and payoutRequestID are untyped so a
@@ -30,7 +30,7 @@ func disbursementRow(uuid, status string, failureReason, payoutRequestID any, cr
 		uuid, "randid-" + uuid, "acc-001", int64(250_000), "IDR", status,
 		"014", "1234567890", "Seller Name",
 		"Disbursement request", nil, failureReason,
-		payoutRequestID, createdAt, createdAt, nil,
+		payoutRequestID, int64(0), createdAt, createdAt, nil,
 	}
 }
 
@@ -89,7 +89,7 @@ func TestGetByID_LeavesPayoutRequestIDEmptyWhenNull(t *testing.T) {
 	disbursement, err := repo.GetByID(context.Background(), "d-old")
 
 	// A row from before migration 014. It must stay empty so RetryDisbursement refuses
-	// it rather than inventing a key DOKU has never seen.
+	// it rather than inventing a reference Singapay has never seen.
 	require.NoError(t, err)
 	assert.Empty(t, disbursement.PayoutRequestID)
 	assert.NoError(t, mock.ExpectationsWereMet())
@@ -103,13 +103,13 @@ func TestGetByID_ReadsBothColumnsWhenBothPresent(t *testing.T) {
 
 	mock.ExpectQuery("(?s)SELECT.*FROM disbursements.*WHERE uuid").
 		WithArgs("d-failed").
-		WillReturnRows(rowsFrom(disbursementRow("d-failed", "FAILED", "DOKU rejected the payout", "req-002", createdAt)))
+		WillReturnRows(rowsFrom(disbursementRow("d-failed", "FAILED", "Singapay refused the payout", "req-002", createdAt)))
 
 	disbursement, err := repo.GetByID(context.Background(), "d-failed")
 
 	require.NoError(t, err)
 	assert.Equal(t, "req-002", disbursement.PayoutRequestID)
-	assert.Equal(t, "DOKU rejected the payout", disbursement.FailureReason)
+	assert.Equal(t, "Singapay refused the payout", disbursement.FailureReason)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 

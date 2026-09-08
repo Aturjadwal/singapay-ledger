@@ -1,14 +1,14 @@
-# DOKU Payment Gateway Ledger System - Architecture Documentation
+# Singapay Payment Gateway Ledger System - Architecture Documentation
 
 ## Overview
 
-This ledger system is designed to track and manage financial transactions from the DOKU payment gateway. It provides users with a comprehensive view of their payments, settlements, and disbursements while maintaining accurate balance tracking.
+This ledger system is designed to track and manage financial transactions from the Singapay payment gateway. It provides users with a comprehensive view of their payments, settlements, and disbursements while maintaining accurate balance tracking.
 
 ## System Purpose
 
 - Track income from customer payments
-- Record settlements from DOKU (with fee deductions)
-- Manage disbursements to user bank accounts ("KIRIM DOKU")
+- Record settlements from Singapay (with fee deductions)
+- Manage disbursements to user bank accounts ("KIRIM Singapay")
 - Provide real-time balance visibility (available + pending)
 
 ## Analytics Docs
@@ -28,7 +28,7 @@ Represents a user/merchant account in the system.
 | `uuid` | string | Primary key |
 | `randid` | string | Random ID for public reference |
 | `name` | string | Account holder name |
-| `email` | string | Unique email (DOKU requires unique emails) |
+| `email` | string | Unique email (Singapay requires unique emails) |
 
 ### 2. LedgerAccountBank
 Stores user's bank account information for disbursements.
@@ -67,23 +67,23 @@ Records individual payment transactions.
 | `currency` | string | Currency code |
 | `payment_method` | string | Payment method (QRIS, VA_BCA, etc.) |
 | `status` | string | PENDING, PAID, FAILED, EXPIRED |
-| `gateway_request_id` | string | DOKU request ID |
+| `gateway_request_id` | string | Singapay request ID |
 
 ### 5. LedgerSettlement
-Records DOKU settlement batches.
+Records Singapay settlement batches.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `uuid` | string | Primary key |
 | `ledger_account_uuid` | string | Reference to account owner |
-| `batch_number` | string | DOKU batch number |
+| `batch_number` | string | Singapay batch number |
 | `gross_amount` | int64 | Total before fee deduction |
 | `net_amount` | int64 | Total after fee deduction |
-| `fee_amount` | int64 | Fee deducted by DOKU |
+| `fee_amount` | int64 | Fee deducted by Singapay |
 | `status` | string | IN_PROGRESS, TRANSFERRED |
 
 ### 6. LedgerDisbursement
-Records disbursement requests to user's bank account ("KIRIM DOKU").
+Records disbursement requests to user's bank account ("KIRIM Singapay").
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -197,7 +197,7 @@ Audit log for all wallet balance changes.
 │         │ (User initiates)                                                      │
 │         ▼                                                                       │
 │  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │ STEP 3: DISBURSEMENT ("KIRIM DOKU")                                     │   │
+│  │ STEP 3: DISBURSEMENT ("KIRIM Singapay")                                     │   │
 │  │                                                                          │   │
 │  │   LedgerDisbursement.status = PENDING → PROCESSING → SUCCESS            │   │
 │  │   LedgerWallet.balance -= amount (when PENDING)                         │   │
@@ -230,7 +230,7 @@ Audit log for all wallet balance changes.
 
 ```json
 {
-  "available_balance": 48500,    // Ready for "KIRIM DOKU"
+  "available_balance": 48500,    // Ready for "KIRIM Singapay"
   "pending_balance": 50000,      // Waiting for settlement
   "currency": "IDR",
   "total_income": 500000,        // Lifetime gross
@@ -349,12 +349,12 @@ ledger/
 - `EXPIRED` - Payment link expired
 
 ### Settlement Status
-- `IN_PROGRESS` - Settlement initiated by DOKU
+- `IN_PROGRESS` - Settlement initiated by Singapay
 - `TRANSFERRED` - Funds moved to available balance
 
 ### Disbursement Status
 - `PENDING` - Disbursement requested, balance deducted
-- `PROCESSING` - DOKU accepted the request
+- `PROCESSING` - Singapay accepted the request
 - `SUCCESS` - Funds transferred to bank
 - `FAILED` - Disbursement failed, balance refunded
 
@@ -369,13 +369,13 @@ ledger/
 
 ### Overview
 
-DOKU settles payments daily at **1PM on weekdays**, but **does not provide a webhook** for settlement completion. To detect when settlements have been processed, the system uses an **on-demand reconciliation** approach.
+Singapay settles payments daily at **1PM on weekdays**, but **does not provide a webhook** for settlement completion. To detect when settlements have been processed, the system uses an **on-demand reconciliation** approach.
 
 ### Why On-Demand?
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| Webhook (not available) | Real-time updates | DOKU doesn't offer this for settlements |
+| Webhook (not available) | Real-time updates | Singapay doesn't offer this for settlements |
 | Scheduled Job | Predictable timing | Adds complexity, still has delay |
 | **On-Demand** ✓ | No extra infrastructure, updates when user needs it | Only updates when user checks balance |
 
@@ -383,10 +383,10 @@ DOKU settles payments daily at **1PM on weekdays**, but **does not provide a web
 
 When a user accesses their balance page, the backend:
 
-1. **Fetches DOKU Balance** - Calls `GetBalance` API to get real-time pending/available
-2. **Compares with Ledger** - Calculates delta between DOKU pending and our pending_balance
-3. **Detects Settlements** - If DOKU pending < Ledger pending, settlements occurred
-4. **Reconciles** - Processes settlements FIFO, updates ledger to match DOKU
+1. **Fetches Singapay Balance** - Calls `GetBalance` API to get real-time pending/available
+2. **Compares with Ledger** - Calculates delta between Singapay pending and our pending_balance
+3. **Detects Settlements** - If Singapay pending < Ledger pending, settlements occurred
+4. **Reconciles** - Processes settlements FIFO, updates ledger to match Singapay
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -397,7 +397,7 @@ When a user accesses their balance page, the backend:
 │          │                                                                      │
 │          ▼                                                                      │
 │  ┌───────────────────────────────────┐                                          │
-│  │  Backend: Get DOKU Balance        │◀─── DOKU GetBalance API                  │
+│  │  Backend: Get Singapay Balance        │◀─── Singapay GetBalance API                  │
 │  │  (pending: 0, available: 95,560)  │                                          │
 │  └───────────────────────────────────┘                                          │
 │          │                                                                      │
@@ -430,12 +430,12 @@ When a user accesses their balance page, the backend:
 
 ### Data Flow
 
-| Step | DOKU State | Ledger State | Action |
+| Step | Singapay State | Ledger State | Action |
 |------|------------|--------------|--------|
 | Payment confirmed | pending: +100K | pending_balance: +100K | Create settlement (IN_PROGRESS) |
-| DOKU settles (1PM) | pending: 0, available: +95.5K | pending_balance: 100K (stale) | No webhook - we don't know! |
+| Singapay settles (1PM) | pending: 0, available: +95.5K | pending_balance: 100K (stale) | No webhook - we don't know! |
 | User checks balance | pending: 0, available: 95.5K | pending_balance: 100K | Detect delta, reconcile |
-| After reconciliation | pending: 0, available: 95.5K | pending_balance: 0, balance: 95.5K | Ledger matches DOKU |
+| After reconciliation | pending: 0, available: 95.5K | pending_balance: 0, balance: 95.5K | Ledger matches Singapay |
 
 ### Implementation Location
 

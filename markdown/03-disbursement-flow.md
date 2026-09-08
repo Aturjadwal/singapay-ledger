@@ -2,7 +2,7 @@
 
 ## Overview
 
-The disbursement flow handles the transfer of funds from the user's DOKU wallet to their bank account. This is triggered when the user initiates a "KIRIM DOKU" request. The system deducts from the available balance immediately and tracks the disbursement status until completion.
+The disbursement flow handles the transfer of funds from the user's Singapay wallet to their bank account. This is triggered when the user initiates a "KIRIM Singapay" request. The system deducts from the available balance immediately and tracks the disbursement status until completion.
 
 ---
 
@@ -25,8 +25,8 @@ The disbursement flow handles the transfer of funds from the user's DOKU wallet 
 
 | Status | Description | Balance Impact |
 |--------|-------------|----------------|
-| `PENDING` | Disbursement created, awaiting DOKU API call | balance -= amount |
-| `PROCESSING` | DOKU accepted the request, transfer in progress | - |
+| `PENDING` | Disbursement created, awaiting Singapay API call | balance -= amount |
+| `PROCESSING` | Singapay accepted the request, transfer in progress | - |
 | `SUCCESS` | Transfer completed to user's bank | withdraw_accumulation += amount |
 | `FAILED` | Transfer failed, balance refunded | balance += amount (refund) |
 
@@ -43,20 +43,20 @@ The disbursement flow handles the transfer of funds from the user's DOKU wallet 
 | `currency` | string | Currency code |
 | `bank_name` | string | Destination bank (denormalized) |
 | `bank_account_number` | string | Destination account (denormalized) |
-| `gateway_request_id` | string | DOKU request ID |
-| `gateway_reference_number` | string | DOKU reference number |
+| `gateway_request_id` | string | Singapay request ID |
+| `gateway_reference_number` | string | Singapay reference number |
 | `requested_at` | time.Time | When user initiated the request |
-| `processed_at` | *time.Time | When DOKU accepted the request |
+| `processed_at` | *time.Time | When Singapay accepted the request |
 | `completed_at` | *time.Time | When transfer completed/failed |
 | `status` | string | PENDING, PROCESSING, SUCCESS, FAILED |
 | `failure_reason` | string | Reason if failed |
 
 ---
 
-## Create Disbursement Flow ("KIRIM DOKU")
+## Create Disbursement Flow ("KIRIM Singapay")
 
 ### When to Call
-Called when user initiates a withdrawal/disbursement from their DOKU wallet to their bank account.
+Called when user initiates a withdrawal/disbursement from their Singapay wallet to their bank account.
 
 ### Request Structure
 
@@ -77,7 +77,7 @@ type LedgerDisbursementCreateRequest struct {
 │                        CREATE DISBURSEMENT FLOW                                  │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
-│  1. User initiates "KIRIM DOKU" from their dashboard                           │
+│  1. User initiates "KIRIM Singapay" from their dashboard                           │
 │     - Selects destination bank account                                          │
 │     - Enters amount to disburse                                                 │
 │                                                                                 │
@@ -96,7 +96,7 @@ type LedgerDisbursementCreateRequest struct {
 │     - No change to withdraw_accumulation yet                                   │
 │                                                                                 │
 │  5. Return disbursement record to caller                                       │
-│     - Caller should then call DOKU "KIRIM" API                                 │
+│     - Caller should then call Singapay "KIRIM" API                                 │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -174,7 +174,7 @@ func (u *ledgerDisbursementUseCase) CreateDisbursement(
 ## Confirm Disbursement Flow
 
 ### When to Call
-Called after DOKU API accepts the disbursement request.
+Called after Singapay API accepts the disbursement request.
 
 ### Request Structure
 
@@ -193,9 +193,9 @@ type LedgerDisbursementConfirmRequest struct {
 │                       CONFIRM DISBURSEMENT FLOW                                  │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
-│  1. External service calls DOKU "KIRIM" API                                    │
+│  1. External service calls Singapay "KIRIM" API                                    │
 │                                                                                 │
-│  2. DOKU returns success response:                                             │
+│  2. Singapay returns success response:                                             │
 │     - request_id (for webhook matching)                                        │
 │     - reference_number                                                          │
 │                                                                                 │
@@ -260,7 +260,7 @@ func (u *ledgerDisbursementUseCase) ConfirmDisbursement(
 ## Complete Disbursement Flow
 
 ### When to Call
-Called when DOKU webhook confirms the transfer has been sent to the user's bank account.
+Called when money-in webhook confirms the transfer has been sent to the user's bank account.
 
 ### Request Structure
 
@@ -277,7 +277,7 @@ type LedgerDisbursementCompleteRequest struct {
 │                       COMPLETE DISBURSEMENT FLOW                                 │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
-│  1. DOKU sends webhook confirming transfer complete                            │
+│  1. Singapay sends webhook confirming transfer complete                            │
 │     - Status: SUCCESS                                                           │
 │     - request_id matches our gateway_request_id                                │
 │                                                                                 │
@@ -370,7 +370,7 @@ func (u *ledgerDisbursementUseCase) CompleteDisbursement(
 ## Fail Disbursement Flow
 
 ### When to Call
-Called when DOKU rejects the disbursement or the transfer fails.
+Called when Singapay rejects the disbursement or the transfer fails.
 
 ### Request Structure
 
@@ -388,8 +388,8 @@ type LedgerDisbursementFailRequest struct {
 │                         FAIL DISBURSEMENT FLOW                                   │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
-│  1. DOKU sends failure notification or API returns error                       │
-│     - Could be: invalid bank account, insufficient funds at DOKU, etc.         │
+│  1. Singapay sends failure notification or API returns error                       │
+│     - Could be: invalid bank account, insufficient funds at Singapay, etc.         │
 │                                                                                 │
 │  2. External service calls Ledger.FailDisbursement:                            │
 │     - gateway_request_id or disbursement_uuid                                  │
@@ -485,16 +485,16 @@ func (u *ledgerDisbursementUseCase) FailDisbursement(
 │  - balance: 135,800                                                             │
 │  - withdraw_accumulation: 0                                                     │
 │                                                                                 │
-│  10:00 - User initiates "KIRIM DOKU" for IDR 100,000                           │
+│  10:00 - User initiates "KIRIM Singapay" for IDR 100,000                           │
 │          ├─ Status = PENDING                                                    │
 │          └─ balance: 135,800 → 35,800 (reserved)                               │
 │                                                                                 │
-│  10:01 - External service calls DOKU "KIRIM" API                               │
-│          ├─ DOKU accepts request                                               │
+│  10:01 - External service calls Singapay "KIRIM" API                               │
+│          ├─ Singapay accepts request                                               │
 │          ├─ Status = PROCESSING                                                 │
 │          └─ gateway_request_id stored                                          │
 │                                                                                 │
-│  10:30 - DOKU webhook confirms transfer complete                               │
+│  10:30 - money-in webhook confirms transfer complete                               │
 │          ├─ Status = SUCCESS                                                    │
 │          ├─ withdraw_accumulation: 0 → 100,000                                 │
 │          └─ Money arrived in user's bank!                                      │
@@ -518,11 +518,11 @@ func (u *ledgerDisbursementUseCase) FailDisbursement(
 │  Initial State:                                                                 │
 │  - balance: 135,800                                                             │
 │                                                                                 │
-│  10:00 - User initiates "KIRIM DOKU" for IDR 100,000                           │
+│  10:00 - User initiates "KIRIM Singapay" for IDR 100,000                           │
 │          └─ balance: 135,800 → 35,800                                          │
 │                                                                                 │
-│  10:01 - External service calls DOKU API                                       │
-│          └─ DOKU rejects: "Invalid bank account number"                        │
+│  10:01 - External service calls Singapay API                                       │
+│          └─ Singapay rejects: "Invalid bank account number"                        │
 │                                                                                 │
 │  10:02 - FailDisbursement called                                               │
 │          ├─ Status = FAILED                                                     │
@@ -587,7 +587,7 @@ The `bank_name` and `bank_account_number` are stored directly on the disbursemen
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/ledger/disbursements` | POST | Create new disbursement |
-| `/ledger/disbursements/{uuid}/confirm` | POST | Confirm disbursement (DOKU accepted) |
+| `/ledger/disbursements/{uuid}/confirm` | POST | Confirm disbursement (Singapay accepted) |
 | `/ledger/disbursements/{uuid}/complete` | POST | Complete disbursement (transfer done) |
 | `/ledger/disbursements/{uuid}/fail` | POST | Fail disbursement (refund) |
 | `/ledger/disbursements/{uuid}` | GET | Get disbursement by UUID |

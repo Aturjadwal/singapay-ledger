@@ -69,14 +69,37 @@ const (
 	CodeNotFound       ErrorCode = 404
 	CodeInvalidRequest ErrorCode = 400
 
-	CodeDatabaseError           ErrorCode = 500001
-	CodeDokuAPIError            ErrorCode = 500002
+	CodeDatabaseError ErrorCode = 500001
+
+	// CodeGatewayAPIError covers every failed call to Singapay. It stays a 500-class
+	// code even when Singapay answered 4xx: an SP001 or SP004 on a payout is not the
+	// caller's fault and must not be surfaced to them as a bad request.
+	CodeGatewayAPIError ErrorCode = 500002
+
+	// CodeGatewayOutcomeUnknown is the one that decides money. It means a money-out
+	// call failed without telling us whether the money moved — a timeout, a dropped
+	// connection, or one of the SP-codes Singapay documents as "call inquiry-status".
+	// A caller must not treat it as a failure and must not retry it blind; the reserved
+	// balance stays held until an inquiry settles it.
+	CodeGatewayOutcomeUnknown ErrorCode = 500004
+
+	// CodeWebhookVerificationFailed means an inbound webhook's HMAC did not match, or
+	// its timestamp was outside the replay window. Distinct from CodeInvalidRequest so
+	// a handler can answer 401 rather than 400 and so forged deliveries are countable.
+	CodeWebhookVerificationFailed ErrorCode = 401001
+
 	CodeSubaccountAlreadyExists ErrorCode = 409001
 
 	// Ledger error codes
 	CodeLedgerNotFound                 ErrorCode = 404001
 	CodeLedgerAlreadyExists            ErrorCode = 409002
 	CodeReconciliationDiscrepancyFound ErrorCode = 409003
+
+	// CodeReconciliationNotImplemented reports that settlement reconciliation has no
+	// Singapay implementation yet. It is a state of the system, not a transient fault:
+	// retrying never helps, and a caller must not treat it as a reason to hold a
+	// webhook unacknowledged.
+	CodeReconciliationNotImplemented ErrorCode = 501001
 
 	// ProductTransaction error codes
 	CodeProductTransactionNotFound      ErrorCode = 404002
@@ -107,7 +130,7 @@ const (
 	CodeSettlementBatchAlreadyExists ErrorCode = 409007
 	CodeInvalidSettlementBatchStatus ErrorCode = 400010
 	CodeInvalidSettlementItem        ErrorCode = 400011
-	CodeInvalidSettlementCSVFormat   ErrorCode = 400012
+	CodeInvalidSettlementWindow      ErrorCode = 400012
 	CodeSettlementItemNotFound       ErrorCode = 404007
 
 	// Analytics error codes
@@ -169,10 +192,20 @@ var (
 	ErrSettlementBatchAlreadyExists = NewError(CodeSettlementBatchAlreadyExists, "settlement batch already exists for this date", nil)
 	ErrInvalidSettlementBatchStatus = NewError(CodeInvalidSettlementBatchStatus, "invalid settlement batch status transition", nil)
 	ErrInvalidSettlementItem        = NewError(CodeInvalidSettlementItem, "invalid settlement item data", nil)
-	ErrInvalidSettlementCSVFormat   = NewError(CodeInvalidSettlementCSVFormat, "invalid settlement CSV format", nil)
+	ErrInvalidSettlementWindow      = NewError(CodeInvalidSettlementWindow, "invalid settlement window", nil)
 	ErrSettlementItemNotFound       = NewError(CodeSettlementItemNotFound, "settlement item not found", nil)
 
 	ErrInvalidRequest = NewError(CodeInvalidRequest, "invalid request", nil)
+)
+
+// Gateway errors
+var (
+	// ErrGatewayOutcomeUnknown is returned when a money-out call gave no usable answer.
+	// See CodeGatewayOutcomeUnknown: the reservation stays held and the payout is
+	// resolved by inquiry, never by re-sending.
+	ErrGatewayOutcomeUnknown = NewError(CodeGatewayOutcomeUnknown, "gateway outcome unknown; resolve by inquiry", nil)
+
+	ErrWebhookVerificationFailed = NewError(CodeWebhookVerificationFailed, "webhook signature verification failed", nil)
 )
 
 // Analytics error

@@ -114,7 +114,7 @@ type LedgerEntryRepository interface {
 //
 //	seller account   +sellerAmount  PENDING  PAYMENT
 //	platform account +platformFee   PENDING  PLATFORM_FEE
-//	doku account     +dokuFee       PENDING  PAYMENT
+//	gateway account  +gatewayFee    PENDING  PAYMENT
 //
 // productTransactionID is used as the reference_id for all three entries.
 // journalUUID groups these entries as part of a single PAYMENT_SUCCESS event.
@@ -125,8 +125,8 @@ func NewPaymentEntries(
 	sellerAmount int64,
 	platformAccountID string,
 	platformFee int64,
-	dokuAccountID string,
-	dokuFee int64,
+	gatewayAccountID string,
+	gatewayFee int64,
 ) []*LedgerEntry {
 	sellerEntry := &LedgerEntry{
 		JournalUUID:   journalUUID,
@@ -150,18 +150,18 @@ func NewPaymentEntries(
 	}
 	redifu.InitRecord(platformEntry)
 
-	dokuEntry := &LedgerEntry{
+	gatewayEntry := &LedgerEntry{
 		JournalUUID:   journalUUID,
-		AccountUUID:   dokuAccountID,
-		Amount:        dokuFee,
+		AccountUUID:   gatewayAccountID,
+		Amount:        gatewayFee,
 		BalanceBucket: BalanceBucketPending,
 		EntryType:     EntryTypeProcessorFee,
 		SourceType:    SourceTypeProductTransaction,
 		SourceID:      productTransactionID,
 	}
-	redifu.InitRecord(dokuEntry)
+	redifu.InitRecord(gatewayEntry)
 
-	return []*LedgerEntry{sellerEntry, platformEntry, dokuEntry}
+	return []*LedgerEntry{sellerEntry, platformEntry, gatewayEntry}
 }
 
 // NewSettlementEntriesForAccount creates the PENDING→AVAILABLE conversion pair
@@ -205,23 +205,23 @@ func NewSettlementEntriesForAccount(
 	return []*LedgerEntry{pendingEntry, availableEntry}
 }
 
-// NewDokuFeeSettlementEntry creates the single PENDING clearance entry for the
-// DOKU expense account on settlement (Phase 3, Step D).
+// NewGatewayFeeSettlementEntry creates the single PENDING clearance entry for the
+// gateway expense account on settlement (Phase 3, Step D).
 //
-//	doku account  -dokuFee  PENDING  SETTLEMENT_FEE_CLEAR
+//	gateway account  -gatewayFee  PENDING  SETTLEMENT_FEE_CLEAR
 //
-// There is intentionally no AVAILABLE credit — DOKU keeps the fee.
+// There is intentionally no AVAILABLE credit — Singapay keeps the fee.
 // journalUUID groups this entry with other settlement entries.
-func NewDokuFeeSettlementEntry(
+func NewGatewayFeeSettlementEntry(
 	journalUUID string,
 	productTransactionID string,
-	dokuAccountID string,
-	dokuFee int64,
+	gatewayAccountID string,
+	gatewayFee int64,
 ) *LedgerEntry {
 	entry := &LedgerEntry{
 		JournalUUID:   journalUUID,
-		AccountUUID:   dokuAccountID,
-		Amount:        -dokuFee,
+		AccountUUID:   gatewayAccountID,
+		Amount:        -gatewayFee,
 		BalanceBucket: BalanceBucketPending,
 		EntryType:     EntryTypeSettlement,
 		SourceType:    SourceTypeProductTransaction,
@@ -232,7 +232,7 @@ func NewDokuFeeSettlementEntry(
 }
 
 // NewFeeAdjustmentWriteOffEntry creates a PENDING debit (write-off) for the absorbing party
-// when ActualDokuFee > ExpectedDokuFee.
+// when the fee Singapay actually took exceeds the one expected at payment time.
 //
 //	account  -amount  PENDING  FEE_ADJUSTMENT  (terminal — no AVAILABLE counterpart)
 //
@@ -259,11 +259,11 @@ func NewFeeAdjustmentWriteOffEntry(
 }
 
 // NewFeeAdjustmentCreditEntry creates an AVAILABLE credit (surplus) for the seller
-// when ActualDokuFee < ExpectedDokuFee.
+// when the fee Singapay actually took is below the one expected at payment time.
 //
 //	seller account  +amount  AVAILABLE  FEE_ADJUSTMENT  (terminal — no PENDING source)
 //
-// The surplus comes from DOKU charging less than expected; credited directly to seller.
+// The surplus comes from Singapay charging less than expected; credited directly to seller.
 func NewFeeAdjustmentCreditEntry(
 	journalUUID string,
 	productTransactionID string,
@@ -310,8 +310,9 @@ func NewDisbursementEntry(
 
 // NewDisbursementReversalEntry gives a reserved amount back to the available balance.
 //
-// Write this only when the payout is known not to have happened — DOKU rejected it, or
-// answered with a FAILED status. An unknown outcome (timeout, 5xx) must NOT be reversed:
+// Write this only when the payout is known not to have happened — Singapay refused it
+// outright (singapay.OutcomeRefused), or reported transaction status 04/05/06. An unknown
+// outcome must NOT be reversed:
 // the money may be on its way, and handing it back to the available balance is what lets
 // it be withdrawn a second time.
 func NewDisbursementReversalEntry(

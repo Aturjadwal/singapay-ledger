@@ -18,17 +18,17 @@ type BalanceResponse struct {
 	Currency              string        `json:"currency"`
 }
 
-// CheapestChannelInfo contains summary info for the payment channel with the lowest DOKU fee.
+// CheapestChannelInfo contains summary info for the payment channel with the lowest gateway fee.
 type CheapestChannelInfo struct {
 	PaymentChannel string `json:"payment_channel"`
-	DokuFee        int64  `json:"doku_fee"`
+	GatewayFee     int64  `json:"gateway_fee"`
 	TotalCharged   int64  `json:"total_charged"`
 }
 
 // FeeCalculationResponse wraps a FeeBreakdown and adds cheapest-channel guidance.
 type FeeCalculationResponse struct {
 	domain.FeeBreakdown
-	// CheapestPaymentChannel is the channel with the lowest DOKU fee for the same seller price.
+	// CheapestPaymentChannel is the channel with the lowest gateway fee for the same seller price.
 	// It equals the requested channel when that channel is already the cheapest.
 	CheapestPaymentChannel CheapestChannelInfo `json:"cheapest_payment_channel"`
 }

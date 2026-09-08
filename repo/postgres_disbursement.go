@@ -22,7 +22,7 @@ func (r *PostgresDisbursementRepository) GetByID(ctx context.Context, id string)
 		SELECT uuid, randid, account_uuid, amount, currency, status,
 		       bank_code, account_number, account_name,
 		       description, external_transaction_id, failure_reason,
-		       payout_request_id, created_at, updated_at, processed_at
+		       payout_request_id, gateway_fee, created_at, updated_at, processed_at
 		FROM disbursements
 		WHERE uuid = $1
 	`
@@ -51,6 +51,7 @@ func (r *PostgresDisbursementRepository) GetByID(ctx context.Context, id string)
 		&externalTxID,
 		&failureReason,
 		&payoutRequestID,
+		&d.GatewayFee,
 		&d.CreatedAt,
 		&d.UpdatedAt,
 		&processedAt,
@@ -106,7 +107,7 @@ func (r *PostgresDisbursementRepository) GetByAccountIDWithCursor(ctx context.Co
 			SELECT uuid, randid, account_uuid, amount, currency, status,
 			       bank_code, account_number, account_name,
 			       description, external_transaction_id, failure_reason,
-			       payout_request_id, created_at, updated_at, processed_at
+			       payout_request_id, gateway_fee, created_at, updated_at, processed_at
 			FROM disbursements
 			WHERE account_uuid = $1
 			ORDER BY created_at ` + sortOrder + `
@@ -121,7 +122,7 @@ func (r *PostgresDisbursementRepository) GetByAccountIDWithCursor(ctx context.Co
 				SELECT uuid, randid, account_uuid, amount, currency, status,
 				       bank_code, account_number, account_name,
 				       description, external_transaction_id, failure_reason,
-				       payout_request_id, created_at, updated_at, processed_at
+				       payout_request_id, gateway_fee, created_at, updated_at, processed_at
 				FROM disbursements
 				WHERE account_uuid = $1 
 				  AND (created_at < (SELECT created_at FROM disbursements WHERE randid = $2)
@@ -134,7 +135,7 @@ func (r *PostgresDisbursementRepository) GetByAccountIDWithCursor(ctx context.Co
 				SELECT uuid, randid, account_uuid, amount, currency, status,
 				       bank_code, account_number, account_name,
 				       description, external_transaction_id, failure_reason,
-				       payout_request_id, created_at, updated_at, processed_at
+				       payout_request_id, gateway_fee, created_at, updated_at, processed_at
 				FROM disbursements
 				WHERE account_uuid = $1 
 				  AND (created_at > (SELECT created_at FROM disbursements WHERE randid = $2)
@@ -168,7 +169,7 @@ func (r *PostgresDisbursementRepository) GetByLedgerID(ctx context.Context, ledg
 		SELECT uuid, randid, account_uuid, amount, currency, status,
 		       bank_code, account_number, account_name,
 		       description, external_transaction_id, failure_reason,
-		       payout_request_id, created_at, updated_at, processed_at
+		       payout_request_id, gateway_fee, created_at, updated_at, processed_at
 		FROM disbursements
 		WHERE account_uuid = $1
 		ORDER BY created_at DESC
@@ -189,7 +190,7 @@ func (r *PostgresDisbursementRepository) GetPendingByLedgerID(ctx context.Contex
 		SELECT uuid, randid, account_uuid, amount, currency, status,
 		       bank_code, account_number, account_name,
 		       description, external_transaction_id, failure_reason,
-		       payout_request_id, created_at, updated_at, processed_at
+		       payout_request_id, gateway_fee, created_at, updated_at, processed_at
 		FROM disbursements
 		WHERE account_uuid = $1 AND status = $2
 		ORDER BY created_at ASC
@@ -209,14 +210,14 @@ func (r *PostgresDisbursementRepository) GetPendingByLedgerID(ctx context.Contex
 // the caller is looking for payouts whose outcome was never learned, and those are not
 // concentrated in any one seller.
 //
-// The cutoff exists because a disbursement is written PENDING before DOKU is called, so
+// The cutoff exists because a disbursement is written PENDING before the gateway is called, so
 // a row created moments ago is not stuck — its first attempt is simply still in flight.
 func (r *PostgresDisbursementRepository) GetPendingOlderThan(ctx context.Context, cutoff time.Time, limit int) ([]*domain.Disbursement, error) {
 	query := `
 		SELECT uuid, randid, account_uuid, amount, currency, status,
 		       bank_code, account_number, account_name,
 		       description, external_transaction_id, failure_reason,
-		       payout_request_id, created_at, updated_at, processed_at
+		       payout_request_id, gateway_fee, created_at, updated_at, processed_at
 		FROM disbursements
 		WHERE status = $1 AND created_at < $2
 		ORDER BY created_at ASC
@@ -234,18 +235,19 @@ func (r *PostgresDisbursementRepository) GetPendingOlderThan(ctx context.Context
 
 // Save inserts a disbursement, or updates the mutable parts of one that already exists.
 //
-// payout_request_id is deliberately absent from the DO UPDATE SET list: it is set once,
-// when the row is first written ahead of the DOKU call, and must survive every later save.
-// Overwriting it would hand a retry a fresh idempotency key, which is precisely the hole
-// this column was added to close.
+// payout_request_id and gateway_fee are deliberately absent from the DO UPDATE SET list.
+// Both are set once, when the row is first written ahead of the gateway call, and must
+// survive every later save. Overwriting the reference would hand a retry a fresh
+// idempotency key, which is precisely the hole that column was added to close; overwriting
+// the fee would make the reversal disagree with the reservation it is meant to release.
 func (r *PostgresDisbursementRepository) Save(ctx context.Context, d *domain.Disbursement) error {
 	query := `
 		INSERT INTO disbursements (
 			uuid, randid, account_uuid, amount, currency, status,
 			bank_code, account_number, account_name,
 			description, external_transaction_id, failure_reason,
-			payout_request_id, created_at, updated_at, processed_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			payout_request_id, gateway_fee, created_at, updated_at, processed_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		ON CONFLICT (uuid) DO UPDATE SET
 			status = EXCLUDED.status,
 			external_transaction_id = EXCLUDED.external_transaction_id,
@@ -270,6 +272,7 @@ func (r *PostgresDisbursementRepository) Save(ctx context.Context, d *domain.Dis
 		toNullString(d.ExternalTransactionID),
 		toNullString(d.FailureReason),
 		toNullString(d.PayoutRequestID),
+		d.GatewayFee,
 		d.CreatedAt,
 		d.UpdatedAt,
 		toNullTime(d.ProcessedAt),
@@ -337,6 +340,7 @@ func (r *PostgresDisbursementRepository) scanDisbursements(rows *sql.Rows) ([]*d
 			&externalTxID,
 			&failureReason,
 			&payoutRequestID,
+			&d.GatewayFee,
 			&d.CreatedAt,
 			&d.UpdatedAt,
 			&processedAt,
@@ -370,4 +374,45 @@ func (r *PostgresDisbursementRepository) scanDisbursements(rows *sql.Rows) ([]*d
 	}
 
 	return disbursements, nil
+}
+
+// GetByPayoutRequestID resolves a disbursement from the reference_number a payout went out
+// under.
+//
+// This is how a money-out webhook finds its row. Singapay's callback names the payout by
+// its reference_number and by its own transaction_id, and only the first is something this
+// ledger chose and stored before the call — the transaction_id does not exist until
+// Singapay accepts the instruction, which is exactly the moment that can be lost.
+func (r *PostgresDisbursementRepository) GetByPayoutRequestID(ctx context.Context, payoutRequestID string) (*domain.Disbursement, error) {
+	// An empty reference never matches. Rows predating migration 014 carry NULL, and
+	// letting "" through would match one of them on a schema where the column is NOT
+	// NULL and book a stranger's payout outcome onto it.
+	if payoutRequestID == "" {
+		return nil, ErrNotFound
+	}
+
+	query := `
+		SELECT uuid, randid, account_uuid, amount, currency, status,
+		       bank_code, account_number, account_name,
+		       description, external_transaction_id, failure_reason,
+		       payout_request_id, gateway_fee, created_at, updated_at, processed_at
+		FROM disbursements
+		WHERE payout_request_id = $1
+		LIMIT 1
+	`
+
+	rows, err := r.db.QueryContext(ctx, query, payoutRequestID)
+	if err != nil {
+		return nil, ErrFailedQuerySQL.WithError(err)
+	}
+	defer rows.Close()
+
+	disbursements, err := r.scanDisbursements(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(disbursements) == 0 {
+		return nil, ErrNotFound
+	}
+	return disbursements[0], nil
 }

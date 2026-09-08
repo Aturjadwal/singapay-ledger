@@ -267,7 +267,7 @@ GROUP BY
 -- ============================================================================
 SELECT
     'Discrepancy from API' AS source,
-    'DOKU says: Pending = 204000, Available = 138015' AS doku_values,
+    'Gateway says: Pending = 204000, Available = 138015' AS gateway_values,
     'Our DB says: Pending = 0, Available = 46005' AS our_values,
     'Difference: Pending diff = 204000, Available diff = 92010' AS differences;
 
@@ -285,13 +285,13 @@ SELECT
 --    - OR there was a disbursement that was deleted
 --    - OR the field is being updated at the wrong time
 -- 
--- 3. The DOKU mismatch (expected vs actual) suggests:
---    - Our ledger_accounts balances (pending=0, available=46005) don't match DOKU
---    - DOKU says: pending=204000, available=138015
+-- 3. The gateway mismatch (expected vs actual) suggests:
+--    - Our ledger_accounts balances (pending=0, available=46005) don't match the gateway
+--    - The gateway says: pending=204000, available=138015
 --    - This is a major discrepancy that needs reconciliation
 -- 
 -- NEXT STEPS:
--- 1. Run a CSV reconciliation to sync with DOKU
+-- 1. Run a settlement reconciliation to sync with the gateway
 -- 2. Check when total_deposit_amount and total_withdrawal_amount are updated
 -- 3. Verify the logic in the code that updates these fields
 -- ============================================================================

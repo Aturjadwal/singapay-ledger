@@ -51,13 +51,24 @@ type Disbursement struct {
 	Status                DisbursementStatus
 	BankAccount           BankAccount
 	Description           string
-	ExternalTransactionID string // DOKU transaction ID
+	ExternalTransactionID string // Singapay transaction_id for the payout
 	FailureReason         string
 	ProcessedAt           *time.Time
 
-	// PayoutRequestID is the DOKU Request-Id this payout was, or will be, sent under.
-	// It is written with the row before DOKU is called and never changes afterwards:
-	// replaying the same id is what stops a retry from paying out a second time.
+	// GatewayFee is what Singapay charges to move the money, quoted before the payout
+	// is sent and reserved on top of Amount.
+	//
+	// Singapay's disbursement amount is the NET the beneficiary receives; the fee is
+	// added, so the sub-account is debited Amount + GatewayFee. Reserving only Amount
+	// would leave the ledger short by the fee on every single payout, and the drift is
+	// silent — the books balance against themselves and disagree only with Singapay.
+	GatewayFee int64
+
+	// PayoutRequestID is the reference_number this payout was, or will be, sent under.
+	// It is written with the row before Singapay is called and never changes afterwards:
+	// replaying the same reference is what stops a retry from paying out a second time.
+	// Singapay answers SP004 for a reference it has already seen, which is a signal to
+	// inquire rather than to re-send.
 	PayoutRequestID string
 }
 
@@ -77,6 +88,11 @@ type DisbursementRepository interface {
 	// before the cutoff, oldest first. It backs the operator sweep for payouts whose
 	// outcome was never learned.
 	GetPendingOlderThan(ctx context.Context, cutoff time.Time, limit int) ([]*Disbursement, error)
+
+	// GetByPayoutRequestID resolves a disbursement from the reference_number it was sent
+	// under. This is how an inbound payout webhook finds its row: the reference is the
+	// only identifier this ledger chose and stored before the gateway was called.
+	GetByPayoutRequestID(ctx context.Context, payoutRequestID string) (*Disbursement, error)
 
 	Save(ctx context.Context, d *Disbursement) error
 	UpdateStatus(ctx context.Context, id string, status DisbursementStatus, processedAt *time.Time, failureReason string) error
@@ -115,7 +131,7 @@ func NewDisbursement(
 }
 
 // NewDisbursementWithID creates a new disbursement with a pre-generated ID
-// Use this when the ID needs to be known before creation (e.g., for DOKU invoice number)
+// Use this when the ID needs to be known before creation (it doubles as the payout notes reference)
 func NewDisbursementWithID(
 	id string,
 	ledgerID string,
@@ -170,7 +186,7 @@ func (d *Disbursement) IsPending() bool {
 	return d.Status == DisbursementStatusPending
 }
 
-// IsProcessing checks if disbursement is being processed by DOKU
+// IsProcessing checks if disbursement is still in flight at the gateway
 func (d *Disbursement) IsProcessing() bool {
 	return d.Status == DisbursementStatusProcessing
 }
@@ -205,9 +221,9 @@ func (d *Disbursement) CanTransitionTo(newStatus DisbursementStatus) bool {
 	switch d.Status {
 	case DisbursementStatusPending:
 		// PENDING can transition to:
-		// - PROCESSING: DOKU accepted, waiting for final confirmation
-		// - COMPLETED: DOKU returned SUCCESS immediately
-		// - FAILED: DOKU rejected or error occurred
+		// - PROCESSING: Singapay accepted the instruction, outcome not yet final
+		// - COMPLETED: Singapay reported transaction status 00
+		// - FAILED: Singapay refused, or reported a terminal failure status
 		// - CANCELLED: User cancelled before processing
 		return newStatus == DisbursementStatusProcessing ||
 			newStatus == DisbursementStatusCompleted ||
@@ -225,7 +241,7 @@ func (d *Disbursement) CanTransitionTo(newStatus DisbursementStatus) bool {
 	}
 }
 
-// MarkProcessing transitions from PENDING to PROCESSING (when DOKU accepts the request)
+// MarkProcessing transitions from PENDING to PROCESSING (when Singapay accepts the instruction)
 func (d *Disbursement) MarkProcessing(externalTxID string) error {
 	if !d.CanTransitionTo(DisbursementStatusProcessing) {
 		return ledgererr.ErrInvalidDisbursementStatus
@@ -235,7 +251,7 @@ func (d *Disbursement) MarkProcessing(externalTxID string) error {
 	return nil
 }
 
-// MarkCompleted transitions to COMPLETED status (when DOKU confirms success)
+// MarkCompleted transitions to COMPLETED status (when Singapay confirms success)
 // Can transition from PENDING (immediate success) or PROCESSING (async success)
 func (d *Disbursement) MarkCompleted(externalTxID string) error {
 	if !d.CanTransitionTo(DisbursementStatusCompleted) {
@@ -273,7 +289,7 @@ func (d *Disbursement) MarkCancelled(reason string) error {
 }
 
 // NeedsRollback checks if this disbursement requires a balance rollback
-// (failed before DOKU processed it)
+// (failed before the gateway processed it)
 func (d *Disbursement) NeedsRollback() bool {
 	return d.Status == DisbursementStatusFailed && d.ExternalTransactionID == ""
 }

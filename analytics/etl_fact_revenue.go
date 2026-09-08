@@ -88,7 +88,7 @@ func (c *LedgerAnalyticsClient) RunFactRevenueTimeseriesETL(ctx context.Context,
 		    ai.interval_label,
 		    COALESCE(SUM(pt.platform_fee) FILTER (WHERE pt.product_type != 'SUBSCRIPTION'), 0) AS convenience_fee_total,
 		    COALESCE(SUM(pt.seller_price) FILTER (WHERE pt.product_type = 'SUBSCRIPTION'), 0)  AS subscription_fee_total,
-		    COALESCE(SUM(pt.doku_fee), 0)                                                        AS gateway_fee_paid_total,
+		    COALESCE(SUM(pt.gateway_fee), 0)                                                        AS gateway_fee_paid_total,
 		    COUNT(*)                                                                             AS settlement_transaction_count
 		  FROM affected_intervals ai
 		  JOIN product_transactions pt ON pt.status = 'SETTLED'

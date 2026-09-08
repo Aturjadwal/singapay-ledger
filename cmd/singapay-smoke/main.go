@@ -368,7 +368,7 @@ func stepMethods(ctx context.Context, c *singapay.Client) error {
 		fmt.Printf("    %-18s %-8s %s\n", m.Code, m.Group, m.Name)
 	}
 	fmt.Println()
-	fmt.Println("  These codes are what a fee table must key on — DOKU's channel names")
+	fmt.Println("  These codes are what a fee table must key on — no other spelling")
 	fmt.Println("  are not accepted anywhere in this API.")
 	return nil
 }

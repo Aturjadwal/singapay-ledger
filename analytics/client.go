@@ -8,28 +8,30 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/21strive/doku/app/usecases"
 	"github.com/redis/go-redis/v9"
 )
 
 // LedgerAnalyticsClient provides the interface for running analytics ETL jobs.
 // It manages dimension and fact table populations with idempotency and watermarking.
+//
+// It takes no payment gateway client. It used to, for exactly one purpose — reading the
+// gateway's supported-bank catalogue to build dim_bank — and Singapay publishes no such
+// catalogue. The dimension is now derived from the payouts this ledger has actually made,
+// which needs no network at all. See ensureDimBank.
 type LedgerAnalyticsClient struct {
 	ledgerDB          *sql.DB
 	ledgerAnalyticsDB *sql.DB
 	redis             redis.UniversalClient
 	logger            *slog.Logger
-	dokuClient        usecases.DokuUseCaseInterface
 }
 
 // NewLedgerAnalyticsClient creates a new analytics client.
-func NewLedgerAnalyticsClient(ledgerDB *sql.DB, ledgerAnalyticsDB *sql.DB, redisClient redis.UniversalClient, logger *slog.Logger, dokuClient usecases.DokuUseCaseInterface) *LedgerAnalyticsClient {
+func NewLedgerAnalyticsClient(ledgerDB *sql.DB, ledgerAnalyticsDB *sql.DB, redisClient redis.UniversalClient, logger *slog.Logger) *LedgerAnalyticsClient {
 	return &LedgerAnalyticsClient{
 		ledgerDB:          ledgerDB,
 		ledgerAnalyticsDB: ledgerAnalyticsDB,
 		redis:             redisClient,
 		logger:            logger,
-		dokuClient:        dokuClient,
 	}
 }
 

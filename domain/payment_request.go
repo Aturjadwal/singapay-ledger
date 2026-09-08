@@ -19,11 +19,11 @@ const (
 	PaymentStatusExpired   PaymentStatus = "EXPIRED"
 )
 
-// PaymentRequest tracks DOKU payment lifecycle for a transaction
+// PaymentRequest tracks the gateway payment lifecycle for a transaction
 type PaymentRequest struct {
 	*redifu.Record         `json:",inline" bson:",inline" db:"-"`
 	ProductTransactionUUID string
-	RequestID              string // DOKU's payment request ID
+	RequestID              string // Singapay's own id for the payment instrument (VA ULID, QRIS/link id, e-wallet id)
 	PaymentCode            string // VA number, QRIS code, etc.
 	PaymentChannel         string // Payment method (QRIS, VA_BCA, etc.)
 	PaymentURL             string // URL for user to complete payment
@@ -31,7 +31,7 @@ type PaymentRequest struct {
 	Currency               Currency
 	Status                 PaymentStatus
 	FailureReason          string
-	CompletedAt            *time.Time // When DOKU webhook confirmed payment
+	CompletedAt            *time.Time // When the money-in webhook confirmed payment
 	ExpiresAt              time.Time  // Payment link expiration
 }
 
@@ -130,7 +130,7 @@ func (pr *PaymentRequest) CanTransitionTo(newStatus PaymentStatus) bool {
 	}
 }
 
-// MarkCompleted transitions from PENDING to COMPLETED (when DOKU webhook received)
+// MarkCompleted transitions from PENDING to COMPLETED (when the money-in webhook is booked)
 func (pr *PaymentRequest) MarkCompleted() error {
 	if !pr.CanTransitionTo(PaymentStatusCompleted) {
 		return ledgererr.ErrInvalidPaymentStatus

@@ -50,7 +50,7 @@ WITH daily_revenue_deltas AS (
     DATE_TRUNC('day', settled_at)::DATE AS settled_day,
     COALESCE(SUM(platform_fee) FILTER (WHERE product_type != 'SUBSCRIPTION'), 0) AS day_convenience,
     COALESCE(SUM(seller_price) FILTER (WHERE product_type = 'SUBSCRIPTION'), 0) AS day_subscription,
-    COALESCE(SUM(doku_fee), 0) AS day_gateway
+    COALESCE(SUM(gateway_fee), 0) AS day_gateway
   FROM product_transactions
   WHERE status = 'SETTLED'
     AND updated_at > $1
@@ -69,7 +69,7 @@ FROM daily_revenue_deltas
 SELECT
   COALESCE(SUM(platform_fee) FILTER (WHERE product_type != 'SUBSCRIPTION'), 0) AS total_convenience,
   COALESCE(SUM(seller_price) FILTER (WHERE product_type = 'SUBSCRIPTION'), 0) AS total_subscription,
-  COALESCE(SUM(doku_fee), 0) AS total_gateway
+  COALESCE(SUM(gateway_fee), 0) AS total_gateway
 FROM product_transactions
 WHERE status = 'SETTLED'
 	AND settled_at >= DATE_TRUNC('year', $1::timestamptz)

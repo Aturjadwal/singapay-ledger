@@ -28,8 +28,7 @@ const (
 )
 
 type Account struct {
-	*redifu.Record   `json:",inline" bson:",inline" db:"-"`
-	DokuSubAccountID string `json:"doku_sub_account_id,omitempty"`
+	*redifu.Record `json:",inline" bson:",inline" db:"-"`
 
 	// SingapayAccountID is the sub-account's ULID. It identifies the account on every
 	// Singapay endpoint — payment link, virtual account, QRIS, e-wallet, balance,
@@ -51,35 +50,34 @@ type Account struct {
 	TotalDepositAmount    int64     `json:"total_deposit_amount"`    // Sum of all deposits
 }
 
-func NewAccount(ownerType OwnerType, dokuSubAccountID string, ownerID string, currency Currency) Account {
+func NewAccount(ownerType OwnerType, singapayAccountID string, ownerID string, currency Currency) Account {
 	a := Account{
-		DokuSubAccountID: dokuSubAccountID,
-		OwnerType:        ownerType,
-		OwnerID:          ownerID,
-		Currency:         currency,
+		SingapayAccountID: singapayAccountID,
+		OwnerType:         ownerType,
+		OwnerID:           ownerID,
+		Currency:          currency,
 	}
 	redifu.InitRecord(&a)
 	return a
 }
 
-func NewPlatformAccount(dokuSubAccountID string, ownerID string, currency Currency) Account {
-	return NewAccount(OwnerTypePlatform, dokuSubAccountID, ownerID, currency)
+func NewPlatformAccount(singapayAccountID string, ownerID string, currency Currency) Account {
+	return NewAccount(OwnerTypePlatform, singapayAccountID, ownerID, currency)
 }
 
-func NewSellerAccount(dokuSubAccountID string, sellerId string, currency Currency) Account {
-	return NewAccount(OwnerTypeSeller, dokuSubAccountID, sellerId, currency)
+func NewSellerAccount(singapayAccountID string, sellerId string, currency Currency) Account {
+	return NewAccount(OwnerTypeSeller, singapayAccountID, sellerId, currency)
 }
 
-func NewPaymentGatewayAccount(dokuSubAccountID string, ownerID string, currency Currency) Account {
-	return NewAccount(OwnerTypePaymentGateway, dokuSubAccountID, ownerID, currency)
+func NewPaymentGatewayAccount(singapayAccountID string, ownerID string, currency Currency) Account {
+	return NewAccount(OwnerTypePaymentGateway, singapayAccountID, ownerID, currency)
 }
 
 // SetSingapayAccount records both identifiers Singapay issues for one sub-account.
 //
-// It is a setter rather than a constructor parameter because an account is created with
-// whichever gateway backs it, and the three constructors above already carry a positional
-// gateway id. accountNumber may legitimately be empty: Singapay declares it nullable in
-// the create response.
+// The ULID is a constructor argument because no account is useful without one; the number
+// is set here because Singapay declares it nullable in the create response, so it may
+// genuinely arrive later or not at all. See CanReceiveTransfer for what that costs.
 func (a *Account) SetSingapayAccount(accountID, accountNumber string) {
 	a.SingapayAccountID = accountID
 	a.SingapayAccountNumber = accountNumber
@@ -107,7 +105,10 @@ type AccountRepository interface {
 	// entries to land, then reads a balance that includes them.
 	GetByIDForUpdate(ctx context.Context, id string) (*Account, error)
 	GetByOwner(ctx context.Context, ownerType OwnerType, ownerID string) (*Account, error)
-	GetByDokuSubAccountID(ctx context.Context, dokuSubAccountID string) (*Account, error)
+	// GetBySingapayAccountID resolves an account from the ULID Singapay puts on webhooks
+	// and transaction records. There is deliberately no lookup by account number: the
+	// number appears only as a transfer beneficiary, and accounts issued without one
+	// would be unreachable through it.
 	GetBySingapayAccountID(ctx context.Context, singapayAccountID string) (*Account, error)
 	GetBySellerID(ctx context.Context, sellerId string) (*Account, error)
 	GetPlatformAccount(ctx context.Context) (*Account, error)

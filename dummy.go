@@ -10,17 +10,18 @@ import (
 )
 
 // SetupDummyData seeds a development database. platformEmail is no longer used: nothing
-// in this package provisions a DOKU sub-account for the platform any more (see the note
-// where CreatePlatformAccount used to live). The parameter is kept so existing callers
-// still compile.
+// in this package provisions a platform sub-account any more (see the note where
+// CreatePlatformAccount used to live). The parameter is kept so existing callers still
+// compile.
 func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) {
 	// Setup Platform Account.
 	//
-	// A real environment gets its platform account from scripts/doku-subaccount plus a
-	// hand-inserted row. Seeding cannot do that, so it settles for a local row with an
-	// empty sub-account id — enough for the dummy ledger entries below to balance, and
-	// unable to move money: ProcessPlatformFeeTransfer refuses outright on an empty
-	// DokuSubAccountID, so a seeded database announces itself instead of quietly
+	// A real environment gets its platform account provisioned at Singapay by hand, then
+	// a hand-inserted row carrying both the ULID and the account number. Seeding cannot
+	// do that, so it settles for a local row with no Singapay identifiers — enough for
+	// the dummy ledger entries below to balance, and unable to move money:
+	// ProcessPlatformFeeTransfer refuses outright when the platform account has no
+	// account number, so a seeded database announces itself instead of quietly
 	// transferring fees somewhere unintended.
 	platformAccount, err := c.repoProvider.Account().GetPlatformAccount(context.Background())
 	if err != nil {
@@ -36,33 +37,35 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 			return
 		}
 		platformAccount = &seeded
-		c.logger.InfoContext(context.Background(), "Seeded platform account without a DOKU sub-account", "account_id", platformAccount.Record.UUID)
+		c.logger.InfoContext(context.Background(), "Seeded platform account without Singapay identifiers", "account_id", platformAccount.Record.UUID)
 	} else {
 		c.logger.InfoContext(context.Background(), "Platform account already exists", "account_id", platformAccount.Record.UUID)
 	}
 
-	// Setup DOKU Account
-	var dokuAccount domain.Account
+	// Setup the gateway expense account. It is bookkeeping only — it holds the gateway
+	// fees this ledger has recognised so settlement can clear them — so it has no
+	// Singapay sub-account behind it and needs none.
+	var gatewayAccount domain.Account
 	c.txProvider.Transact(context.Background(), func(tx repo.Tx) error {
 
-		existingDokuAcc, err := tx.Account().GetPaymentGatewayAccount(context.Background())
+		existingGatewayAcc, err := tx.Account().GetPaymentGatewayAccount(context.Background())
 		if err != nil && err == repo.ErrNotFound {
-			c.logger.InfoContext(context.Background(), "No existing DOKU account found, creating new one...")
+			c.logger.InfoContext(context.Background(), "No existing gateway account found, creating new one...")
 		} else if err != nil {
-			c.logger.ErrorContext(context.Background(), "Failed to check existing DOKU account: skipping...", "error", err)
+			c.logger.ErrorContext(context.Background(), "Failed to check existing gateway account: skipping...", "error", err)
 			return nil
 		} else {
-			c.logger.InfoContext(context.Background(), "DOKU account already exists", "account_id", existingDokuAcc.Record.UUID)
-			dokuAccount = *existingDokuAcc
+			c.logger.InfoContext(context.Background(), "Gateway account already exists", "account_id", existingGatewayAcc.Record.UUID)
+			gatewayAccount = *existingGatewayAcc
 			return nil
 		}
 
-		dokuAccount = domain.NewPaymentGatewayAccount("", "DOKU", domain.CurrencyIDR)
-		err = tx.Account().Save(context.Background(), &dokuAccount)
+		gatewayAccount = domain.NewPaymentGatewayAccount("", "SINGAPAY", domain.CurrencyIDR)
+		err = tx.Account().Save(context.Background(), &gatewayAccount)
 		if err != nil {
-			c.logger.ErrorContext(context.Background(), "Failed to create DOKU account: skipping...", "error", err)
+			c.logger.ErrorContext(context.Background(), "Failed to create gateway account: skipping...", "error", err)
 		} else {
-			c.logger.InfoContext(context.Background(), "DOKU account created", "account_id", dokuAccount.Record.UUID)
+			c.logger.InfoContext(context.Background(), "Gateway account created", "account_id", gatewayAccount.Record.UUID)
 		}
 
 		return nil
@@ -312,7 +315,7 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 					"invoice_number": invoiceNum,
 					"seller_price":   productTx.Fee.SellerPrice,
 					"platform_fee":   productTx.Fee.PlatformFee,
-					"doku_fee":       productTx.Fee.DokuFee,
+					"gateway_fee":    productTx.Fee.GatewayFee,
 				},
 			)
 
@@ -323,8 +326,8 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 				productTx.Fee.SellerPrice,
 				platformAccount.Record.UUID,
 				productTx.Fee.PlatformFee,
-				dokuAccount.Record.UUID,
-				productTx.Fee.DokuFee,
+				gatewayAccount.Record.UUID,
+				productTx.Fee.GatewayFee,
 			)
 
 			productTx.MarkCompleted()
@@ -348,7 +351,7 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 			// Here you would save the product transaction and ledger entries to the database
 			// For this dummy setup, we're just generating the entries without persisting them
 
-			c.logger.InfoContext(context.Background(), "Generated dummy transaction and ledger entries", "transaction_id", productTx.Record.UUID, "seller_amount", productTx.Fee.SellerPrice, "platform_fee", productTx.Fee.PlatformFee, "doku_fee", productTx.Fee.DokuFee)
+			c.logger.InfoContext(context.Background(), "Generated dummy transaction and ledger entries", "transaction_id", productTx.Record.UUID, "seller_amount", productTx.Fee.SellerPrice, "platform_fee", productTx.Fee.PlatformFee, "gateway_fee", productTx.Fee.GatewayFee)
 		}
 
 		// SETTLED Transactions (settled via CSV, in available_balance)
@@ -392,7 +395,7 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 					"invoice_number": invoiceNum,
 					"seller_price":   productTx.Fee.SellerPrice,
 					"platform_fee":   productTx.Fee.PlatformFee,
-					"doku_fee":       productTx.Fee.DokuFee,
+					"gateway_fee":    productTx.Fee.GatewayFee,
 				},
 			)
 
@@ -403,8 +406,8 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 				productTx.Fee.SellerPrice,
 				platformAccount.Record.UUID,
 				productTx.Fee.PlatformFee,
-				dokuAccount.Record.UUID,
-				productTx.Fee.DokuFee,
+				gatewayAccount.Record.UUID,
+				productTx.Fee.GatewayFee,
 			)
 
 			// 2. Create settlement journal and entries (move from PENDING to AVAILABLE)
@@ -433,12 +436,12 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 				feeBreakdown.PlatformFee,
 			)
 
-			// DOKU Fee Entry
-			dokuEntry := domain.NewDokuFeeSettlementEntry(
+			// Gateway fee entry
+			gatewayEntry := domain.NewGatewayFeeSettlementEntry(
 				settlementJournal.UUID,
 				batchID,
-				dokuAccount.Record.UUID,
-				feeBreakdown.DokuFee,
+				gatewayAccount.Record.UUID,
+				feeBreakdown.GatewayFee,
 			)
 
 			// Save journals first
@@ -453,7 +456,7 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 
 			// Combine all ledger entries: payment + settlement
 			settlementEntries := append(sellerEntry, platformEntry...)
-			settlementEntries = append(settlementEntries, dokuEntry)
+			settlementEntries = append(settlementEntries, gatewayEntry)
 			allEntries := append(paymentEntries, settlementEntries...)
 
 			// Insert all ledger entries
@@ -467,7 +470,7 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 				return err
 			}
 
-			c.logger.InfoContext(context.Background(), "Generated dummy settled transaction and ledger entries", "transaction_id", productTx.Record.UUID, "seller_amount", productTx.Fee.SellerPrice, "platform_fee", productTx.Fee.PlatformFee, "doku_fee", productTx.Fee.DokuFee)
+			c.logger.InfoContext(context.Background(), "Generated dummy settled transaction and ledger entries", "transaction_id", productTx.Record.UUID, "seller_amount", productTx.Fee.SellerPrice, "platform_fee", productTx.Fee.PlatformFee, "gateway_fee", productTx.Fee.GatewayFee)
 		}
 
 		// Process disbursements (withdrawals)
@@ -584,8 +587,8 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 		// 	productTx.Fee.SellerPrice,
 		// 	platformAccount.Record.UUID,
 		// 	productTx.Fee.PlatformFee,
-		// 	dokuAccount.Record.UUID,
-		// 	productTx.Fee.DokuFee,
+		// 	gatewayAccount.Record.UUID,
+		// 	productTx.Fee.GatewayFee,
 		// )
 
 		// return nil

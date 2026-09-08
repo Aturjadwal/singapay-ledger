@@ -1,6 +1,6 @@
 // Package singapay is a client for the Singapay Payment Gateway merchant API.
 //
-// It covers the surface this ledger needs to replace DOKU: sub-accounts, balances,
+// It covers the surface this ledger needs: sub-accounts, balances,
 // transfers between accounts, and bank disbursement — plus the three signature schemes
 // Singapay uses. Money-in (payment link, virtual account, QRIS) and reconciliation are
 // deliberately absent for now; see docs/105-singapay-migration.md for why those are still
@@ -28,8 +28,7 @@
 // Singapay is inconsistent about how it writes money: "1234.56" on balances, 100000 on a
 // VA webhook, "500000" on an account transfer. Every monetary field here is an [Amount],
 // which accepts all three and refuses to truncate silently. Reading a balance with
-// fmt.Sscanf("%d") — which is what the DOKU path does today — turns "1234.56" into 1234
-// and reports no error at all.
+// fmt.Sscanf("%d") turns "1234.56" into 1234 and reports no error at all.
 //
 // # A response code is not a transaction status
 //

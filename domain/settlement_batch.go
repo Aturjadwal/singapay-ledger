@@ -19,24 +19,48 @@ const (
 	SettlementBatchStatusFailed     SettlementBatchStatus = "FAILED"
 )
 
-// SettlementBatch represents a CSV settlement upload from DOKU
-// It contains the totals and tracks the reconciliation process
+// SettlementBatch is one Singapay settlement, and the record of what this ledger did
+// about it.
+//
+// Singapay announces a settlement on settlement_notif_url with totals and a date window,
+// and nothing else: there is no list of the transactions it covered. SettleFrom and
+// SettleTo are therefore not decoration — they are the only handle on which rows the
+// batch contained, and the reconciler replays them against the per-product transaction
+// lists to find out. A batch with no window can never be reprocessed or audited, so both
+// are required.
 type SettlementBatch struct {
-	*redifu.Record   `json:",inline" bson:",inline" db:"-"`
-	LedgerUUID       string
-	ReportFileName   string
-	SettlementDate   time.Time
-	BatchID          string // DOKU Batch ID from CSV metadata (e.g., B-BSN-0203-1761932477260-SBS-8298-20251109155312120-20260305210108875)
-	GrossAmount      int64  // Total amount before DOKU fees
-	NetAmount        int64  // Amount after DOKU fees (PAY TO MERCHANT total)
-	DokuFee          int64  // Total DOKU fees from all transactions
-	Currency         Currency
-	UploadedBy       string
-	UploadedAt       time.Time
+	*redifu.Record `json:",inline" bson:",inline" db:"-"`
+	LedgerUUID     string
+
+	// BatchID is Singapay's own identifier for the settlement. It is the idempotency
+	// key: a batch_id already present has been booked, and the ledger entries behind it
+	// are immutable.
+	BatchID string
+
+	// SettlementReference is Singapay's reference_no — the human-facing label a support
+	// conversation will quote. It is not unique enough to key on; BatchID is.
+	SettlementReference string
+
+	// SettleFrom and SettleTo bound the window Singapay says this batch covered. The
+	// transaction lists are filtered on exactly this range to reconstruct the rows.
+	SettleFrom time.Time
+	SettleTo   time.Time
+
+	SettlementDate time.Time
+	GrossAmount    int64 // Total charged across all matched transactions
+	NetAmount      int64 // Total credited after gateway fees
+	GatewayFee     int64 // Total channel fees Singapay took
+	Currency       Currency
+
+	// InitiatedBy names who caused this reconciliation to run: the webhook that
+	// delivered the settlement, or the operator who replayed it by hand.
+	InitiatedBy string
+	InitiatedAt time.Time
+
 	ProcessedAt      *time.Time
 	ProcessingStatus SettlementBatchStatus
-	MatchedCount     int    // Number of successfully matched transactions
-	UnmatchedCount   int    // Number of unmatched CSV rows
+	MatchedCount     int    // Number of settled rows matched to a transaction
+	UnmatchedCount   int    // Number of settled rows that could not be booked
 	FailureReason    string // Reason if processing failed
 	Metadata         map[string]any
 }
@@ -46,52 +70,68 @@ type SettlementBatchRepository interface {
 	GetByID(ctx context.Context, id string) (*SettlementBatch, error)
 	GetByLedgerID(ctx context.Context, ledgerID string, page, pageSize int) ([]*SettlementBatch, error)
 	GetByLedgerIDAndDate(ctx context.Context, ledgerID string, settlementDate time.Time) (*SettlementBatch, error)
-	// GetByBatchID looks up a batch by DOKU's own identifier for it, read from the
-	// settlement CSV's metadata header. This is the idempotency lookup: batch_id
-	// survives the two things that defeat report_file_name, a rename and a
-	// re-download under a different path. Returns ErrNotFound when nothing matches.
+
+	// GetByBatchID looks up a batch by Singapay's own identifier for it, taken from the
+	// settlement webhook. This is the idempotency lookup. Returns ErrNotFound when
+	// nothing matches.
 	GetByBatchID(ctx context.Context, batchID string) (*SettlementBatch, error)
-	// FilterIngestedReportFiles returns the subset of reportFileNames that already
-	// have a batch row. Callers that discover settlement files by listing object
-	// storage diff their listing against this; anything missing from the result is
-	// unprocessed work. An empty input returns an empty set without querying.
-	FilterIngestedReportFiles(ctx context.Context, reportFileNames []string) (map[string]struct{}, error)
+
+	// FilterIngestedBatchIDs returns the subset of batchIDs that already have a batch
+	// row. A caller replaying a range of settlements — after an outage that dropped
+	// webhooks, say — diffs its list against this and processes the difference. An
+	// empty input returns an empty set without querying.
+	FilterIngestedBatchIDs(ctx context.Context, batchIDs []string) (map[string]struct{}, error)
+
 	Save(ctx context.Context, batch *SettlementBatch) error
 	UpdateStatus(ctx context.Context, id string, status SettlementBatchStatus, processedAt *time.Time, failureReason string) error
 }
 
-// NewSettlementBatch creates a new settlement batch in PENDING status
+// NewSettlementBatch creates a new settlement batch in PENDING status.
 func NewSettlementBatch(
 	ledgerID string,
-	reportFileName string,
+	batchID string,
+	settlementReference string,
+	settleFrom, settleTo time.Time,
 	settlementDate time.Time,
-	uploadedBy string,
+	initiatedBy string,
 	currency Currency,
 ) (*SettlementBatch, error) {
 	if ledgerID == "" {
 		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "ledger_id is required", nil)
 	}
-	if reportFileName == "" {
-		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "report_file_name is required", nil)
+	if batchID == "" {
+		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "batch_id is required", nil)
 	}
-	if uploadedBy == "" {
-		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "uploaded_by is required", nil)
+	if initiatedBy == "" {
+		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "initiated_by is required", nil)
+	}
+	// Without a window there is nothing to query the gateway for, so a batch that
+	// carries none is not a batch that can be reconciled later — it is a row that will
+	// permanently claim a settlement was handled when it was not.
+	if settleFrom.IsZero() || settleTo.IsZero() {
+		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "settle_from and settle_to are required", nil)
+	}
+	if settleTo.Before(settleFrom) {
+		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "settle_to must not precede settle_from", nil)
 	}
 
 	sb := &SettlementBatch{
-		LedgerUUID:       ledgerID,
-		ReportFileName:   reportFileName,
-		SettlementDate:   settlementDate,
-		GrossAmount:      0,
-		NetAmount:        0,
-		DokuFee:          0,
-		Currency:         currency,
-		UploadedBy:       uploadedBy,
-		UploadedAt:       time.Now(),
-		ProcessingStatus: SettlementBatchStatusPending,
-		MatchedCount:     0,
-		UnmatchedCount:   0,
-		Metadata:         make(map[string]any),
+		LedgerUUID:          ledgerID,
+		BatchID:             batchID,
+		SettlementReference: settlementReference,
+		SettleFrom:          settleFrom,
+		SettleTo:            settleTo,
+		SettlementDate:      settlementDate,
+		GrossAmount:         0,
+		NetAmount:           0,
+		GatewayFee:          0,
+		Currency:            currency,
+		InitiatedBy:         initiatedBy,
+		InitiatedAt:         time.Now(),
+		ProcessingStatus:    SettlementBatchStatusPending,
+		MatchedCount:        0,
+		UnmatchedCount:      0,
+		Metadata:            make(map[string]any),
 	}
 	redifu.InitRecord(sb)
 
@@ -131,7 +171,7 @@ func (sb *SettlementBatch) MarkProcessing() error {
 }
 
 // MarkCompleted transitions to COMPLETED status with totals
-func (sb *SettlementBatch) MarkCompleted(grossAmount, netAmount, dokuFee int64, matchedCount, unmatchedCount int) error {
+func (sb *SettlementBatch) MarkCompleted(grossAmount, netAmount, gatewayFee int64, matchedCount, unmatchedCount int) error {
 	if sb.ProcessingStatus != SettlementBatchStatusProcessing {
 		return ledgererr.ErrInvalidSettlementBatchStatus
 	}
@@ -139,7 +179,7 @@ func (sb *SettlementBatch) MarkCompleted(grossAmount, netAmount, dokuFee int64, 
 	sb.ProcessingStatus = SettlementBatchStatusCompleted
 	sb.GrossAmount = grossAmount
 	sb.NetAmount = netAmount
-	sb.DokuFee = dokuFee
+	sb.GatewayFee = gatewayFee
 	sb.MatchedCount = matchedCount
 	sb.UnmatchedCount = unmatchedCount
 	sb.ProcessedAt = &now
@@ -170,7 +210,7 @@ func (sb *SettlementBatch) GetMatchRate() float64 {
 // AddToTotals accumulates amounts from a settlement item
 func (sb *SettlementBatch) AddToTotals(amount, fee int64) {
 	sb.GrossAmount += amount
-	sb.DokuFee += fee
+	sb.GatewayFee += fee
 	sb.NetAmount += (amount - fee)
 }
 

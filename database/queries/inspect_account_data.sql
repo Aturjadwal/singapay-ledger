@@ -10,7 +10,8 @@
 SELECT
     uuid,
     randid,
-    doku_subaccount_id,
+    singapay_account_id,
+    singapay_account_number,
     owner_type,
     owner_id,
     currency,
@@ -83,7 +84,7 @@ SELECT
     pt.product_type,
     pt.seller_price,
     pt.platform_fee,
-    pt.doku_fee,
+    pt.gateway_fee,
     pt.total_charged,
     pt.seller_net_amount,
     pt.fee_model,
@@ -113,7 +114,7 @@ SELECT
     pt.product_type,
     pt.seller_price,
     pt.platform_fee,
-    pt.doku_fee,
+    pt.gateway_fee,
     pt.total_charged,
     pt.seller_net_amount,
     pt.fee_model,
@@ -137,7 +138,7 @@ SELECT
     COUNT(*) AS count,
     SUM(seller_price) AS total_seller_price,
     SUM(platform_fee) AS total_platform_fee,
-    SUM(doku_fee) AS total_doku_fee,
+    SUM(gateway_fee) AS total_gateway_fee,
     SUM(total_charged) AS total_charged,
     SUM(seller_net_amount) AS total_seller_net
 FROM
@@ -152,7 +153,7 @@ ORDER BY
     fee_model;
 
 -- ============================================================================
--- PAYMENT REQUESTS (DOKU Payment Gateway)
+-- PAYMENT REQUESTS (Singapay)
 -- ============================================================================
 SELECT
     pr.uuid,
@@ -231,7 +232,7 @@ SELECT
     batch_id,
     gross_amount,
     net_amount,
-    doku_fee,
+    gateway_fee,
     currency,
     uploaded_by,
     uploaded_at,

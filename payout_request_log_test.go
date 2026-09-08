@@ -11,9 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	dokumodels "github.com/21strive/doku/app/models"
-	dokurequests "github.com/21strive/doku/app/requests"
 	"github.com/21strive/ledger/domain"
+	"github.com/21strive/ledger/singapay"
 )
 
 func TestMaskAccountNumber(t *testing.T) {
@@ -36,61 +35,60 @@ func TestMaskAccountNumber(t *testing.T) {
 	}
 }
 
-// The rendered body must be the body, not a summary of it: same field names, same nesting,
-// same types DOKU is given.
+// The rendered body must be the body, not a summary of it: same field names, same types
+// Singapay is given.
 func TestPayoutRequestLogBody_RendersTheWireShape(t *testing.T) {
-	req := dokurequests.DokuSendPayoutSubAccountRequest{}
-	req.Account.ID = "SAC-SELLER-1"
-	req.Payout.Amount = 50000
-	req.Payout.InvoiceNumber = "DSB-1"
-	req.Beneficiary.BankCode = "BNINIDJA"
-	req.Beneficiary.BankAccountNumber = "712739123020001"
-	req.Beneficiary.BankAccountName = "Ria Florensi"
+	req := singapay.DisburseRequest{
+		AccountID:         "01SELLERACCOUNTULID",
+		ReferenceNumber:   "ref-1",
+		BankCode:          "BNINIDJA",
+		BankAccountNumber: "712739123020001",
+		Amount:            50000,
+		Notes:             "DSB-1",
+	}
 
 	body := payoutRequestLogBody(req)
 
 	assert.JSONEq(t, `{
-		"account": {"id": "SAC-SELLER-1"},
-		"payout": {"amount": 50000, "invoice_number": "DSB-1"},
-		"beneficiary": {
-			"bank_code": "BNINIDJA",
-			"bank_account_number": "***********0001",
-			"bank_account_name": "Ria Florensi"
-		}
+		"account_id": "01SELLERACCOUNTULID",
+		"reference_number": "ref-1",
+		"bank_code": "BNINIDJA",
+		"bank_account_number": "***********0001",
+		"amount": 50000,
+		"notes": "DSB-1"
 	}`, body)
 
-	assert.Equal(t, "712739123020001", req.Beneficiary.BankAccountNumber,
+	assert.Equal(t, "712739123020001", req.BankAccountNumber,
 		"masking for the log must not reach the request being sent")
 }
 
-// An empty sub-account id is the state that produces DOKU's "Request or data not found",
-// so the body has to show it rather than omit the field.
-func TestPayoutRequestLogBody_KeepsAnEmptySubAccountID(t *testing.T) {
-	req := dokurequests.DokuSendPayoutSubAccountRequest{}
-	req.Payout.Amount = 50000
+// An empty account_id is the state that makes Singapay answer with a not-found rather than
+// a clear validation error, so the body has to show it rather than omit the field.
+func TestPayoutRequestLogBody_KeepsAnEmptyAccountID(t *testing.T) {
+	req := singapay.DisburseRequest{Amount: 50000}
 
-	assert.Contains(t, payoutRequestLogBody(req), `"account":{"id":""}`)
+	assert.Contains(t, payoutRequestLogBody(req), `"account_id":""`)
 }
 
 // The point of the line is that it can be trusted as a record of the call: what it prints
 // must be what the client was handed.
 func TestExecutePayout_LogsTheBodyItSends(t *testing.T) {
-	doku := &fakePayoutClient{response: payoutSuccess()}
-	client, _, account := newPayoutTestClient(t, doku, 100000)
+	gw := &fakeGateway{disburse: payoutSuccess(t)}
+	client, _, account := newPayoutTestClient(t, gw, 100000)
 
 	logs := &bytes.Buffer{}
 	client.logger = slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	resp, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest())
 	require.NoError(t, err)
-	require.Len(t, doku.bodies, 1)
+	require.Len(t, gw.bodies, 1)
 
-	record := findLogRecord(t, logs, "Calling DOKU SendPayoutSubAccount")
+	record := findLogRecord(t, logs, "Sending Singapay disbursement")
 
-	assert.Equal(t, payoutRequestLogBody(doku.bodies[0]), record["request_body"])
-	assert.Equal(t, "/sac-merchant/v1/payouts", record["request_target"])
-	assert.Equal(t, account.DokuSubAccountID, record["doku_sub_account_id"])
-	assert.Equal(t, false, record["doku_sub_account_id_empty"])
+	assert.Equal(t, payoutRequestLogBody(gw.bodies[0]), record["request_body"])
+	assert.Equal(t, "/api/v2.0/disbursement/transfer", record["request_target"])
+	assert.Equal(t, account.SingapayAccountID, record["singapay_account_id"])
+	assert.Equal(t, false, record["singapay_account_id_empty"])
 	assert.Equal(t, resp.DisbursementID, record["disbursement_id"])
 
 	assert.NotContains(t, logs.String(), "712739123020001",
@@ -100,10 +98,10 @@ func TestExecutePayout_LogsTheBodyItSends(t *testing.T) {
 // A retry replays the same payout, and it is the one most likely to be read after the fact —
 // it must leave the same record.
 func TestRetryDisbursement_LogsTheBodyItSends(t *testing.T) {
-	doku := &fakePayoutClient{response: payoutSuccess()}
-	client, fakes, _ := newPayoutTestClient(t, doku, 100000)
+	gw := &fakeGateway{disburse: payoutSuccess(t)}
+	client, fakes, _ := newPayoutTestClient(t, gw, 100000)
 
-	doku.errorLog = &dokumodels.ErrorLog{StatusCode: 0, Message: "timeout"}
+	gw.err = &singapay.Error{Err: context.DeadlineExceeded}
 	_, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest())
 	require.Error(t, err, "a timeout must leave the disbursement in flight for the retry")
 
@@ -115,15 +113,15 @@ func TestRetryDisbursement_LogsTheBodyItSends(t *testing.T) {
 
 	logs := &bytes.Buffer{}
 	client.logger = slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	doku.errorLog = nil
+	gw.err = nil
 
 	_, err = client.RetryDisbursement(context.Background(), pending.UUID)
 	require.NoError(t, err)
-	require.Len(t, doku.bodies, 2)
+	require.Len(t, gw.bodies, 2)
 
-	record := findLogRecord(t, logs, "Calling DOKU SendPayoutSubAccount")
-	assert.Equal(t, payoutRequestLogBody(doku.bodies[1]), record["request_body"])
-	assert.Equal(t, pending.PayoutRequestID, record["payout_request_id"])
+	record := findLogRecord(t, logs, "Sending Singapay disbursement")
+	assert.Equal(t, payoutRequestLogBody(gw.bodies[1]), record["request_body"])
+	assert.Equal(t, pending.PayoutRequestID, record["payout_reference"])
 }
 
 // findLogRecord returns the first JSON log record carrying the given message.

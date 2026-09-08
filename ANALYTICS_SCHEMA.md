@@ -110,7 +110,7 @@ dim_account {
   owner_type              VARCHAR(50)    -- SELLER | BUYER | PLATFORM
   owner_id                VARCHAR(255)
   currency                VARCHAR(3)
-  doku_subaccount_id      VARCHAR(255)
+  singapay_account_id      VARCHAR(255)
 
   -- SCD2 Validity Columns
   effective_date          DATE
@@ -343,7 +343,7 @@ fact_revenue_timeseries {
   -- Revenue metrics
   convenience_fee_total       BIGINT        -- SUM(platform_fee) WHERE product_type != 'SUBSCRIPTION'
   subscription_fee_total      BIGINT        -- SUM(seller_price) WHERE product_type = 'SUBSCRIPTION'
-  gateway_fee_paid_total      BIGINT        -- SUM(doku_fee) from SETTLED transactions
+  gateway_fee_paid_total      BIGINT        -- SUM(gateway_fee) from SETTLED transactions
   total_revenue               BIGINT        -- convenience_fee_total + subscription_fee_total
 
   -- Count metrics
@@ -360,7 +360,7 @@ fact_revenue_timeseries {
   1. Identify settlements in current batch window
   2. Map each settlement to its Daily, Weekly, Monthly, and Yearly bucket
   3. Recalculate full metrics for affected buckets (UPSERT on conflict)
-- **Key Fields**: `platform_fee`, `doku_fee`, `seller_price`, `product_type`
+- **Key Fields**: `platform_fee`, `gateway_fee`, `seller_price`, `product_type`
 
 #### Source Query
 
@@ -383,7 +383,7 @@ recalculated AS (
     ai.date_key, ai.interval_type,
     COALESCE(SUM(pt.platform_fee) FILTER (WHERE pt.product_type != 'SUBSCRIPTION'), 0) AS convenience_fee_total,
     COALESCE(SUM(pt.seller_price) FILTER (WHERE pt.product_type = 'SUBSCRIPTION'), 0)  AS subscription_fee_total,
-    COALESCE(SUM(pt.doku_fee), 0)                                                        AS gateway_fee_paid_total,
+    COALESCE(SUM(pt.gateway_fee), 0)                                                        AS gateway_fee_paid_total,
     COUNT(*)                                                                             AS settlement_transaction_count
   FROM affected_intervals ai
   JOIN product_transactions pt ON pt.status = 'SETTLED'
@@ -433,7 +433,7 @@ fact_platform_balance {
   total_revenue_ytd           BIGINT   -- convenience_fee_ytd + subscription_fee_ytd
   convenience_fee_ytd         BIGINT   -- SUM(platform_fee) SETTLED non-SUBSCRIPTION YTD
   subscription_fee_ytd        BIGINT   -- SUM(seller_price) SETTLED SUBSCRIPTION YTD
-  gateway_fee_ytd             BIGINT   -- SUM(doku_fee) SETTLED YTD (Cost)
+  gateway_fee_ytd             BIGINT   -- SUM(gateway_fee) SETTLED YTD (Cost)
 
   -- Operations Metrics
   settlement_pending_count    INT      -- Transactions awaiting settlement (COMPLETED state)
@@ -462,7 +462,7 @@ WITH revenue_deltas AS (
   SELECT
     COALESCE(SUM(platform_fee) FILTER (WHERE product_type != 'SUBSCRIPTION'), 0) AS delta_convenience,
     COALESCE(SUM(seller_price) FILTER (WHERE product_type = 'SUBSCRIPTION'), 0)  AS delta_subscription,
-    COALESCE(SUM(doku_fee), 0)                                                    AS delta_gateway,
+    COALESCE(SUM(gateway_fee), 0)                                                    AS delta_gateway,
     COUNT(*)                                                                      AS delta_settled_count
   FROM product_transactions
   WHERE status = 'SETTLED' AND updated_at > :last_watermark AND updated_at <= :batch_end

@@ -1,57 +1,80 @@
-# Payment Execution - Architecture Diagram
+# Payment Execution — Architecture Diagram
 
-This diagram outlines the payment request lifecycle, from creation to completion, interaction with the Payment Gateway (DOKU), and initial ledger recording.
+This diagram outlines the payment request lifecycle, from creation to completion, its
+interaction with Singapay, and the initial ledger recording.
 
 ```mermaid
 sequenceDiagram
-    participant User
+    participant Payer
     participant Frontend
     participant LedgerAPI
-    participant PaymentGateway
-    participant Background
+    participant Singapay
 
-    %% Step 1: Create Payment Request
-    User->>Frontend: Select product & Pay
-    Frontend->>LedgerAPI: POST /payments/request (Create Payment)
-    LedgerAPI->>PaymentGateway: Create Order / Get Payment Info (DOKU/Midtrans)
-    PaymentGateway-->>LedgerAPI: Payment URL / Virtual Account
-    LedgerAPI->>LedgerAPI: Create PaymentRequest (PENDING)
-    LedgerAPI->>LedgerAPI: Create ProductTransaction (PENDING)
-    LedgerAPI-->>Frontend: Return Payment Info
+    %% Step 1: Create the payment instrument
+    Payer->>Frontend: Select product & pay
+    Frontend->>LedgerAPI: GeneratePayment (channel, amount, invoice)
+    Note right of LedgerAPI: The channel selects the product:<br/>QRIS / VA_* / EWALLET_* / payment link
+    LedgerAPI->>Singapay: Create VA, QRIS, e-wallet order, or payment link
+    Singapay-->>LedgerAPI: VA number, QR payload, or checkout URL
+    LedgerAPI->>LedgerAPI: Save ProductTransaction (PENDING) + PaymentRequest (PENDING)
+    LedgerAPI-->>Frontend: Payment info
 
-    %% Step 2: Payment Completion (Webhook)
-    User->>PaymentGateway: Complete Payment (Transfer/CC)
-    PaymentGateway->>LedgerAPI: Webhook (Payment Success)
+    %% Step 2: Payment confirmation
+    Payer->>Singapay: Complete payment
+    Singapay->>LedgerAPI: POST transaction_notif_url
 
     rect rgb(240, 240, 240)
-    Note over LedgerAPI, Background: Webhook Processing
-    LedgerAPI->>LedgerAPI: Validate Signature
-    LedgerAPI->>LedgerAPI: Update PaymentRequest -> COMPLETED
-    LedgerAPI->>LedgerAPI: Update ProductTransaction -> COMPLETED
-    LedgerAPI->>Background: Trigger Async Processing (Optional)
+    Note over LedgerAPI, Singapay: HandlePaymentSuccess
+    LedgerAPI->>LedgerAPI: Verify HMAC-SHA512 signature FIRST
+    Note right of LedgerAPI: Nothing in the body is read until it passes
+    LedgerAPI->>LedgerAPI: Resolve the merchant reference to an invoice
+    Note right of LedgerAPI: Every channel puts it somewhere different;<br/>a payment link's transaction.reff_no is an<br/>ATTEMPT id, not the reference we sent
+    LedgerAPI->>LedgerAPI: Already booked? → no-op (Singapay retries)
+    LedgerAPI->>LedgerAPI: PaymentRequest → COMPLETED
+    LedgerAPI->>LedgerAPI: ProductTransaction → COMPLETED
     end
 
-    %% Step 3: Ledger Recording (No Balance Update Yet)
-    Note right of LedgerAPI: Balances are NOT updated immediately.\nWaiting for Reconciliation (Settlement).
-    LedgerAPI->>LedgerAPI: Create Journal (Event: PAYMENT_SUCCESS)
+    %% Step 3: Ledger recording
+    Note right of LedgerAPI: Balances are NOT available yet.<br/>Waiting for settlement.
+    LedgerAPI->>LedgerAPI: Create Journal (PAYMENT_SUCCESS)
 
-    LedgerAPI->>LedgerAPI: Create LedgerEntry (Seller) -> PENDING
-    Note right of LedgerAPI: Account: Seller | Amount: +SellerPrice | Bucket: PENDING
+    LedgerAPI->>LedgerAPI: LedgerEntry (Seller) → PENDING
+    Note right of LedgerAPI: +SellerNetAmount
 
-    LedgerAPI->>LedgerAPI: Create LedgerEntry (Platform) -> PENDING
-    Note right of LedgerAPI: Account: Platform | Amount: +PlatformFee | Bucket: PENDING
+    LedgerAPI->>LedgerAPI: LedgerEntry (Platform) → PENDING
+    Note right of LedgerAPI: +PlatformFee
 
-    LedgerAPI->>LedgerAPI: Create LedgerEntry (DOKU) -> PENDING
-    Note right of LedgerAPI: Account: Doku | Amount: +DokuFee | Bucket: PENDING
+    LedgerAPI->>LedgerAPI: LedgerEntry (Gateway expense) → PENDING
+    Note right of LedgerAPI: +GatewayFee
 ```
 
-**Key Principles:**
+## Key principles
 
-- **ProductTransaction**: Represents the business event (User bought Item X).
-- **PaymentRequest**: Represents the financial interaction (User paid Y amount via Channel Z).
-- **Ledger Entries Created**:
+- **ProductTransaction**: the business event (someone bought item X).
+- **PaymentRequest**: the financial interaction (they paid Y through channel Z).
+- **Ledger entries created**:
   - **Journal**: EventType `PAYMENT_SUCCESS`
-  - **Seller Entry**: `+SellerPrice` into **PENDING** bucket.
-  - **Platform Entry**: `+PlatformFee` into **PENDING** bucket.
-  - **Doku Entry**: `+DokuFee` into **PENDING** bucket.
-- **Why Pending?**: Funds are held by the payment gateway until settlement. No funds are available for withdrawal yet.
+  - **Seller entry**: `+SellerNetAmount` into **PENDING**
+  - **Platform entry**: `+PlatformFee` into **PENDING**
+  - **Gateway entry**: `+GatewayFee` into **PENDING**
+- **Why pending?** Singapay holds the funds until settlement. Nothing is withdrawable yet.
+
+## Three things about Singapay that shape this
+
+**One callback URL carries four products.** VA, QRIS, e-wallet and payment link all arrive on
+`transaction_notif_url` and are told apart by the envelope's `event` field — except that
+Singapay's own payment-link sample carries no `event` field at all. Routing on `event` alone
+would silently drop payment-link confirmations, so the parser falls back to the payment
+method.
+
+**The merchant reference lives somewhere different on every channel.** VA puts it in
+`reff_no`; QRIS and e-wallet in `merchant_reff_no`; a payment link nests it on the payment
+link object, because its transaction's own `reff_no` is the id of one payment *attempt*.
+`MoneyInNotification.MerchantReference` resolves that. Reading the fields directly would
+never match a payment link to its invoice.
+
+**The amounts booked come from the transaction as priced, not from the webhook.** The fee
+Singapay actually took is not final until settlement. If the webhook reports a charged amount
+or a channel fee that disagrees with what was expected, both are logged and recorded in the
+journal — but the entries are written from the transaction, so a disagreement cannot corrupt
+the books before anyone has looked at it.

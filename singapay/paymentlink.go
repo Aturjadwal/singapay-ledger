@@ -18,8 +18,8 @@ type PaymentMethod struct {
 
 // ListPaymentMethods returns the active channel catalogue.
 //
-// These codes are the source of truth for a fee table: they replace DOKU's channel
-// constants wholesale, and nothing else in the API accepts DOKU's spellings. The
+// These codes are the source of truth for a fee table, and nothing else in the API accepts
+// any other spelling of them. The
 // catalogue carries no rates — Singapay treats those as commercial terms, readable
 // per transaction after the fact but never quoted up front for money-in.
 func (c *Client) ListPaymentMethods(ctx context.Context) ([]PaymentMethod, error) {
@@ -110,8 +110,8 @@ type CreatePaymentLinkRequest struct {
 	// MaxUsage defaults to 1 (single use). 0 means unlimited.
 	MaxUsage *int `json:"max_usage,omitempty"`
 
-	// ExpiredAt is an absolute timestamp, unlike DOKU's payment_due_date which is a
-	// number of minutes. Compute it from the desired lifetime before calling.
+	// ExpiredAt is an absolute timestamp rather than a lifetime in minutes. Compute it
+	// from the desired lifetime before calling.
 	ExpiredAt string `json:"expired_at,omitempty"`
 
 	// WhitelistedPaymentMethod restricts the channels offered. One code pins the link
@@ -133,10 +133,10 @@ type CreatePaymentLinkRequest struct {
 
 // CreatePaymentLink creates a hosted checkout page for a sub-account.
 //
-// This is the closest analogue to DOKU's /checkout/v1/payment: the payer picks a channel
-// on Singapay's page. The cost is reconciliation — a payment link exposes no
-// per-transaction fee anywhere, so [Client.CreateVirtualAccount] or
-// [Client.GenerateQRIS] are the better choice whenever the channel is known up front.
+// This is the hosted-checkout option: the payer picks a channel on Singapay's page. The
+// cost is reconciliation — a payment link exposes no per-transaction fee anywhere, so
+// [Client.CreateVirtualAccount] or [Client.GenerateQRIS] are the better choice whenever
+// the channel is known up front.
 func (c *Client) CreatePaymentLink(ctx context.Context, accountID string, req CreatePaymentLinkRequest) (*PaymentLink, error) {
 	if req.Type == "" {
 		req.Type = PaymentLinkTotal
@@ -199,8 +199,9 @@ type PaymentLinkHistory struct {
 
 // SettlementWindow filters transaction lists by when funds were settled to the merchant.
 //
-// This is the closest thing to DOKU's settlement CSV: given a batch's date range from a
-// settlement webhook, these filters return the rows that batch covered.
+// This is how a settlement batch is reconstructed: given a batch's date range from a
+// settlement webhook, these filters return the rows that batch covered. There is no
+// settlement file to read instead.
 type SettlementWindow struct {
 	// SettleFrom and SettleTo are ISO 8601 and inclusive.
 	SettleFrom string

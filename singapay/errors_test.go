@@ -7,7 +7,7 @@ import (
 
 // TestOutcomeClassification pins the decision that keeps a payout from being made twice.
 //
-// The DOKU path infers this from the HTTP status: 4xx is a definite refusal and releases
+// The obvious approach infers this from the HTTP status: 4xx is a definite refusal and releases
 // the reserved balance, 5xx is unknown and holds it. Singapay answers HTTP 400 for SP001,
 // SP002, SP004 and SP005 while telling merchants to call inquiry-status for all four,
 // because the transfer may still settle. Those rows are the whole point of this table.
@@ -131,7 +131,7 @@ func TestTransactionStatusTerminal(t *testing.T) {
 		{StatusInitiated, false, false},
 		{StatusPaying, false, false},
 		{StatusPending, false, false},
-		// The three the DOKU switch has no case for. Reading them as still-in-flight
+		// The three an HTTP-status switch has no case for. Reading them as still-in-flight
 		// leaves a seller's balance reserved against a transfer that will never land.
 		{StatusRefunded, true, true},
 		{StatusCanceled, true, true},

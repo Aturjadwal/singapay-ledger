@@ -5,17 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"strings"
 	"time"
 
-	dokumodels "github.com/21strive/doku/app/models"
-	"github.com/21strive/doku/app/requests"
-	"github.com/21strive/doku/app/usecases"
 	"github.com/21strive/ledger/domain"
 	"github.com/21strive/ledger/ledgererr"
 	"github.com/21strive/ledger/repo"
+	"github.com/21strive/ledger/singapay"
 	"github.com/google/uuid"
 )
 
@@ -27,14 +24,18 @@ type LedgerClient struct {
 	txProvider   repo.TransactionProvider
 	logger       *slog.Logger
 	repoProvider repo.RepositoryProvider
-	dokuClient   usecases.DokuUseCaseInterface
+	gateway      PaymentGateway
 }
 
-// NewLedgerClient takes no object-storage handle: this package keeps ledgers, and
-// nothing it does touches a bucket. It used to accept an aws.Config purely to build
-// an S3 client for the seller KYC upload helpers, which have moved to the service
-// that owns KYC.
-func NewLedgerClient(db *sql.DB, dokuClient usecases.DokuUseCaseInterface, logger *slog.Logger) *LedgerClient {
+// NewLedgerClient wires the ledger to a payment gateway and a database.
+//
+// gateway is normally a *singapay.Client built with singapay.NewFromEnv. It is taken as
+// an interface so the paths that decide what happens to money — a payout whose outcome is
+// unknown, a settlement that does not match — can be tested without a merchant account.
+//
+// It takes no object-storage handle: this package keeps ledgers, and nothing it does
+// touches a bucket.
+func NewLedgerClient(db *sql.DB, gateway PaymentGateway, logger *slog.Logger) *LedgerClient {
 	txProvider := repo.NewTransactionProvider(db)
 	repoProvider := repo.NewRepositoryProvider(db)
 
@@ -42,7 +43,7 @@ func NewLedgerClient(db *sql.DB, dokuClient usecases.DokuUseCaseInterface, logge
 		db:           db,
 		txProvider:   txProvider,
 		logger:       logger,
-		dokuClient:   dokuClient,
+		gateway:      gateway,
 		repoProvider: repoProvider,
 	}
 }
@@ -75,18 +76,6 @@ func (c *LedgerClient) GetAccountByOwner(ctx context.Context, ownerType domain.O
 	return account, nil
 }
 
-// GetAccountByDokuSubAccountID returns an account by its DOKU sub-account ID.
-func (c *LedgerClient) GetAccountByDokuSubAccountID(ctx context.Context, dokuSubAccountID string) (*domain.Account, error) {
-	account, err := c.repoProvider.Account().GetByDokuSubAccountID(ctx, dokuSubAccountID)
-	if err != nil {
-		if ledgererr.IsAppError(err, repo.ErrNotFound) {
-			return nil, ledgererr.ErrLedgerNotFound.WithError(err)
-		}
-		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to get account by doku sub account ID", err)
-	}
-	return account, nil
-}
-
 // GetAccountBySingapayAccountID returns an account by its Singapay sub-account ULID.
 //
 // Not by account number: the number appears only as a transfer beneficiary, and rows that
@@ -114,8 +103,15 @@ func (c *LedgerClient) GetAccountBySellerID(ctx context.Context, sellerID string
 	return account, nil
 }
 
-// CreateAccount provisions a DOKU sub-account and persists an Account record.
-// Idempotent: if an account for accountID already exists, returns ErrLedgerAlreadyExists.
+// CreateAccount provisions a Singapay sub-account and persists an Account record.
+// Idempotent against our own table: if an account for accountID already exists, returns
+// ErrLedgerAlreadyExists without calling Singapay.
+//
+// That local check is the only idempotency there is. Singapay's create endpoint has no
+// idempotency key and no duplicate detection — it will happily open a second account with
+// the same name — so a retry after a timeout can leave behind an account that holds money
+// and that nothing references. The existing-row check runs first for exactly that reason,
+// and a caller retrying a timeout must check for the account before calling again.
 func (c *LedgerClient) CreateAccount(ctx context.Context, accountID string, email, name string, currency domain.Currency) (*domain.Account, error) {
 	// Check for existing account
 	existing, err := c.repoProvider.Account().GetByOwner(ctx, domain.OwnerTypeSeller, accountID)
@@ -126,69 +122,144 @@ func (c *LedgerClient) CreateAccount(ctx context.Context, accountID string, emai
 		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to check existing account", err)
 	}
 
-	// DOKU constrains both fields (email max 40 chars, name alphabetic only, max 100).
-	// Neither is checked anywhere upstream, and this call sits inside the seller's first
-	// paid booking — the worst possible place to discover a 4xx from an unusual name.
+	// This call sits inside the seller's first paid booking — the worst possible place
+	// to discover a 4xx from an unusual display name.
 	sanitizedName := sanitizeSubAccountName(name)
 	if err := validateSubAccountEmail(email); err != nil {
 		return nil, err
 	}
 	if sanitizedName != name {
-		c.logger.InfoContext(ctx, "Sub-account name sanitized for DOKU", "owner_id", accountID, "original", name, "sanitized", sanitizedName)
+		c.logger.InfoContext(ctx, "Sub-account name sanitized for Singapay", "owner_id", accountID, "original", name, "sanitized", sanitizedName)
 	}
 
-	// Provision DOKU sub-account
-	response, dokuErr := c.dokuClient.CreateAccount(&requests.DokuCreateSubAccountRequest{
-		Email: email,
-		Name:  sanitizedName,
+	// AccountTypeOwned is the only type usable here. personal_managed behaves the same,
+	// but business_managed creates the account *inactive* pending a KYB review a human
+	// at Singapay must approve — and an inactive account cannot accept the payment that
+	// is waiting on this call.
+	account, gwErr := c.gateway.CreateAccount(ctx, singapay.CreateAccountRequest{
+		Name:          sanitizedName,
+		Type:          singapay.AccountTypeOwned,
+		InviteMembers: []string{strings.TrimSpace(email)},
 	})
-	c.logger.DebugContext(ctx, "DOKU CreateAccount response", "response", response, "error", dokuErr)
-
-	// Any DOKU failure ends this, 409 included. A 409 means the email already owns a
-	// sub-account, and the SAC ID in that message is deliberately not reused: it may
-	// belong to a different user, and a sub-account holds money. The raw DOKU message
-	// reaches the log, so an admin can bind the account by hand after checking who owns
-	// it. See T6b/T6c in docs/doku-sac-api-compliance.md (aturjadwal-monoservice).
-	if dokuErr != nil {
-		return nil, ledgererr.NewError(ledgererr.CodeDokuAPIError,
-			"failed to create DOKU sub account",
-			fmt.Errorf("Status Code: %d, Error: %v: %v", dokuErr.StatusCode, dokuErr.Err, dokuErr.Message))
+	if gwErr != nil {
+		c.logger.ErrorContext(ctx, "Singapay CreateAccount failed", "owner_id", accountID, "error", gwErr)
+		return nil, ledgererr.NewError(ledgererr.CodeGatewayAPIError,
+			"failed to create Singapay sub-account", gwErr)
 	}
-	dokuSubAccountID := response.ID.String
 
-	account := domain.NewSellerAccount(dokuSubAccountID, accountID, currency)
+	c.logger.InfoContext(ctx, "Singapay sub-account created",
+		"owner_id", accountID,
+		"singapay_account_id", account.ID,
+		"singapay_account_number", account.Number,
+		"status", account.Status,
+	)
+
+	// An account with no number cannot be the beneficiary of an account transfer, and
+	// the platform fee reaches the platform by exactly that route. Singapay declares the
+	// field nullable, so this is a real possibility rather than a defensive check — and
+	// it is worth a loud line now instead of a platform-fee transfer that fails silently
+	// for months. The account is still saved: it can take payments, and the number can
+	// be backfilled from GET /accounts/{id}.
+	if account.Number == "" {
+		c.logger.WarnContext(ctx, "Singapay issued no account number — this account cannot receive platform-fee transfers until one is backfilled",
+			"owner_id", accountID,
+			"singapay_account_id", account.ID,
+		)
+	}
+
+	ledgerAccount := domain.NewSellerAccount(account.ID, accountID, currency)
+	ledgerAccount.SetSingapayAccount(account.ID, account.Number)
+
 	err = c.txProvider.Transact(ctx, func(tx repo.Tx) error {
-		if err := tx.Account().Save(ctx, &account); err != nil {
+		if err := tx.Account().Save(ctx, &ledgerAccount); err != nil {
 			return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to create account", err)
 		}
 		return nil
 	})
 	if err != nil {
+		// The sub-account exists at Singapay and nothing here references it. Loud,
+		// because the fix is to bind the row by hand — creating another would leave the
+		// first one holding money nobody watches.
+		c.logger.ErrorContext(ctx, "CRITICAL: Singapay sub-account created but the ledger row could not be saved — bind it by hand, do not re-create",
+			"owner_id", accountID,
+			"singapay_account_id", account.ID,
+			"singapay_account_number", account.Number,
+			"error", err,
+		)
 		return nil, ledgererr.NewError(ledgererr.CodeInternal, "transaction failed while creating account", err)
 	}
 
-	return &account, nil
+	return &ledgerAccount, nil
+}
+
+// BackfillSingapayAccountNumber reads an account's number from Singapay and stores it.
+//
+// It exists because Singapay may create a sub-account without a number, and an account
+// with no number silently cannot receive a platform-fee transfer — the one operation
+// where Singapay names its destination by number and rejects the ULID. This is the
+// repair, and it is safe to call on an account that already has one.
+func (c *LedgerClient) BackfillSingapayAccountNumber(ctx context.Context, accountID string) (*domain.Account, error) {
+	account, err := c.repoProvider.Account().GetByID(ctx, accountID)
+	if err != nil {
+		if ledgererr.IsAppError(err, repo.ErrNotFound) {
+			return nil, ledgererr.ErrLedgerNotFound.WithError(err)
+		}
+		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to get account", err)
+	}
+	if account.SingapayAccountID == "" {
+		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest,
+			"account has no Singapay sub-account id to read a number from", nil)
+	}
+	if account.CanReceiveTransfer() {
+		return account, nil
+	}
+
+	remote, gwErr := c.gateway.GetAccount(ctx, account.SingapayAccountID)
+	if gwErr != nil {
+		return nil, ledgererr.NewError(ledgererr.CodeGatewayAPIError, "failed to read Singapay sub-account", gwErr)
+	}
+	if remote.Number == "" {
+		return nil, ledgererr.NewError(ledgererr.CodeGatewayAPIError,
+			"Singapay still reports no account number for this sub-account", nil)
+	}
+
+	account.SetSingapayAccount(account.SingapayAccountID, remote.Number)
+	err = c.txProvider.Transact(ctx, func(tx repo.Tx) error {
+		return tx.Account().Save(ctx, account)
+	})
+	if err != nil {
+		return nil, ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to save backfilled account number", err)
+	}
+
+	c.logger.InfoContext(ctx, "Backfilled Singapay account number",
+		"account_id", account.UUID,
+		"singapay_account_id", account.SingapayAccountID,
+		"singapay_account_number", account.SingapayAccountNumber,
+	)
+	return account, nil
 }
 
 // The platform account is deliberately not creatable from here. It used to be:
-// CreatePlatformAccount provisioned a DOKU sub-account under whatever email the caller
-// passed, and callers invoked it lazily from the booking path. That made the account that
-// collects every platform fee a side effect of somebody else's booking — and since DOKU
-// binds a sub-account to an email permanently, a caller with a stale constant would
+// CreatePlatformAccount provisioned a sub-account under whatever email the caller passed,
+// and callers invoked it lazily from the booking path. That made the account that collects
+// every platform fee a side effect of somebody else's booking — and because Singapay's
+// create endpoint has no duplicate check at all, a caller with a stale constant would
 // quietly open a *second* sub-account and route the fees into one nobody watches, without
 // raising a single error.
 //
-// Provisioning is now a deliberate, once-per-environment act: run
-// scripts/doku-subaccount in aturjadwal-monoservice to create the sub-account at DOKU,
-// then insert the ledger_accounts row by hand (T6c runbook / T9 in
-// docs/doku-sac-api-compliance.md). Readers stay: GetPlatformAccount is what
-// ProcessPlatformFeeTransfer and the reconciliation path use, and both already refuse to
-// run when the account is missing or has no sub-account id — which is now a real safety
-// net rather than a formality.
+// Provisioning is a deliberate, once-per-environment act: create the sub-account against
+// Singapay, then insert the ledger_accounts row by hand with its ULID *and* its account
+// number. Readers stay: GetPlatformAccount is what ProcessPlatformFeeTransfer and the
+// reconciliation path use, and both refuse to run when the account is missing or has no
+// Singapay identifiers.
 
-// CreatePaymentGatewayAccount creates a PAYMENT_GATEWAY-type account (singleton, no DOKU sub-account).
+// CreatePaymentGatewayAccount creates the PAYMENT_GATEWAY-type expense account (singleton).
+//
+// It is a bookkeeping account, not a Singapay sub-account: it holds the gateway fees this
+// ledger has recognised so they can be cleared on settlement. Nothing is provisioned at
+// Singapay for it, which is why it carries no sub-account identifiers.
 func (c *LedgerClient) CreatePaymentGatewayAccount(ctx context.Context, currency domain.Currency) (*domain.Account, error) {
-	ownerID := "DOKU"
+	ownerID := "SINGAPAY"
 	existing, err := c.repoProvider.Account().GetPaymentGatewayAccount(ctx)
 	if err == nil {
 		c.logger.InfoContext(ctx, "Payment gateway account already exists, skipping creation", "owner_id", ownerID, "account_id", existing.UUID)
@@ -317,7 +388,7 @@ func (c *LedgerClient) GetBalanceByAccountUUID(ctx context.Context, accountUUID 
 }
 
 // GetAllBalancesBySellerID returns cached balances for a seller's account.
-// This is a pure read from ledger_accounts — no DOKU sync.
+// This is a pure read from ledger_accounts — no gateway call.
 func (c *LedgerClient) GetAllBalancesBySellerID(ctx context.Context, sellerID string) (*BalanceResponse, error) {
 	account, err := c.repoProvider.Account().GetBySellerID(ctx, sellerID)
 	if err != nil {
@@ -355,9 +426,13 @@ func (c *LedgerClient) GetAllBalancesBySellerID(ctx context.Context, sellerID st
 
 // ValidateBankAccountRequest contains the parameters to validate a bank account
 type ValidateBankAccountRequest struct {
+	// BankCode accepts a three-digit national code ("002") or a SWIFT code
+	// ("BRINIDJA"). Storing SWIFT is the safer choice: the payout fee quote is a v1.0
+	// endpoint with no v2 counterpart and accepts SWIFT only, so a three-digit code
+	// makes "quote the fee, then transfer" break at the first step.
 	BankCode      string `json:"bank_code"`
 	AccountNumber string `json:"account_number"`
-	AccountName   string `json:"account_name"` // Optional: for verification
+	AccountName   string `json:"account_name"` // Optional: for the caller's own comparison
 }
 
 // ValidateBankAccountResponse contains the result of bank account validation
@@ -366,52 +441,53 @@ type ValidateBankAccountResponse struct {
 	BankCode      string `json:"bank_code"`
 	BankName      string `json:"bank_name"`
 	AccountNumber string `json:"account_number"`
-	AccountName   string `json:"account_name"` // From DOKU response
+	AccountName   string `json:"account_name"` // The name the bank holds for this account
+	// Message carries the bank's reason when the account was not found.
+	Message string `json:"message,omitempty"`
 }
 
-// ValidateBankAccount validates a bank account with DOKU
+// ValidateBankAccount performs a real-time bank account name inquiry.
+//
+// Note what "not valid" means here. Singapay answers HTTP 200 with SP000 for an account
+// that does not exist, reporting the outcome in the body — so a nil error does not mean
+// the account is real. IsValid is the answer; err means the inquiry itself could not be
+// made, which is a different thing and is returned as an error rather than folded into a
+// false.
 func (c *LedgerClient) ValidateBankAccount(ctx context.Context, req *ValidateBankAccountRequest) (*ValidateBankAccountResponse, error) {
 	if req.BankCode == "" || req.AccountNumber == "" {
 		return nil, ledgererr.ErrInvalidBankAccount.WithError(fmt.Errorf("bank_code and account_number are required"))
 	}
 
-	tokenResp, tokenErr := c.dokuClient.GetToken()
-	if tokenErr != nil {
-		c.logger.ErrorContext(ctx, "Failed to get DOKU access token",
-			"error", tokenErr.Err,
-			"message", tokenErr.Message,
-		)
-		return nil, ledgererr.NewError(ledgererr.CodeDokuAPIError, "failed to get DOKU access token", fmt.Errorf("%v", tokenErr.Message))
-	}
-
-	dokuReq := &requests.DokuBankAccountInquiryRequest{
-		BeneficiaryAccountNumber: req.AccountNumber,
-	}
-	dokuReq.AdditionalInfo.BeneficiaryBankCode = req.BankCode
-	dokuReq.AdditionalInfo.BeneficiaryAccountName = req.AccountName
-
-	resp, dokuErr := c.dokuClient.BankAccountInquiry(dokuReq, tokenResp.AccessToken)
-	if dokuErr != nil {
-		c.logger.ErrorContext(ctx, "DOKU BankAccountInquiry failed",
+	beneficiary, gwErr := c.gateway.CheckBeneficiary(ctx, req.BankCode, req.AccountNumber)
+	if gwErr != nil {
+		c.logger.ErrorContext(ctx, "Singapay CheckBeneficiary failed",
 			"bank_code", req.BankCode,
-			"account_number", req.AccountNumber,
-			"error", dokuErr.Err,
-			"message", dokuErr.Message,
-			"status_code", dokuErr.StatusCode,
+			"account_number", maskAccountNumber(req.AccountNumber),
+			"error", gwErr,
+		)
+		return nil, ledgererr.NewError(ledgererr.CodeGatewayAPIError, "bank account inquiry failed", gwErr)
+	}
+
+	if !beneficiary.IsValid() {
+		c.logger.InfoContext(ctx, "Bank account inquiry returned invalid",
+			"bank_code", req.BankCode,
+			"account_number", maskAccountNumber(req.AccountNumber),
+			"message", beneficiary.Message,
 		)
 		return &ValidateBankAccountResponse{
 			IsValid:       false,
 			BankCode:      req.BankCode,
 			AccountNumber: req.AccountNumber,
+			Message:       beneficiary.Message,
 		}, nil
 	}
 
 	return &ValidateBankAccountResponse{
 		IsValid:       true,
-		BankCode:      resp.BeneficiaryBankCode,
-		BankName:      resp.BeneficiaryBankName,
-		AccountNumber: resp.BeneficiaryAccountNumber,
-		AccountName:   resp.BeneficiaryAccountName,
+		BankCode:      beneficiary.BankCode,
+		BankName:      beneficiary.BankName,
+		AccountNumber: beneficiary.AccountNumber,
+		AccountName:   beneficiary.AccountName,
 	}, nil
 }
 
@@ -434,32 +510,42 @@ type WithdrawRequest struct {
 type WithdrawResponse struct {
 	DisbursementID string `json:"disbursement_id"`
 	Status         string `json:"status"`
-	Amount         int64  `json:"amount"`
-	Currency       string `json:"currency"`
-	Message        string `json:"message"`
+	// Amount is the NET the beneficiary receives. TransferFee is charged on top, so the
+	// seller's balance moves by Amount + TransferFee.
+	Amount      int64  `json:"amount"`
+	TransferFee int64  `json:"transfer_fee"`
+	Currency    string `json:"currency"`
+	Message     string `json:"message"`
 }
 
 // Withdraw initiates a withdrawal from an account to an external bank account.
 // Flow:
 //  1. Look up Account by sellerID (owner_id)
-//  2. Reserve: under a row lock, check the available balance and — in the same
-//     transaction — write the journal, the PENDING Disbursement carrying the DOKU
-//     Request-Id, and the debit that holds the money
-//  3. Call DOKU SendPayoutSubAccount under that Request-Id
-//  4. Book the answer: complete it, or release the reservation if the payout is known
-//     not to have happened
+//  2. Quote the transfer fee, because Singapay debits Amount + fee
+//  3. Reserve: under a row lock, check the available balance against the GROSS and — in
+//     the same transaction — write the journal, the PENDING Disbursement carrying the
+//     reference number, and the debit that holds the money
+//  4. Send the payout under that reference
+//  5. Book the answer: complete it, leave it in flight, or release the reservation if the
+//     payout is known not to have happened
 //
-// Two things used to go wrong here, and they are different problems with different fixes.
+// Three things go wrong here if this order is disturbed, and they are different problems.
 //
-// The DOKU call came first, before any DB write. Payout succeeds, process dies before the
-// commit, and the money is gone with only a log line naming it — and no stored Request-Id,
-// so it could never be asked about again, only judged by hand. Writing the row and its id
-// first makes that recoverable: see RetryDisbursement.
+// The gateway call must not come first. Payout succeeds, process dies before the commit,
+// and the money is gone with only a log line naming it — and no stored reference, so it
+// could never be asked about again. Writing the row and its reference first makes that
+// recoverable: see RetryDisbursement.
 //
-// And the balance was checked but never reserved, so two *different* withdrawals racing
-// each other both passed the check and both paid out. Idempotency does not help there —
-// each is a distinct payout with its own Request-Id. Only holding the money at request
-// time does, which is what step 2 is.
+// The balance must be reserved, not merely checked. Balances are derived by summing
+// ledger_entries, so two *different* withdrawals racing each other both pass a bare check
+// and both pay out. Idempotency does not help — each is a distinct payout with its own
+// reference. Only holding the money at request time does.
+//
+// And the reservation must cover the fee. Singapay's disbursement amount is the NET the
+// beneficiary receives; the transfer fee is added on top, so the sub-account is debited
+// Amount + fee. Reserving only Amount leaves the ledger over-stating the seller's balance
+// by the fee on every payout, and the error is silent: the books stay internally
+// consistent and disagree only with Singapay.
 func (c *LedgerClient) Withdraw(ctx context.Context, sellerID string, req *WithdrawRequest) (*WithdrawResponse, error) {
 	if req.AccountID == "" {
 		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "account_id is required", nil)
@@ -476,8 +562,12 @@ func (c *LedgerClient) Withdraw(ctx context.Context, sellerID string, req *Withd
 		}
 		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to get account", err)
 	}
+	if account.SingapayAccountID == "" {
+		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest,
+			"account has no Singapay sub-account id; nothing can be paid out of it", nil)
+	}
 
-	// Generate disbursement ID upfront (used as DOKU invoice number)
+	// Generate disbursement ID upfront — it travels with the payout as its note.
 	disbursementID := domain.GenerateID()
 
 	currency := domain.Currency(req.Currency)
@@ -496,9 +586,10 @@ func (c *LedgerClient) Withdraw(ctx context.Context, sellerID string, req *Withd
 		return nil, err
 	}
 
-	// The Request-Id this payout will travel under, stored with the row so a retry can
-	// present the same one and get DOKU's original answer instead of a second payout.
+	// The reference this payout will travel under, stored with the row so a retry can
+	// ask about the same one instead of sending a second payout.
 	disbursement.PayoutRequestID = uuid.NewString()
+	disbursement.GatewayFee = c.quotePayoutFee(ctx, account, disbursement)
 
 	if err := c.reserveBalance(ctx, account, disbursement); err != nil {
 		return nil, err
@@ -507,8 +598,56 @@ func (c *LedgerClient) Withdraw(ctx context.Context, sellerID string, req *Withd
 	return c.executePayout(ctx, account, disbursement)
 }
 
+// quotePayoutFee asks Singapay what this payout will cost, so the reservation can cover
+// the gross.
+//
+// A failed quote is not a failed withdrawal. The quote endpoint takes a SWIFT code where
+// the transfer itself takes either a SWIFT or a three-digit national code, so an account
+// stored with a three-digit code cannot be quoted at all — and refusing every such payout
+// would be a worse outcome than under-reserving by the fee. The fee is left at zero and
+// logged; the disbursement still goes out, and the drift is visible in the log rather
+// than invisible in the books.
+//
+// The quote is also a balance check: Singapay refuses it when the resulting gross would
+// exceed the account's available balance. That refusal is deliberately not fatal here
+// either — the ledger's own reservation is the authority on whether the seller may
+// withdraw, and Singapay's view of the balance can lag a settlement.
+func (c *LedgerClient) quotePayoutFee(ctx context.Context, account *domain.Account, disbursement *domain.Disbursement) int64 {
+	quote, err := c.gateway.CheckFee(ctx, account.SingapayAccountID, disbursement.BankAccount.BankCode, disbursement.Amount)
+	if err != nil {
+		c.logger.WarnContext(ctx, "Could not quote the payout fee — reserving the net only, which under-reserves by the transfer fee",
+			"disbursement_id", disbursement.UUID,
+			"account_id", account.UUID,
+			"bank_code", disbursement.BankAccount.BankCode,
+			"amount", disbursement.Amount,
+			"error", err,
+		)
+		return 0
+	}
+
+	fee, err := quote.TransferFee.Rupiah()
+	if err != nil {
+		// Rupiah() refuses to round rather than silently truncating. A fractional fee
+		// is not something to guess at on the path that moves money.
+		c.logger.WarnContext(ctx, "Payout fee quote is not a whole rupiah amount — reserving the net only",
+			"disbursement_id", disbursement.UUID,
+			"transfer_fee", quote.TransferFee.String(),
+			"error", err,
+		)
+		return 0
+	}
+
+	c.logger.InfoContext(ctx, "Quoted payout fee",
+		"disbursement_id", disbursement.UUID,
+		"net_amount", disbursement.Amount,
+		"transfer_fee", fee,
+		"gross_amount", disbursement.Amount+fee,
+	)
+	return fee
+}
+
 // reserveBalance takes the money out of the available balance and records the intent,
-// atomically, before anything is sent to DOKU.
+// atomically, before anything is sent to the gateway.
 //
 // The lock is the part that matters. Balances are derived by summing ledger_entries, so
 // without it two concurrent withdrawals both read the balance before either has written
@@ -518,7 +657,12 @@ func (c *LedgerClient) Withdraw(ctx context.Context, sellerID string, req *Withd
 //
 // The balance check therefore lives inside this transaction. Checking outside and writing
 // inside would be the same race with extra steps.
+//
+// What is reserved is the gross — net plus the quoted transfer fee — because that is what
+// Singapay will debit.
 func (c *LedgerClient) reserveBalance(ctx context.Context, account *domain.Account, disbursement *domain.Disbursement) error {
+	gross := disbursement.Amount + disbursement.GatewayFee
+
 	err := c.txProvider.Transact(ctx, func(tx repo.Tx) error {
 		if _, err := tx.Account().GetByIDForUpdate(ctx, account.UUID); err != nil {
 			return ledgererr.NewError(ledgererr.CodeInternal, "failed to lock account for withdrawal", err)
@@ -529,14 +673,16 @@ func (c *LedgerClient) reserveBalance(ctx context.Context, account *domain.Accou
 			return ledgererr.NewError(ledgererr.CodeInternal, "failed to derive available balance", err)
 		}
 
-		if disbursement.Amount > available {
+		if gross > available {
 			c.logger.WarnContext(ctx, "Insufficient available balance for withdrawal",
 				"account_id", account.UUID,
 				"requested_amount", disbursement.Amount,
+				"transfer_fee", disbursement.GatewayFee,
+				"required_gross", gross,
 				"available_balance", available,
 			)
 			return ledgererr.ErrInsufficientBalance.WithError(
-				fmt.Errorf("requested: %d, available: %d", disbursement.Amount, available),
+				fmt.Errorf("requested: %d + fee %d = %d, available: %d", disbursement.Amount, disbursement.GatewayFee, gross, available),
 			)
 		}
 
@@ -555,15 +701,23 @@ func (c *LedgerClient) reserveBalance(ctx context.Context, account *domain.Accou
 
 // writeReservation persists the journal, the PENDING disbursement and the debit that holds
 // the money. Caller owns the transaction and any locking.
+//
+// The debit is the gross. A reversal, when one is written, reverses the same amount — the
+// two must always agree, or releasing a refused payout would hand back more or less than
+// was held.
 func (c *LedgerClient) writeReservation(ctx context.Context, tx repo.Tx, account *domain.Account, disbursement *domain.Disbursement) error {
+	gross := disbursement.Amount + disbursement.GatewayFee
+
 	journal := domain.NewJournal(
 		domain.EventTypeDisbursement,
 		domain.SourceTypeDisbursement,
 		disbursement.UUID,
 		map[string]any{
-			"amount":    disbursement.Amount,
-			"bank_code": disbursement.BankAccount.BankCode,
-			"stage":     "RESERVED",
+			"amount":       disbursement.Amount,
+			"transfer_fee": disbursement.GatewayFee,
+			"gross_amount": gross,
+			"bank_code":    disbursement.BankAccount.BankCode,
+			"stage":        "RESERVED",
 		},
 	)
 	if err := tx.Journal().Save(ctx, journal); err != nil {
@@ -572,20 +726,24 @@ func (c *LedgerClient) writeReservation(ctx context.Context, tx repo.Tx, account
 	if err := tx.Disbursement().Save(ctx, disbursement); err != nil {
 		return err
 	}
-	return tx.LedgerEntry().Save(ctx, domain.NewDisbursementEntry(journal.UUID, disbursement.UUID, account.UUID, disbursement.Amount))
+	return tx.LedgerEntry().Save(ctx, domain.NewDisbursementEntry(journal.UUID, disbursement.UUID, account.UUID, gross))
 }
 
-// RetryDisbursement re-sends a payout that never reached a settled outcome, reusing the
-// Request-Id stored on the row. Because DOKU keys idempotency on that id, this is safe to
-// call even when the first attempt did succeed: DOKU replays its original answer under a
-// 409 rather than paying again, and the ledger is then written from that answer.
+// RetryDisbursement resolves a payout that never reached a settled outcome.
 //
-// This is the reason payout_request_id exists. Without a caller that reuses the id, storing
-// it protects nothing.
+// It asks before it sends. Singapay keys a payout on the reference_number this row already
+// carries, and re-sending a used reference returns SP004 rather than paying twice — but
+// SP004 is an error, not an answer, and the honest way to learn what happened is to
+// inquire on the reference. So this inquires first: if Singapay knows the reference, its
+// answer is booked and nothing is sent. Only a reference Singapay has never seen is
+// actually transmitted.
+//
+// This is the reason payout_request_id exists. Without a caller that reuses the reference,
+// storing it protects nothing.
 //
 // COMPLETED and FAILED are terminal and are refused: the first has already been paid and
-// booked, the second is a definite refusal from DOKU. Only PENDING (sent, outcome unknown)
-// and PROCESSING (accepted, awaiting confirmation) may be replayed.
+// booked, the second is a definite refusal. Only PENDING (sent, outcome unknown) and
+// PROCESSING (accepted, awaiting confirmation) may be resolved.
 func (c *LedgerClient) RetryDisbursement(ctx context.Context, disbursementID string) (*WithdrawResponse, error) {
 	disbursement, err := c.repoProvider.Disbursement().GetByID(ctx, disbursementID)
 	if err != nil {
@@ -623,7 +781,8 @@ func (c *LedgerClient) GetPendingDisbursement(ctx context.Context, disbursementI
 // SQL against a table this package owns.
 //
 // The cutoff is the caller's judgement about how long an in-flight payout may reasonably
-// take: a row is written PENDING before DOKU is called, so a young one is not stuck.
+// take: a row is written PENDING before the gateway is called, so a young one is not
+// stuck.
 func (c *LedgerClient) GetPendingDisbursements(ctx context.Context, cutoff time.Time, limit int) ([]*domain.Disbursement, error) {
 	if limit <= 0 {
 		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "limit must be greater than zero", nil)
@@ -638,19 +797,21 @@ func (c *LedgerClient) GetPendingDisbursements(ctx context.Context, cutoff time.
 }
 
 // replay applies the eligibility rules to a disbursement already read from storage, then
-// re-sends it. Split out of RetryDisbursement only so the rules live in one place.
+// resolves it — by inquiry where possible, by re-sending only when Singapay has never seen
+// the reference. Split out of RetryDisbursement only so the rules live in one place.
 func (c *LedgerClient) replay(ctx context.Context, disbursement *domain.Disbursement) (*WithdrawResponse, error) {
 	if !disbursement.IsPending() && !disbursement.IsProcessing() {
 		return nil, ledgererr.NewError(ledgererr.CodeInvalidDisbursementStatus,
 			fmt.Sprintf("disbursement is %s and cannot be retried", disbursement.Status), nil)
 	}
 
-	// A row written before this feature existed has no id to replay. Minting one now would
-	// be worse than refusing: it would look like a protected retry while giving DOKU a key
-	// it has never seen, so a payout that already went out would go out again.
+	// A row written before this feature existed has no reference to ask about. Minting
+	// one now would be worse than refusing: it would look like a protected retry while
+	// giving Singapay a reference it has never seen, so a payout that already went out
+	// would go out again.
 	if disbursement.PayoutRequestID == "" {
 		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest,
-			"disbursement has no stored payout request id; it predates idempotent retries and must be settled by hand", nil)
+			"disbursement has no stored payout reference; it predates idempotent retries and must be settled by hand", nil)
 	}
 
 	account, err := c.repoProvider.Account().GetByID(ctx, disbursement.LedgerUUID)
@@ -666,13 +827,39 @@ func (c *LedgerClient) replay(ctx context.Context, disbursement *domain.Disburse
 		return nil, err
 	}
 
-	c.logger.InfoContext(ctx, "Retrying disbursement with stored request id",
+	c.logger.InfoContext(ctx, "Resolving disbursement by inquiry before considering a re-send",
 		"disbursement_id", disbursement.UUID,
 		"status", disbursement.Status,
-		"payout_request_id", disbursement.PayoutRequestID,
+		"payout_reference", disbursement.PayoutRequestID,
 	)
 
-	return c.executePayout(ctx, account, disbursement)
+	known, err := c.gateway.InquiryDisbursement(ctx, account.SingapayAccountID, disbursement.PayoutRequestID)
+	if err == nil && known != nil {
+		c.logger.InfoContext(ctx, "Singapay already knows this payout reference — booking its answer instead of re-sending",
+			"disbursement_id", disbursement.UUID,
+			"payout_reference", disbursement.PayoutRequestID,
+			"transaction_status", known.TransactionStatus(),
+		)
+		return c.bookPayoutOutcome(ctx, account, disbursement, known)
+	}
+
+	// Not found is the one answer that makes re-sending safe: Singapay has no record of
+	// this reference, so nothing can have been paid under it. Any other failure leaves
+	// the question open, and an open question is not a licence to send money again.
+	if e, ok := singapay.AsError(err); ok && e.Code == singapay.CodeTransactionNotFound {
+		c.logger.InfoContext(ctx, "Singapay has no record of this payout reference — sending it",
+			"disbursement_id", disbursement.UUID,
+			"payout_reference", disbursement.PayoutRequestID,
+		)
+		return c.executePayout(ctx, account, disbursement)
+	}
+
+	c.logger.WarnContext(ctx, "Payout inquiry gave no usable answer — leaving the disbursement in flight, balance stays reserved",
+		"disbursement_id", disbursement.UUID,
+		"payout_reference", disbursement.PayoutRequestID,
+		"error", err,
+	)
+	return nil, ledgererr.ErrGatewayOutcomeUnknown.WithError(err)
 }
 
 // ensureReserved backfills the reservation for a disbursement that predates it.
@@ -697,6 +884,7 @@ func (c *LedgerClient) ensureReserved(ctx context.Context, account *domain.Accou
 		"disbursement_id", disbursement.UUID,
 		"account_id", account.UUID,
 		"amount", disbursement.Amount,
+		"transfer_fee", disbursement.GatewayFee,
 	)
 
 	err = c.txProvider.Transact(ctx, func(tx repo.Tx) error {
@@ -708,66 +896,103 @@ func (c *LedgerClient) ensureReserved(ctx context.Context, account *domain.Accou
 	return nil
 }
 
-// executePayout sends the payout to DOKU and books whatever comes back. It is shared by the
-// first attempt and by every replay, so both go out under the same Request-Id and are
-// settled by identical rules.
+// executePayout sends the payout and books whatever comes back.
 //
-// The disbursement row already exists when this runs.
+// The disbursement row already exists when this runs, and the reservation debit is already
+// in the ledger — written before the call went out. So the only question left is whether
+// to give it back, and that question is answered by Outcome, never by the HTTP status.
 func (c *LedgerClient) executePayout(ctx context.Context, account *domain.Account, disbursement *domain.Disbursement) (*WithdrawResponse, error) {
-	dokuReq := requests.DokuSendPayoutSubAccountRequest{}
-	dokuReq.Account.ID = account.DokuSubAccountID
-	dokuReq.Payout.Amount = int(disbursement.Amount)
-	dokuReq.Payout.InvoiceNumber = disbursement.UUID
-	dokuReq.Beneficiary.BankCode = disbursement.BankAccount.BankCode
-	dokuReq.Beneficiary.BankAccountNumber = disbursement.BankAccount.AccountNumber
-	dokuReq.Beneficiary.BankAccountName = disbursement.BankAccount.AccountName
-
-	// The body is built before the log line, not after, so the line can carry it. A payout
-	// DOKU refuses is argued over the body it received, and until now the log described the
-	// call in our own field names and left the beneficiary out entirely.
-	c.logger.InfoContext(ctx, "Calling DOKU SendPayoutSubAccount",
-		"disbursement_id", disbursement.UUID,
-		"account_id", account.UUID,
-		"doku_sub_account_id", account.DokuSubAccountID,
-		// Empty is the failure worth spotting at a glance: the body still goes out with a
-		// blank account.id, and DOKU answers "Request or data not found".
-		"doku_sub_account_id_empty", account.DokuSubAccountID == "",
-		"amount", disbursement.Amount,
-		"payout_request_id", disbursement.PayoutRequestID,
-		"request_target", "/sac-merchant/v1/payouts",
-		"request_body", payoutRequestLogBody(dokuReq),
-	)
-
-	dokuResp, dokuErr := c.dokuClient.SendPayoutSubAccount(disbursement.PayoutRequestID, dokuReq)
-	if dokuErr != nil {
-		return nil, c.recordPayoutFailure(ctx, disbursement, dokuErr)
+	payoutReq := singapay.DisburseRequest{
+		AccountID:         account.SingapayAccountID,
+		ReferenceNumber:   disbursement.PayoutRequestID,
+		BankCode:          disbursement.BankAccount.BankCode,
+		BankAccountNumber: disbursement.BankAccount.AccountNumber,
+		Amount:            disbursement.Amount,
+		Notes:             disbursement.UUID,
 	}
 
-	c.logger.InfoContext(ctx, "DOKU disbursement response received",
+	// The body is built before the log line, not after, so the line can carry it. A payout
+	// Singapay refuses is argued over the body it received.
+	c.logger.InfoContext(ctx, "Sending Singapay disbursement",
 		"disbursement_id", disbursement.UUID,
-		"doku_status", dokuResp.Payout.Status,
-		"doku_invoice", dokuResp.Payout.InvoiceNumber,
+		"account_id", account.UUID,
+		"singapay_account_id", account.SingapayAccountID,
+		// Empty is the failure worth spotting at a glance: the body still goes out with a
+		// blank account_id, and Singapay answers with a not-found rather than a clear
+		// validation error.
+		"singapay_account_id_empty", account.SingapayAccountID == "",
+		"net_amount", disbursement.Amount,
+		"transfer_fee", disbursement.GatewayFee,
+		"payout_reference", disbursement.PayoutRequestID,
+		"request_target", "/api/v2.0/disbursement/transfer",
+		"request_body", payoutRequestLogBody(payoutReq),
 	)
 
-	// The debit is already in the ledger — it was written when the balance was reserved,
-	// before this call went out. So the only question left is whether to give it back.
-	dokuStatus := dokuResp.Payout.Status
-	reverse := false
-	switch dokuStatus {
-	case "SUCCESS":
-		_ = disbursement.MarkCompleted(dokuResp.Payout.InvoiceNumber)
-	case "FAILED", "REJECTED":
-		c.logger.WarnContext(ctx, "DOKU payout returned failed status",
+	result, gwErr := c.gateway.Disburse(ctx, payoutReq)
+	if gwErr != nil {
+		return nil, c.recordPayoutFailure(ctx, account, disbursement, gwErr)
+	}
+
+	return c.bookPayoutOutcome(ctx, account, disbursement, result)
+}
+
+// bookPayoutOutcome writes the ledger consequences of a payout Singapay has described,
+// whether that description arrived from the transfer call, from an inquiry, or from a
+// webhook. One code path for all three, so all three settle by identical rules.
+//
+// SP000 on the transfer meant the instruction was accepted, not that money moved. The
+// payment outcome is the two-digit transaction status, and this is where it is read:
+//
+//	00           succeeded — complete, count the withdrawal
+//	04, 05, 06, 07  terminally failed — release the reservation
+//	01, 02, 03   still in flight — hold the reservation and wait
+func (c *LedgerClient) bookPayoutOutcome(ctx context.Context, account *domain.Account, disbursement *domain.Disbursement, result *singapay.Disbursement) (*WithdrawResponse, error) {
+	status := result.TransactionStatus()
+	gross := disbursement.Amount + disbursement.GatewayFee
+
+	c.logger.InfoContext(ctx, "Singapay disbursement outcome",
+		"disbursement_id", disbursement.UUID,
+		"transaction_status", status,
+		"transaction_id", result.TransactionID,
+		"failed_code", result.FailedCode,
+		"failed_reason", result.FailedReason,
+	)
+
+	// If Singapay reports a fee different from the one quoted, the reservation is wrong.
+	// It is recorded but not re-reserved here: changing the held amount after the money
+	// has moved would need its own compensating entry, and a quiet adjustment on this
+	// path is exactly the kind of thing that makes a balance impossible to explain.
+	if actualFee, err := result.Fee.Rupiah(); err == nil && result.Fee.Set && actualFee != disbursement.GatewayFee {
+		c.logger.WarnContext(ctx, "Singapay charged a different transfer fee than was quoted — the reservation is off by the difference",
 			"disbursement_id", disbursement.UUID,
-			"doku_status", dokuStatus,
-			"doku_invoice", dokuResp.Payout.InvoiceNumber,
+			"quoted_fee", disbursement.GatewayFee,
+			"actual_fee", actualFee,
+			"difference", actualFee-disbursement.GatewayFee,
 		)
-		_ = disbursement.MarkFailed(fmt.Sprintf("DOKU payout status: %s", dokuStatus))
-		// A status DOKU states outright is a known outcome: no money left, so the
-		// reservation is released.
+	}
+
+	reverse := false
+	switch {
+	case status.Succeeded():
+		_ = disbursement.MarkCompleted(result.TransactionID)
+	case status.Terminal():
+		reason := fmt.Sprintf("Singapay payout status %s", status)
+		if result.FailedReason != "" {
+			reason = fmt.Sprintf("%s: %s (%s)", reason, result.FailedReason, result.FailedCode)
+		}
+		c.logger.WarnContext(ctx, "Singapay payout terminally failed",
+			"disbursement_id", disbursement.UUID,
+			"transaction_status", status,
+			"failed_code", result.FailedCode,
+			"failed_reason", result.FailedReason,
+		)
+		_ = disbursement.MarkFailed(reason)
+		// A terminal failure is a known outcome: no money left, so the reservation is
+		// released.
 		reverse = true
 	default:
-		_ = disbursement.MarkProcessing(dokuResp.Payout.InvoiceNumber)
+		// 01, 02, 03 — accepted and still moving. The reservation stays.
+		_ = disbursement.MarkProcessing(result.TransactionID)
 	}
 
 	settlementJournal := domain.NewJournal(
@@ -775,11 +1000,13 @@ func (c *LedgerClient) executePayout(ctx context.Context, account *domain.Accoun
 		domain.SourceTypeDisbursement,
 		disbursement.UUID,
 		map[string]any{
-			"amount":       disbursement.Amount,
-			"bank_code":    disbursement.BankAccount.BankCode,
-			"doku_status":  dokuStatus,
-			"doku_invoice": dokuResp.Payout.InvoiceNumber,
-			"stage":        "SETTLED",
+			"amount":             disbursement.Amount,
+			"transfer_fee":       disbursement.GatewayFee,
+			"gross_amount":       gross,
+			"bank_code":          disbursement.BankAccount.BankCode,
+			"transaction_status": string(status),
+			"transaction_id":     result.TransactionID,
+			"stage":              "SETTLED",
 		},
 	)
 
@@ -792,7 +1019,7 @@ func (c *LedgerClient) executePayout(ctx context.Context, account *domain.Accoun
 		}
 
 		if reverse {
-			if err := tx.LedgerEntry().Save(ctx, domain.NewDisbursementReversalEntry(settlementJournal.UUID, disbursement.UUID, account.UUID, disbursement.Amount)); err != nil {
+			if err := tx.LedgerEntry().Save(ctx, domain.NewDisbursementReversalEntry(settlementJournal.UUID, disbursement.UUID, account.UUID, gross)); err != nil {
 				return err
 			}
 		}
@@ -812,21 +1039,21 @@ func (c *LedgerClient) executePayout(ctx context.Context, account *domain.Accoun
 		return nil
 	})
 	if err != nil {
-		// Recoverable now, unlike before: the row and its Request-Id were written ahead of
-		// the call, so RetryDisbursement can replay and book the same answer.
-		c.logger.ErrorContext(ctx, "CRITICAL: DOKU succeeded but DB save failed — retry with the stored request id",
+		// Recoverable: the row and its reference were written ahead of the call, so
+		// RetryDisbursement can inquire and book the same answer.
+		c.logger.ErrorContext(ctx, "CRITICAL: Singapay answered but the ledger write failed — resolve with RetryDisbursement, which inquires rather than re-sends",
 			"disbursement_id", disbursement.UUID,
-			"payout_request_id", disbursement.PayoutRequestID,
-			"doku_status", dokuStatus,
-			"doku_invoice", dokuResp.Payout.InvoiceNumber,
+			"payout_reference", disbursement.PayoutRequestID,
+			"transaction_status", status,
+			"transaction_id", result.TransactionID,
 			"amount", disbursement.Amount,
 			"account_id", account.UUID,
 			"error", err,
 		)
-		return nil, ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to save disbursement after DOKU success", err)
+		return nil, ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to save disbursement after gateway answered", err)
 	}
 
-	c.logger.InfoContext(ctx, "Withdrawal completed",
+	c.logger.InfoContext(ctx, "Withdrawal booked",
 		"disbursement_id", disbursement.UUID,
 		"status", disbursement.Status,
 		"amount", disbursement.Amount,
@@ -836,17 +1063,18 @@ func (c *LedgerClient) executePayout(ctx context.Context, account *domain.Accoun
 		DisbursementID: disbursement.UUID,
 		Status:         string(disbursement.Status),
 		Amount:         disbursement.Amount,
+		TransferFee:    disbursement.GatewayFee,
 		Currency:       string(disbursement.Currency),
-		Message:        fmt.Sprintf("Withdrawal %s", dokuStatus),
+		Message:        fmt.Sprintf("Payout %s", status),
 	}, nil
 }
 
-// payoutRequestLogBody renders the payout request as the JSON body DOKU will receive.
+// payoutRequestLogBody renders the payout request as the JSON body Singapay will receive.
 //
-// The individual fields are logged beside it, but a payout DOKU rejects is disputed over
-// the body it was sent, not over our field names. This marshals the very struct the client
-// marshals, so the log holds what went on the wire — reproduced verbatim, empty account.id
-// included, which is the shape "Request or data not found" comes back to.
+// The individual fields are logged beside it, but a payout Singapay rejects is disputed
+// over the body it was sent, not over our field names. This marshals the very struct the
+// client marshals, so the log holds what went on the wire — reproduced verbatim, empty
+// account_id included.
 //
 // The one departure is the beneficiary account number, masked to its last four digits.
 // These logs are shipped off-process; a full account number does not need to travel with
@@ -854,8 +1082,8 @@ func (c *LedgerClient) executePayout(ctx context.Context, account *domain.Accoun
 // this went to.
 //
 // req is taken by value: the mask must not touch what is about to be sent.
-func payoutRequestLogBody(req requests.DokuSendPayoutSubAccountRequest) string {
-	req.Beneficiary.BankAccountNumber = maskAccountNumber(req.Beneficiary.BankAccountNumber)
+func payoutRequestLogBody(req singapay.DisburseRequest) string {
+	req.BankAccountNumber = maskAccountNumber(req.BankAccountNumber)
 
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -881,55 +1109,70 @@ func maskAccountNumber(accountNumber string) string {
 	return strings.Repeat("*", len(accountNumber)-visible) + accountNumber[len(accountNumber)-visible:]
 }
 
-// recordPayoutFailure decides what a DOKU error means for the row, and it turns on one
-// question: do we know the payout did not happen?
+// recordPayoutFailure decides what a failed money-out call means for the row, and it turns
+// on one question: do we know the payout did not happen?
 //
-// A 4xx is DOKU refusing — invalid bank account, insufficient balance on their side. Nothing
-// left, so the disbursement becomes FAILED, which is terminal here.
+// Singapay answers that question itself, through Outcome. Deciding it from the HTTP status
+// instead is the trap the previous gateway's code fell into: Singapay returns HTTP 400 for
+// SP001, SP002, SP004 and SP005, and its own documentation says to call inquiry-status for
+// every one of them, because the transfer may still settle. Releasing the reservation on a
+// 4xx is precisely how a payout gets made twice.
 //
-// A timeout (status 0) or a 5xx says nothing about the money. The payout may be on its way.
-// Marking that FAILED would be a claim we cannot support, and worse, it would lock the row
-// out of any replay, because FAILED cannot transition to COMPLETED. Those stay PENDING with
-// their Request-Id intact, which is exactly the state RetryDisbursement is built for.
-func (c *LedgerClient) recordPayoutFailure(ctx context.Context, disbursement *domain.Disbursement, dokuErr *dokumodels.ErrorLog) error {
-	outcomeKnown := dokuErr.StatusCode >= 400 && dokuErr.StatusCode < 500
+//	OutcomeRefused    Singapay declined before moving anything. FAILED, reservation released.
+//	OutcomeDuplicate  This reference already exists — the original may well have succeeded.
+//	                  Left in flight; RetryDisbursement resolves it by inquiry.
+//	OutcomeUnknown    No answer, or an answer that says nothing about the money. Left in
+//	                  flight with the reservation held, which is the only state from which
+//	                  the truth can still be recovered.
+func (c *LedgerClient) recordPayoutFailure(ctx context.Context, account *domain.Account, disbursement *domain.Disbursement, gwErr error) error {
+	outcome := singapay.OutcomeUnknown
+	var code singapay.ResponseCode
+	var statusCode int
+	if e, ok := singapay.AsError(gwErr); ok {
+		outcome = e.Outcome()
+		code = e.Code
+		statusCode = e.StatusCode
+	}
 
-	c.logger.ErrorContext(ctx, "DOKU SendPayoutSubAccount failed",
+	c.logger.ErrorContext(ctx, "Singapay disbursement failed",
 		"disbursement_id", disbursement.UUID,
-		"payout_request_id", disbursement.PayoutRequestID,
-		"error", dokuErr.Err,
-		"message", dokuErr.Message,
-		"status_code", dokuErr.StatusCode,
-		"outcome_known", outcomeKnown,
+		"payout_reference", disbursement.PayoutRequestID,
+		"response_code", string(code),
+		"status_code", statusCode,
+		"outcome", outcome.String(),
+		"error", gwErr,
 	)
 
-	if !outcomeKnown {
+	if outcome != singapay.OutcomeRefused {
 		// Left in flight on purpose, and the reservation stays with it. The money may be
 		// on its way; handing it back to the available balance is precisely how it would
-		// be withdrawn a second time. PENDING plus a stored Request-Id is the only state
+		// be withdrawn a second time. PENDING plus a stored reference is the only state
 		// from which the truth can still be recovered.
-		c.logger.WarnContext(ctx, "Payout outcome unknown — disbursement left in flight, balance stays reserved",
+		c.logger.WarnContext(ctx, "Payout outcome not known to be a refusal — disbursement left in flight, balance stays reserved",
 			"disbursement_id", disbursement.UUID,
-			"payout_request_id", disbursement.PayoutRequestID,
+			"payout_reference", disbursement.PayoutRequestID,
+			"outcome", outcome.String(),
 			"amount", disbursement.Amount,
 		)
-		return ledgererr.NewError(ledgererr.CodeDokuAPIError,
-			"DOKU disbursement outcome unknown; it will be resolved by retrying with the stored request id",
-			fmt.Errorf("status code: %d, error: %v", dokuErr.StatusCode, dokuErr.Message))
+		return ledgererr.ErrGatewayOutcomeUnknown.WithError(
+			fmt.Errorf("outcome %s (code %s, http %d): %w", outcome, code, statusCode, gwErr))
 	}
 
 	// Known refusal: no money left, so the reservation goes back to the available balance
 	// and the row reaches its terminal state.
-	if err := disbursement.MarkFailed(fmt.Sprintf("DOKU rejected the payout: %v", dokuErr.Message)); err == nil {
+	gross := disbursement.Amount + disbursement.GatewayFee
+	if err := disbursement.MarkFailed(fmt.Sprintf("Singapay refused the payout (%s): %v", code, gwErr)); err == nil {
 		reversalJournal := domain.NewJournal(
 			domain.EventTypeDisbursement,
 			domain.SourceTypeDisbursement,
 			disbursement.UUID,
 			map[string]any{
-				"amount":      disbursement.Amount,
-				"bank_code":   disbursement.BankAccount.BankCode,
-				"status_code": dokuErr.StatusCode,
-				"stage":       "REVERSED",
+				"amount":        disbursement.Amount,
+				"transfer_fee":  disbursement.GatewayFee,
+				"gross_amount":  gross,
+				"bank_code":     disbursement.BankAccount.BankCode,
+				"response_code": string(code),
+				"stage":         "REVERSED",
 			},
 		)
 
@@ -940,934 +1183,21 @@ func (c *LedgerClient) recordPayoutFailure(ctx context.Context, disbursement *do
 			if err := tx.Disbursement().Save(ctx, disbursement); err != nil {
 				return err
 			}
-			return tx.LedgerEntry().Save(ctx, domain.NewDisbursementReversalEntry(reversalJournal.UUID, disbursement.UUID, disbursement.LedgerUUID, disbursement.Amount))
+			return tx.LedgerEntry().Save(ctx, domain.NewDisbursementReversalEntry(reversalJournal.UUID, disbursement.UUID, account.UUID, gross))
 		})
 		if saveErr != nil {
 			// The seller's money is held by a reservation that no longer corresponds to
 			// anything. Loud, because only a human can put this right.
-			c.logger.ErrorContext(ctx, "CRITICAL: payout rejected but the reservation could not be released — balance is understated",
+			c.logger.ErrorContext(ctx, "CRITICAL: payout refused but the reservation could not be released — balance is understated",
 				"disbursement_id", disbursement.UUID,
-				"account_id", disbursement.LedgerUUID,
-				"amount", disbursement.Amount,
+				"account_id", account.UUID,
+				"gross_amount", gross,
 				"error", saveErr,
 			)
 		}
 	}
 
-	return ledgererr.NewError(ledgererr.CodeDokuAPIError, "DOKU disbursement failed", fmt.Errorf("%v", dokuErr.Message))
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Reconciliation (Settlement CSV processing)
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ReconciliationRequest contains the parameters for reconciliation
-type ReconciliationRequest struct {
-	CSVReader      io.Reader // CSV file reader
-	ReportFileName string    // Original filename
-	SettlementDate time.Time // Date of settlement
-	UploadedBy     string    // Admin/System who uploaded
-}
-
-// ReconciliationResponse contains the result of reconciliation
-type ReconciliationResponse struct {
-	ReconciliationID string `json:"reconciliation_id"`
-	// AlreadyIngested reports that this CSV's batch_id was already booked and
-	// nothing was posted. It is a success, not an error: re-presenting a settlement
-	// file is the ordinary case for a caller that discovers files by listing object
-	// storage, and the answer it needs is "already done", not a failure.
-	//
-	// When it is true, only ReconciliationID, IngestedAs, UploadedBy, UploadedAt,
-	// SettlementDate and Transactions describe the ORIGINAL ingest; BalanceUpdates,
-	// Discrepancies and Verification are zero, because this call moved no money.
-	AlreadyIngested bool `json:"already_ingested,omitempty"`
-	// IngestedAs is the report_file_name the batch was originally ingested under,
-	// set only when AlreadyIngested is true.
-	//
-	// It is returned rather than a bare boolean so the caller can tell two very
-	// different situations apart: the SAME file presented again (benign, and worth
-	// no more than an info log), versus a DIFFERENT file carrying a batch_id that
-	// has already been booked — which is also what a DOKU correction would look
-	// like, and must not be swallowed quietly.
-	IngestedAs     string                  `json:"ingested_as,omitempty"`
-	UploadedBy     string                  `json:"uploaded_by"`
-	UploadedAt     time.Time               `json:"uploaded_at"`
-	SettlementDate string                  `json:"settlement_date"`
-	Transactions   ReconciliationTxSummary `json:"transactions"`
-	BalanceUpdates ReconciliationBalances  `json:"balance_updates"`
-	Discrepancies  []DiscrepancySummary    `json:"discrepancies"`
-	Verification   ReconciliationVerify    `json:"verification"`
-}
-
-// ReconciliationTxSummary contains transaction counts
-type ReconciliationTxSummary struct {
-	Total     int `json:"total"`
-	Matched   int `json:"matched"`
-	Unmatched int `json:"unmatched"`
-}
-
-// ReconciliationBalances contains balance changes
-type ReconciliationBalances struct {
-	Pending   BalanceChange `json:"pending"`
-	Available BalanceChange `json:"available"`
-}
-
-// BalanceChange represents before/after/diff for a balance
-type BalanceChange struct {
-	Before int64 `json:"before"`
-	After  int64 `json:"after"`
-	Diff   int64 `json:"diff"`
-}
-
-// DiscrepancySummary contains discrepancy information
-type DiscrepancySummary struct {
-	Type          string `json:"type"`
-	InvoiceNumber string `json:"invoice_number,omitempty"`
-	Amount        int64  `json:"amount,omitempty"`
-	Message       string `json:"message"`
-}
-
-// ReconciliationVerify contains DOKU verification results
-type ReconciliationVerify struct {
-	DokuAPIChecked     bool   `json:"doku_api_checked"`
-	DokuPending        int64  `json:"doku_pending,omitempty"`   // Deprecated: use seller-level verification
-	DokuAvailable      int64  `json:"doku_available,omitempty"` // Deprecated: use seller-level verification
-	MatchStatus        string `json:"match_status"`
-	SellersVerified    int    `json:"sellers_verified"`     // Number of sellers with DOKU sub-accounts verified
-	SellersMatched     int    `json:"sellers_matched"`      // Number of sellers with exact balance match
-	SellersMismatched  int    `json:"sellers_mismatched"`   // Number of sellers with balance discrepancies
-	SellersNotVerified int    `json:"sellers_not_verified"` // Number of sellers without DOKU sub-accounts
-}
-
-// FilterIngestedReportFiles returns the subset of reportFileNames that this ledger
-// has already ingested as settlement batches.
-//
-// It exists for callers that discover settlement files by listing object storage:
-// they list, ask here which ones are already booked, and process the difference.
-// Asking the ledger is the point — "have I processed this file?" is a question
-// about ledger state, and answering it by reaching into settlement_batches from
-// outside this package couples that caller to a schema it does not own.
-//
-// The answer is a set rather than a slice because the caller's next move is
-// always a membership test, one per listed key.
-//
-// This is the cheap filter, not the safety net. It keys on report_file_name, which
-// a rename or a re-download under a new path defeats; the guarantee that a batch is
-// booked at most once comes from batch_id, enforced inside ProcessReconciliation
-// and by the unique index behind it. A caller may skip this entirely and simply
-// hand every file over — it would just do more parsing to reach the same outcome.
-func (c *LedgerClient) FilterIngestedReportFiles(ctx context.Context, reportFileNames []string) (map[string]struct{}, error) {
-	ingested, err := c.repoProvider.SettlementBatch().FilterIngestedReportFiles(ctx, reportFileNames)
-	if err != nil {
-		return nil, ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to filter ingested report files", err)
-	}
-
-	return ingested, nil
-}
-
-// ProcessReconciliation processes a DOKU settlement CSV and writes immutable
-// ledger entries to convert PENDING → AVAILABLE for seller and platform accounts,
-// and clears the DOKU expense PENDING balance.
-//
-// NOTE: Settlement CSV is PLATFORM-WIDE and contains invoices from ALL sellers.
-// Each transaction is matched to its respective seller account during processing.
-//
-// Phase 3 flow:
-// 1. Validate + parse CSV
-// 2. Insert settlement_batch record (tied to platform account)
-// 3. For each CSV row: match → mark ProductTransaction SETTLED
-// 4. Write settlement ledger entries (PENDING→AVAILABLE) for each seller
-// 5. Optionally verify with DOKU GetBalance API
-func (c *LedgerClient) ProcessReconciliation(ctx context.Context, req *ReconciliationRequest) (*ReconciliationResponse, error) {
-	if req.CSVReader == nil {
-		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "csv_reader is required", nil)
-	}
-	if req.UploadedBy == "" {
-		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "uploaded_by is required", nil)
-	}
-
-	// Fetch system accounts
-	platformAccount, err := c.repoProvider.Account().GetPlatformAccount(ctx)
-	if err != nil {
-		if ledgererr.IsAppError(err, repo.ErrNotFound) {
-			return nil, ledgererr.NewError(ledgererr.CodeInternal, "platform account not found - please create platform account first", err)
-		}
-		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to get platform account", err)
-	}
-	dokuAccount, err := c.repoProvider.Account().GetPaymentGatewayAccount(ctx)
-	if err != nil && !ledgererr.IsAppError(err, repo.ErrNotFound) {
-		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to get payment gateway account", err)
-	}
-
-	// Derive pre-settlement balances for platform account
-	// (Settlement CSV contains transactions from ALL sellers, so we track at platform level)
-	previousPending, previousAvailable, err := c.repoProvider.LedgerEntry().GetAllBalances(ctx, platformAccount.UUID)
-	if err != nil {
-		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to derive pre-settlement balances", err)
-	}
-
-	// Parse CSV
-	parser := domain.NewDokuSettlementCSVParser("", 1)
-	if err := parser.Parse(req.CSVReader); err != nil {
-		return nil, err
-	}
-
-	csvRows := parser.GetRows()
-	if len(csvRows) == 0 {
-		return nil, ledgererr.ErrInvalidSettlementCSVFormat.WithError(fmt.Errorf("CSV contains no data rows"))
-	}
-
-	c.logger.InfoContext(ctx, "Parsed settlement CSV",
-		"platform_account_id", platformAccount.UUID,
-		"total_rows", len(csvRows),
-		"skipped_rows", parser.GetSkippedRows(),
-		"parse_errors", len(parser.GetParseErrors()),
-	)
-
-	// Extract metadata from CSV
-	csvMetadata := parser.GetMetadata()
-	if csvMetadata == nil || csvMetadata.BatchID == "" {
-		return nil, ledgererr.ErrInvalidSettlementCSVFormat.WithError(fmt.Errorf("CSV metadata missing Batch ID"))
-	}
-
-	c.logger.InfoContext(ctx, "Extracted CSV metadata",
-		"batch_id", csvMetadata.BatchID,
-		"total_amount_purchase", csvMetadata.TotalAmountPurchase,
-		"total_fee", csvMetadata.TotalFee,
-		"total_settlement", csvMetadata.TotalSettlement,
-		"total_transactions", csvMetadata.TotalTransactions,
-	)
-
-	// Idempotency check — the normal brake.
-	//
-	// A batch_id already present in settlement_batches has been booked, and the
-	// ledger entries behind it are immutable. Processing it a second time would
-	// double-post: there is no undo, only compensating entries and an audit.
-	//
-	// This runs after the parse (batch_id lives in the CSV metadata, so there is no
-	// cheaper way to learn it) but before anything is written, so a repeat costs one
-	// parse and one indexed lookup and touches nothing.
-	//
-	// It does not replace the unique index from migration 013. Check-then-insert is
-	// a race between two concurrent callers, and it only protects the path that
-	// remembers to check. The index is the emergency brake; this exists so the
-	// ordinary repeat is a describable answer instead of a constraint violation
-	// indistinguishable from the database being down.
-	existingBatch, err := c.repoProvider.SettlementBatch().GetByBatchID(ctx, csvMetadata.BatchID)
-	if err != nil && !ledgererr.IsAppError(err, repo.ErrNotFound) {
-		return nil, ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to look up settlement batch by batch_id", err)
-	}
-	if existingBatch != nil {
-		c.logger.InfoContext(ctx, "Settlement batch already ingested - nothing posted",
-			"batch_id", csvMetadata.BatchID,
-			"ingested_as", existingBatch.ReportFileName,
-			"presented_as", req.ReportFileName,
-			"reconciliation_id", existingBatch.UUID,
-		)
-
-		return &ReconciliationResponse{
-			ReconciliationID: existingBatch.UUID,
-			AlreadyIngested:  true,
-			IngestedAs:       existingBatch.ReportFileName,
-			UploadedBy:       existingBatch.UploadedBy,
-			UploadedAt:       existingBatch.UploadedAt,
-			SettlementDate:   existingBatch.SettlementDate.Format("2006-01-02"),
-			Transactions: ReconciliationTxSummary{
-				Total:     existingBatch.MatchedCount + existingBatch.UnmatchedCount,
-				Matched:   existingBatch.MatchedCount,
-				Unmatched: existingBatch.UnmatchedCount,
-			},
-		}, nil
-	}
-
-	settlementDate := req.SettlementDate
-	if settlementDate.IsZero() && len(csvRows) > 0 {
-		settlementDate = csvRows[0].PayOutDate
-	}
-
-	// Create settlement batch tied to PLATFORM account
-	// (CSV contains transactions from ALL sellers, tracked at platform level)
-	batch, err := domain.NewSettlementBatch(
-		platformAccount.UUID,
-		req.ReportFileName,
-		settlementDate,
-		req.UploadedBy,
-		platformAccount.Currency,
-	)
-	if err != nil {
-		return nil, err
-	}
-	batch.BatchID = csvMetadata.BatchID // Set DOKU Batch ID from CSV metadata
-	batch.MarkProcessing()
-
-	c.logger.InfoContext(ctx, "Created settlement batch",
-		"batch", batch,
-	)
-
-	// Process CSV rows - cache ProductTransactions to avoid N+1 queries
-	var settlementItems []*domain.SettlementItem
-	var discrepancies []DiscrepancySummary
-	productTxCache := make(map[string]*domain.ProductTransaction) // Cache by ProductTransaction.UUID
-	sellerItemDiscrepancies := make(map[string]struct {
-		count int
-		total int64
-	}) // Track per seller
-	var totalSettledSellerAmount int64   // seller_net_amount from matched transactions
-	var totalSettledPlatformAmount int64 // platform_fee from matched transactions
-	var totalDokuFee int64
-
-	for _, csvRow := range csvRows {
-		item, err := csvRow.ToSettlementItem(batch.UUID)
-		if err != nil {
-			c.logger.WarnContext(ctx, "Failed to create settlement item",
-				"row_number", csvRow.RowNumber,
-				"invoice_number", csvRow.InvoiceNumber,
-				"error", err,
-			)
-			batch.IncrementUnmatched()
-			discrepancies = append(discrepancies, DiscrepancySummary{
-				Type:          "INVALID_CSV_ROW",
-				InvoiceNumber: csvRow.InvoiceNumber,
-				Message:       fmt.Sprintf("Row %d: %v", csvRow.RowNumber, err),
-			})
-			continue
-		}
-
-		productTx, err := c.repoProvider.ProductTransaction().GetByInvoiceNumber(ctx, csvRow.InvoiceNumber)
-		if err != nil {
-			if ledgererr.IsAppError(err, repo.ErrNotFound) {
-				c.logger.WarnContext(ctx, "No matching transaction for invoice",
-					"invoice_number", csvRow.InvoiceNumber,
-					"row_number", csvRow.RowNumber,
-				)
-				batch.IncrementUnmatched()
-				discrepancies = append(discrepancies, DiscrepancySummary{
-					Type:          "UNMATCHED_CSV_ENTRY",
-					InvoiceNumber: csvRow.InvoiceNumber,
-					Amount:        csvRow.Amount,
-					Message:       fmt.Sprintf("No matching transaction found for invoice: %s", csvRow.InvoiceNumber),
-				})
-				settlementItems = append(settlementItems, item)
-				continue
-			}
-			return nil, ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to query product transaction", err)
-		}
-
-		// Skip if transaction is already settled (duplicate CSV entry or re-upload)
-		if productTx.IsSettled() {
-			c.logger.InfoContext(ctx, "Skipping already settled transaction",
-				"invoice_number", csvRow.InvoiceNumber,
-				"product_tx_id", productTx.UUID,
-				"settled_at", productTx.SettledAt,
-			)
-			batch.IncrementUnmatched()
-			discrepancies = append(discrepancies, DiscrepancySummary{
-				Type:          "ALREADY_SETTLED",
-				InvoiceNumber: csvRow.InvoiceNumber,
-				Amount:        csvRow.Amount,
-				Message:       fmt.Sprintf("Transaction already settled (settled_at: %v)", productTx.SettledAt),
-			})
-			settlementItems = append(settlementItems, item)
-			continue
-		}
-
-		if err := item.MatchToTransaction(productTx); err != nil {
-			c.logger.WarnContext(ctx, "Failed to match settlement item",
-				"invoice_number", csvRow.InvoiceNumber,
-				"product_tx_id", productTx.UUID,
-				"error", err,
-			)
-			batch.IncrementUnmatched()
-			settlementItems = append(settlementItems, item)
-			continue
-		}
-
-		// Verify SubAccount from CSV matches seller's DOKU sub-account for safety
-		if csvRow.SubAccount != "" {
-			sellerAccount, err := c.repoProvider.Account().GetByID(ctx, productTx.SellerAccountID)
-			if err != nil {
-				c.logger.WarnContext(ctx, "Failed to get seller account for SubAccount verification",
-					"invoice_number", csvRow.InvoiceNumber,
-					"product_tx_id", productTx.UUID,
-					"seller_account_id", productTx.SellerAccountID,
-					"error", err,
-				)
-			} else if sellerAccount.DokuSubAccountID != "" && sellerAccount.DokuSubAccountID != csvRow.SubAccount {
-				c.logger.WarnContext(ctx, "SubAccount mismatch - CSV SubAccount differs from seller's account, transaction will not be settled",
-					"invoice_number", csvRow.InvoiceNumber,
-					"product_tx_id", productTx.UUID,
-					"csv_sub_account", csvRow.SubAccount,
-					"seller_doku_sac", sellerAccount.DokuSubAccountID,
-				)
-				discrepancies = append(discrepancies, DiscrepancySummary{
-					Type:          "SUBACCOUNT_MISMATCH",
-					InvoiceNumber: csvRow.InvoiceNumber,
-					Message:       fmt.Sprintf("CSV SubAccount (%s) != Seller Account (%s) - Transaction NOT settled", csvRow.SubAccount, sellerAccount.DokuSubAccountID),
-				})
-				// Mark as unmatched and skip settlement for this transaction
-				item.IsMatched = false
-				batch.IncrementUnmatched()
-				settlementItems = append(settlementItems, item)
-				continue
-			}
-		}
-
-		// Fee mismatch reconciliation
-		// feeDelta = ActualDokuFee (from CSV) - ExpectedDokuFee (from ProductTransaction)
-		feeDelta := csvRow.Fee - productTx.Fee.DokuFee
-		if feeDelta != 0 {
-			blocked := false
-			var blockReason string
-
-			switch productTx.Fee.FeeModel {
-			case domain.FeeModelGatewayOnCustomer:
-				// Platform absorbs when DOKU is more expensive
-				if feeDelta > 0 {
-					adjustedPlatformFee := productTx.Fee.PlatformFee - feeDelta
-					if adjustedPlatformFee < 0 {
-						blocked = true
-						blockReason = fmt.Sprintf("feeDelta (%d) exceeds PlatformFee (%d) — platform cannot absorb", feeDelta, productTx.Fee.PlatformFee)
-					}
-				}
-			case domain.FeeModelGatewayOnSeller:
-				// Seller absorbs when DOKU is more expensive
-				if feeDelta > 0 {
-					adjustedSellerNet := productTx.Fee.SellerNetAmount - feeDelta
-					if adjustedSellerNet < 0 {
-						blocked = true
-						blockReason = fmt.Sprintf("feeDelta (%d) exceeds SellerNetAmount (%d) — seller cannot absorb", feeDelta, productTx.Fee.SellerNetAmount)
-					}
-				}
-			}
-
-			if blocked {
-				c.logger.WarnContext(ctx, "Fee mismatch irreconcilable - transaction will not be settled",
-					"invoice_number", csvRow.InvoiceNumber,
-					"product_tx_id", productTx.UUID,
-					"fee_model", productTx.Fee.FeeModel,
-					"expected_doku_fee", productTx.Fee.DokuFee,
-					"actual_doku_fee", csvRow.Fee,
-					"fee_delta", feeDelta,
-					"reason", blockReason,
-				)
-				discrepancies = append(discrepancies, DiscrepancySummary{
-					Type:          "FEE_MISMATCH_IRRECONCILABLE",
-					InvoiceNumber: csvRow.InvoiceNumber,
-					Amount:        feeDelta,
-					Message:       fmt.Sprintf("Invoice %s: %s", csvRow.InvoiceNumber, blockReason),
-				})
-				item.IsMatched = false
-				batch.IncrementUnmatched()
-				settlementItems = append(settlementItems, item)
-				continue
-			}
-
-			// Reconcilable — store feeDelta on item for use in settlement entries
-			item.FeeAdjustment = feeDelta
-			c.logger.InfoContext(ctx, "Fee mismatch will be adjusted during settlement",
-				"invoice_number", csvRow.InvoiceNumber,
-				"product_tx_id", productTx.UUID,
-				"fee_model", productTx.Fee.FeeModel,
-				"expected_doku_fee", productTx.Fee.DokuFee,
-				"actual_doku_fee", csvRow.Fee,
-				"fee_delta", feeDelta,
-			)
-			discrepancies = append(discrepancies, DiscrepancySummary{
-				Type:          "FEE_ADJUSTMENT_APPLIED",
-				InvoiceNumber: csvRow.InvoiceNumber,
-				Amount:        feeDelta,
-				Message:       fmt.Sprintf("Invoice %s: feeDelta=%d applied (fee_model=%s)", csvRow.InvoiceNumber, feeDelta, productTx.Fee.FeeModel),
-			})
-		}
-
-		// Only process matching transactions from here onwards
-		if productTx.IsCompleted() {
-			productTx.MarkSettled()
-		}
-
-		batch.IncrementMatched()
-		batch.AddToTotals(csvRow.Amount, csvRow.Fee)
-
-		// SellerNetAmount is always the seller's real share (platform fee tracked separately)
-		totalSettledSellerAmount += productTx.Fee.SellerNetAmount
-		totalSettledPlatformAmount += productTx.Fee.PlatformFee
-		totalDokuFee += csvRow.Fee
-
-		// Cache ProductTransaction for later use
-		productTxCache[productTx.UUID] = productTx
-
-		settlementItems = append(settlementItems, item)
-	}
-
-	batch.MarkCompleted(batch.GrossAmount, batch.NetAmount, batch.DokuFee, batch.MatchedCount, batch.UnmatchedCount)
-
-	now := time.Now()
-
-	// Create journal for SETTLEMENT event
-	settlementJournal := domain.NewJournal(
-		domain.EventTypeSettlement,
-		domain.SourceTypeSettlementBatch,
-		batch.UUID,
-		map[string]any{
-			"report_file_name":      req.ReportFileName,
-			"matched_count":         batch.MatchedCount,
-			"unmatched_count":       batch.UnmatchedCount,
-			"total_seller_amount":   totalSettledSellerAmount,
-			"total_platform_amount": totalSettledPlatformAmount,
-			"total_doku_fee":        totalDokuFee,
-		},
-	)
-
-	// pendingFeeTransfer holds data needed to execute a platform fee transfer after the DB commit.
-	type pendingFeeTransfer struct {
-		productTxUUID   string
-		invoiceNumber   string
-		sellerAccountID string
-		amount          int64
-	}
-	pendingFeeTransfers := make([]pendingFeeTransfer, 0)
-
-	// Build settlement ledger entries for EACH matched product transaction (using cached data)
-	allSettlementEntries := make([]*domain.LedgerEntry, 0)
-
-	for _, item := range settlementItems {
-		if !item.IsMatched {
-			continue
-		}
-
-		// Use cached ProductTransaction
-		productTx, ok := productTxCache[item.ProductTransactionUUID]
-		if !ok {
-			c.logger.WarnContext(ctx, "Product transaction not in cache",
-				"product_tx_id", item.ProductTransactionUUID,
-			)
-			continue
-		}
-
-		feeDelta := item.FeeAdjustment
-		sellerSettleAmount := productTx.Fee.SellerNetAmount
-		platformSettleAmount := productTx.Fee.PlatformFee
-
-		if feeDelta > 0 {
-			switch productTx.Fee.FeeModel {
-			case domain.FeeModelGatewayOnCustomer:
-				// Platform absorbs: reduce platform settlement amount
-				platformSettleAmount = productTx.Fee.PlatformFee - feeDelta
-			case domain.FeeModelGatewayOnSeller:
-				// Seller absorbs: reduce seller settlement amount
-				sellerSettleAmount = productTx.Fee.SellerNetAmount - feeDelta
-			}
-		}
-
-		// Seller: PENDING → AVAILABLE
-		if sellerSettleAmount > 0 {
-			allSettlementEntries = append(allSettlementEntries,
-				domain.NewSettlementEntriesForAccount(settlementJournal.UUID, productTx.UUID, item.SellerAccountID, sellerSettleAmount)...,
-			)
-		}
-		// Seller adjustments
-		if feeDelta > 0 && productTx.Fee.FeeModel == domain.FeeModelGatewayOnSeller {
-			// Write-off: clear remaining seller PENDING (feeDelta absorbed)
-			allSettlementEntries = append(allSettlementEntries,
-				domain.NewFeeAdjustmentWriteOffEntry(settlementJournal.UUID, productTx.UUID, item.SellerAccountID, feeDelta),
-			)
-		} else if feeDelta < 0 {
-			// Surplus: credit seller AVAILABLE directly (both fee models)
-			allSettlementEntries = append(allSettlementEntries,
-				domain.NewFeeAdjustmentCreditEntry(settlementJournal.UUID, productTx.UUID, item.SellerAccountID, -feeDelta),
-			)
-		}
-
-		// Platform: PENDING → AVAILABLE
-		if platformSettleAmount > 0 && platformAccount != nil {
-			allSettlementEntries = append(allSettlementEntries,
-				domain.NewSettlementEntriesForAccount(settlementJournal.UUID, productTx.UUID, platformAccount.UUID, platformSettleAmount)...,
-			)
-
-			pendingFeeTransfers = append(pendingFeeTransfers, pendingFeeTransfer{
-				productTxUUID:   productTx.UUID,
-				invoiceNumber:   productTx.InvoiceNumber,
-				sellerAccountID: item.SellerAccountID,
-				amount:          platformSettleAmount,
-			})
-		}
-		// Platform write-off: clear remaining platform PENDING (GATEWAY_ON_CUSTOMER, feeDelta absorbed)
-		if feeDelta > 0 && productTx.Fee.FeeModel == domain.FeeModelGatewayOnCustomer && platformAccount != nil {
-			allSettlementEntries = append(allSettlementEntries,
-				domain.NewFeeAdjustmentWriteOffEntry(settlementJournal.UUID, productTx.UUID, platformAccount.UUID, feeDelta),
-			)
-		}
-
-		// DOKU expense: clear PENDING (always ExpectedDokuFee — actual delta absorbed above)
-		if productTx.Fee.DokuFee > 0 && dokuAccount != nil {
-			allSettlementEntries = append(allSettlementEntries,
-				domain.NewDokuFeeSettlementEntry(settlementJournal.UUID, productTx.UUID, dokuAccount.UUID, productTx.Fee.DokuFee),
-			)
-		}
-	}
-
-	c.logger.DebugContext(ctx, "Built settlement ledger entries", "entries", allSettlementEntries)
-
-	c.logger.InfoContext(ctx, "Settlement balance calculations",
-		"previous_pending", previousPending,
-		"previous_available", previousAvailable,
-		"total_seller_amount", totalSettledSellerAmount,
-		"total_platform_fee", totalSettledPlatformAmount,
-		"total_doku_fee", totalDokuFee,
-		"settlement_entries", len(allSettlementEntries),
-	)
-
-	// Persist everything atomically
-	err = c.txProvider.Transact(ctx, func(tx repo.Tx) error {
-		// Save settlement journal first
-		c.logger.InfoContext(ctx, "Saving settlement journal and batch",
-			"journal", settlementJournal,
-			"batch", batch,
-		)
-		if err := tx.Journal().Save(ctx, settlementJournal); err != nil {
-			return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to save settlement journal", err)
-		}
-
-		if err := tx.SettlementBatch().Save(ctx, batch); err != nil {
-			return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to save settlement batch", err)
-		}
-
-		c.logger.InfoContext(ctx, "Saving settlement items", "items", settlementItems)
-		if err := tx.SettlementItem().SaveBatch(ctx, settlementItems); err != nil {
-			return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to save settlement items", err)
-		}
-
-		// Update matched product transactions to SETTLED and increment seller's total_deposit_amount
-		for _, item := range settlementItems {
-			if item.IsMatched {
-				if err := tx.ProductTransaction().UpdateStatus(ctx, item.ProductTransactionUUID, domain.TransactionStatusSettled, now); err != nil {
-					c.logger.WarnContext(ctx, "Failed to update product transaction status",
-						"product_tx_id", item.ProductTransactionUUID,
-						"error", err,
-					)
-				}
-
-				// Increment seller's total_deposit_amount with the amount that actually settled
-				productTx, ok := productTxCache[item.ProductTransactionUUID]
-				if ok && productTx.Fee.SellerNetAmount > 0 {
-					if err := tx.Account().IncrementDeposit(ctx, item.SellerAccountID, productTx.Fee.SellerNetAmount); err != nil {
-						c.logger.WarnContext(ctx, "Failed to increment seller deposit amount",
-							"seller_account_id", item.SellerAccountID,
-							"amount", productTx.Fee.SellerNetAmount,
-							"error", err,
-						)
-					}
-				}
-			}
-		}
-
-		c.logger.InfoContext(ctx, "Saving settlement ledger entries", "entries", allSettlementEntries)
-		// Write all settlement ledger entries (immutable, insert-only)
-		if err := tx.LedgerEntry().SaveBatch(ctx, allSettlementEntries); err != nil {
-			return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to save settlement ledger entries", err)
-		}
-
-		return nil
-	})
-	if err != nil {
-		// Transaction failed and rolled back completely (including batch record)
-		// Return error to allow retry without UNIQUE constraint violation
-		return nil, err
-	}
-
-	// Execute platform fee transfers (inline, best-effort — failures are retried by ProcessPlatformFeeTransfer)
-	for _, pft := range pendingFeeTransfers {
-		sellerAccount, err := c.repoProvider.Account().GetByID(ctx, pft.sellerAccountID)
-		if err != nil || sellerAccount.DokuSubAccountID == "" {
-			c.logger.WarnContext(ctx, "Platform fee transfer skipped - seller account unavailable",
-				"product_tx_id", pft.productTxUUID,
-				"seller_account_id", pft.sellerAccountID,
-				"error", err,
-			)
-			continue
-		}
-
-		requestID := uuid.NewString()
-		if err := c.repoProvider.ProductTransaction().SaveTransferRequestID(ctx, pft.productTxUUID, requestID); err != nil {
-			c.logger.WarnContext(ctx, "Platform fee transfer skipped - failed to save request ID",
-				"product_tx_id", pft.productTxUUID,
-				"error", err,
-			)
-			continue
-		}
-
-		transferReq := requests.DokuTransferSubAccountRequest{}
-		transferReq.Transfer.Origin = sellerAccount.DokuSubAccountID
-		transferReq.Transfer.Destination = platformAccount.DokuSubAccountID
-		transferReq.Transfer.Amount = int(pft.amount)
-		transferReq.Transfer.InvoiceNumber = platformFeeInvoiceNumber(pft.invoiceNumber)
-
-		_, dokuErr := c.dokuClient.TransferSubAccount(requestID, transferReq)
-		if dokuErr != nil {
-			c.logger.WarnContext(ctx, "Platform fee transfer failed - will retry via background job",
-				"product_tx_id", pft.productTxUUID,
-				"invoice_number", pft.invoiceNumber,
-				"from_sac", sellerAccount.DokuSubAccountID,
-				"to_sac", platformAccount.DokuSubAccountID,
-				"amount", pft.amount,
-				"error", dokuErr.Message,
-			)
-			continue
-		}
-
-		if err := c.repoProvider.ProductTransaction().MarkPlatformFeeTransferred(ctx, pft.productTxUUID); err != nil {
-			c.logger.ErrorContext(ctx, "CRITICAL: DOKU transfer succeeded but DB update failed - requires manual reconciliation",
-				"product_tx_id", pft.productTxUUID,
-				"invoice_number", pft.invoiceNumber,
-				"from_sac", sellerAccount.DokuSubAccountID,
-				"to_sac", platformAccount.DokuSubAccountID,
-				"amount", pft.amount,
-				"error", err,
-			)
-			continue
-		}
-
-		c.logger.InfoContext(ctx, "Platform fee transferred successfully",
-			"product_tx_id", pft.productTxUUID,
-			"invoice_number", pft.invoiceNumber,
-			"from_sac", sellerAccount.DokuSubAccountID,
-			"to_sac", platformAccount.DokuSubAccountID,
-			"amount", pft.amount,
-		)
-	}
-
-	// Derive post-settlement balances for the response (platform account)
-	postPending, postAvailable, _ := c.repoProvider.LedgerEntry().GetAllBalances(ctx, platformAccount.UUID)
-
-	// ============================================================
-	// PER-SELLER RECONCILIATION AND DOKU VERIFICATION
-	// ============================================================
-	// Group transactions by seller (using cached SellerAccountID)
-	sellerTransactions := make(map[string][]*domain.SettlementItem)
-	uniqueSellerIDs := make([]string, 0)
-	for _, item := range settlementItems {
-		if !item.IsMatched || item.SellerAccountID == "" {
-			continue
-		}
-		if _, exists := sellerTransactions[item.SellerAccountID]; !exists {
-			uniqueSellerIDs = append(uniqueSellerIDs, item.SellerAccountID)
-		}
-		sellerTransactions[item.SellerAccountID] = append(sellerTransactions[item.SellerAccountID], item)
-	}
-
-	// Query previous balances for all sellers BEFORE settlement
-	sellerPreviousBalances := make(map[string]struct{ pending, available int64 })
-	for _, sellerID := range uniqueSellerIDs {
-		// Note: These are POST-settlement balances now. For true previous balances,
-		// we'd need to query before the transaction commit. This is a limitation.
-		prevPending, prevAvailable, err := c.repoProvider.LedgerEntry().GetAllBalances(ctx, sellerID)
-		if err == nil {
-			sellerPreviousBalances[sellerID] = struct{ pending, available int64 }{prevPending, prevAvailable}
-		}
-	}
-
-	c.logger.InfoContext(ctx, "Starting per-seller reconciliation verification",
-		"unique_sellers", len(sellerTransactions),
-	)
-
-	// For each seller, verify their balance with DOKU and create reconciliation logs
-	sellerReconciliationResults := make(map[string]ReconciliationVerify)
-	for sellerAccountID, items := range sellerTransactions {
-		// Get seller account
-		sellerAccount, err := c.repoProvider.Account().GetByID(ctx, sellerAccountID)
-		if err != nil {
-			c.logger.WarnContext(ctx, "Failed to get seller account for reconciliation",
-				"seller_account_id", sellerAccountID,
-				"error", err,
-			)
-			continue
-		}
-
-		// Calculate this seller's settled amount (using cached ProductTransactions)
-		var sellerSettledAmount int64
-		for _, item := range items {
-			if productTx, ok := productTxCache[item.ProductTransactionUUID]; ok {
-				sellerSettledAmount += productTx.Fee.SellerNetAmount
-			}
-		}
-
-		// Get seller's post-settlement balances from ledger entries
-		sellerPostPending, sellerPostAvailable, err := c.repoProvider.LedgerEntry().GetAllBalances(ctx, sellerAccount.UUID)
-		if err != nil {
-			c.logger.WarnContext(ctx, "Failed to get seller balances",
-				"seller_account_id", sellerAccountID,
-				"error", err,
-			)
-			continue
-		}
-
-		// Verify with DOKU GetBalance API for this seller's sub-account
-		verification := ReconciliationVerify{
-			DokuAPIChecked: false,
-			MatchStatus:    "NOT_VERIFIED",
-		}
-
-		if sellerAccount.DokuSubAccountID != "" && c.dokuClient != nil {
-			dokuBalance, dokuErr := c.dokuClient.GetBalance(sellerAccount.DokuSubAccountID)
-			if dokuErr == nil && dokuBalance != nil && dokuBalance.Balance != nil {
-				verification.DokuAPIChecked = true
-
-				var dokuPending, dokuAvailable int64
-				if dokuBalance.Balance.Pending.Valid {
-					fmt.Sscanf(dokuBalance.Balance.Pending.String, "%d", &dokuPending)
-				}
-				if dokuBalance.Balance.Available.Valid {
-					fmt.Sscanf(dokuBalance.Balance.Available.String, "%d", &dokuAvailable)
-				}
-
-				verification.DokuPending = dokuPending
-				verification.DokuAvailable = dokuAvailable
-
-				pendingMatch := dokuPending == sellerPostPending
-				availableMatch := dokuAvailable == sellerPostAvailable
-
-				if !pendingMatch || !availableMatch {
-					verification.MatchStatus = "MISMATCH"
-
-					var discrepancyType domain.DiscrepancyType
-					if !pendingMatch && !availableMatch {
-						discrepancyType = domain.DiscrepancyTypeBothMismatch
-					} else if !pendingMatch {
-						discrepancyType = domain.DiscrepancyTypePendingMismatch
-					} else {
-						discrepancyType = domain.DiscrepancyTypeAvailableMismatch
-					}
-
-					// Get item-level discrepancies for this seller
-					sellerDisc := sellerItemDiscrepancies[sellerAccountID]
-					discrepancy := domain.NewReconciliationDiscrepancy(
-						sellerAccount.UUID,
-						batch.UUID,
-						discrepancyType,
-						sellerPostPending,
-						dokuPending,
-						sellerPostAvailable,
-						dokuAvailable,
-						sellerDisc.count, // itemDiscrepancyCount for this seller
-						sellerDisc.total, // totalItemDiscrepancy for this seller
-					)
-					discrepancy.CreatedAt = now
-					discrepancy.UpdatedAt = now
-
-					if err := c.repoProvider.ReconciliationDiscrepancy().Save(ctx, discrepancy); err != nil {
-						c.logger.ErrorContext(ctx, "Failed to save reconciliation discrepancy",
-							"seller_account_id", sellerAccountID,
-							"error", err,
-						)
-					}
-
-					discrepancies = append(discrepancies, DiscrepancySummary{
-						Type:   string(discrepancyType),
-						Amount: dokuAvailable - sellerPostAvailable,
-						Message: fmt.Sprintf("Seller %s: DOKU balance mismatch — Pending: expected %d, got %d; Available: expected %d, got %d",
-							sellerAccount.OwnerID, sellerPostPending, dokuPending, sellerPostAvailable, dokuAvailable),
-					})
-
-					c.logger.WarnContext(ctx, "Balance discrepancy detected for seller",
-						"seller_account_id", sellerAccountID,
-						"seller_owner_id", sellerAccount.OwnerID,
-						"expected_pending", sellerPostPending,
-						"doku_pending", dokuPending,
-						"expected_available", sellerPostAvailable,
-						"doku_available", dokuAvailable,
-					)
-				} else {
-					verification.MatchStatus = "EXACT_MATCH"
-					c.logger.InfoContext(ctx, "Seller balance verified successfully",
-						"seller_account_id", sellerAccountID,
-						"seller_owner_id", sellerAccount.OwnerID,
-						"pending", sellerPostPending,
-						"available", sellerPostAvailable,
-					)
-				}
-			} else {
-				c.logger.WarnContext(ctx, "Failed to verify seller with DOKU GetBalance API",
-					"seller_account_id", sellerAccountID,
-					"seller_owner_id", sellerAccount.OwnerID,
-					"doku_sub_account_id", sellerAccount.DokuSubAccountID,
-					"error", dokuErr,
-				)
-			}
-		} else {
-			c.logger.WarnContext(ctx, "Seller has no DOKU sub-account ID, skipping verification",
-				"seller_account_id", sellerAccountID,
-				"seller_owner_id", sellerAccount.OwnerID,
-			)
-		}
-
-		sellerReconciliationResults[sellerAccountID] = verification
-	}
-
-	// Summary verification for response (platform-level)
-	matchedSellers := 0
-	mismatchedSellers := 0
-	notVerifiedSellers := 0
-	for _, result := range sellerReconciliationResults {
-		if result.MatchStatus == "EXACT_MATCH" {
-			matchedSellers++
-		} else if result.MatchStatus == "MISMATCH" {
-			mismatchedSellers++
-		} else {
-			notVerifiedSellers++
-		}
-	}
-
-	verification := ReconciliationVerify{
-		DokuAPIChecked: len(sellerReconciliationResults) > 0,
-		MatchStatus: fmt.Sprintf("SELLERS_VERIFIED: %d matched, %d mismatched, %d not verified",
-			matchedSellers, mismatchedSellers, notVerifiedSellers),
-		SellersVerified:    len(sellerReconciliationResults),
-		SellersMatched:     matchedSellers,
-		SellersMismatched:  mismatchedSellers,
-		SellersNotVerified: notVerifiedSellers,
-	}
-
-	c.logger.InfoContext(ctx, "Reconciliation completed",
-		"platform_account_id", platformAccount.UUID,
-		"batch_id", batch.UUID,
-		"matched", batch.MatchedCount,
-		"unmatched", batch.UnmatchedCount,
-		"seller_settled", totalSettledSellerAmount,
-		"platform_settled", totalSettledPlatformAmount,
-		"doku_fee", totalDokuFee,
-		"post_pending", postPending,
-		"post_available", postAvailable,
-		"unique_sellers", len(sellerTransactions),
-		"sellers_verified_match", matchedSellers,
-		"sellers_verified_mismatch", mismatchedSellers,
-		"sellers_not_verified", notVerifiedSellers,
-	)
-
-	return &ReconciliationResponse{
-		ReconciliationID: batch.UUID,
-		UploadedBy:       req.UploadedBy,
-		UploadedAt:       batch.UploadedAt,
-		SettlementDate:   settlementDate.Format("2006-01-02"),
-		Transactions: ReconciliationTxSummary{
-			Total:     len(csvRows),
-			Matched:   batch.MatchedCount,
-			Unmatched: batch.UnmatchedCount,
-		},
-		BalanceUpdates: ReconciliationBalances{
-			Pending: BalanceChange{
-				Before: previousPending,
-				After:  postPending,
-				Diff:   postPending - previousPending,
-			},
-			Available: BalanceChange{
-				Before: previousAvailable,
-				After:  postAvailable,
-				Diff:   postAvailable - previousAvailable,
-			},
-		},
-		Discrepancies: discrepancies,
-		Verification:  verification,
-	}, nil
+	return ledgererr.NewError(ledgererr.CodeGatewayAPIError, "Singapay refused the disbursement", gwErr)
 }
 
 type EarningsResponse struct {
@@ -2024,24 +1354,32 @@ type PlatformFeeTransferSuccess struct {
 	ToSubAccount   string `json:"to_sub_account"`
 }
 
-// ProcessPlatformFeeTransfer processes platform fee transfers for settled transactions
-// that haven't had their platform fees transferred yet.
+// ProcessPlatformFeeTransfer moves the platform's share out of seller sub-accounts and
+// into the platform sub-account, for settled transactions that have not had it moved yet.
+//
+// It finds nothing today. Its input is transactions in SETTLED status, and nothing reaches
+// SETTLED while reconciliation is unimplemented — see reconciliation.go. The routine is
+// correct and wired to Singapay's account transfer; it is simply waiting for work. Running
+// it on a schedule now is harmless and means nothing has to be remembered later.
 //
 // This should be called:
-// - After reconciliation completes successfully
-// - As a periodic background job (e.g., every 5 minutes)
+//   - After reconciliation completes successfully
+//   - As a periodic background job (e.g. every 5 minutes)
 //
-// Flow for each transaction:
-// 1. Fetch seller account (to get seller's DOKU sub-account ID)
-// 2. Call DOKU intra-sub-account transfer API
-// 3. On success: Mark transaction as platform_fee_transferred = true
-// 4. On failure: Log error, continue to next (will retry on next run)
+// Two Singapay facts shape it.
+//
+// The transfer names its destination by ACCOUNT NUMBER and by nothing else — the ULID is
+// rejected there, even though every other endpoint in the API takes the ULID. A platform
+// account stored without a number cannot be transferred into at all, which is why that is
+// checked once, up front, rather than discovered per-row.
+//
+// And merchant_ref_no is the idempotency key, unique per merchant across every account
+// movement: re-sending a used reference returns the original transfer and moves nothing
+// further. The reference is derived from the invoice number, so a retry after a timeout is
+// safe by construction — which is the whole reason it must never be random.
 //
 // Parameters:
-// - batchSize: Maximum number of transactions to process in one call (recommended: 50-100)
-//
-// Returns:
-// - PlatformFeeTransferResult with success/failure counts and details
+//   - batchSize: maximum number of transactions to process in one call (recommended: 50-100)
 func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize int) (*PlatformFeeTransferResult, error) {
 	if batchSize <= 0 {
 		batchSize = 50 // Default batch size
@@ -2061,8 +1399,11 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to get platform account", err)
 	}
 
-	if platformAccount.DokuSubAccountID == "" {
-		return nil, ledgererr.NewError(ledgererr.CodeInternal, "platform account has no DOKU sub-account ID", nil)
+	// Checked here rather than per row: without a number every transfer in the batch
+	// fails identically, and the fix is one configuration change, not N retries.
+	if !platformAccount.CanReceiveTransfer() {
+		return nil, ledgererr.NewError(ledgererr.CodeInternal,
+			"platform account has no Singapay account number; an account transfer names its destination by number and rejects the ULID", nil)
 	}
 
 	// Fetch settled transactions that need platform fee transfer
@@ -2080,10 +1421,9 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 		"batch_size", batchSize,
 		"transactions_found", len(transactions),
 		"platform_account_id", platformAccount.UUID,
-		"platform_doku_sac", platformAccount.DokuSubAccountID,
+		"platform_singapay_account_number", platformAccount.SingapayAccountNumber,
 	)
 
-	// Process each transaction
 	for _, tx := range transactions {
 		if tx.Fee.PlatformFee <= 0 {
 			c.logger.WarnContext(ctx, "Transaction has zero platform fee, skipping",
@@ -2093,108 +1433,74 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 			continue
 		}
 
-		// Get seller account to retrieve DOKU sub-account ID
 		sellerAccount, err := c.repoProvider.Account().GetByID(ctx, tx.SellerAccountID)
 		if err != nil {
-			errMsg := fmt.Sprintf("failed to get seller account: %v", err)
+			result.recordFailure(tx, fmt.Sprintf("failed to get seller account: %v", err))
 			c.logger.ErrorContext(ctx, "Platform fee transfer failed - seller account not found",
 				"transaction_id", tx.UUID,
 				"invoice_number", tx.InvoiceNumber,
 				"seller_account_id", tx.SellerAccountID,
 				"error", err,
 			)
-			result.Failed++
-			result.Errors = append(result.Errors, PlatformFeeTransferError{
-				TransactionID: tx.UUID,
-				InvoiceNumber: tx.InvoiceNumber,
-				PlatformFee:   tx.Fee.PlatformFee,
-				ErrorMessage:  errMsg,
-			})
 			continue
 		}
 
-		if sellerAccount.DokuSubAccountID == "" {
-			errMsg := "seller account has no DOKU sub-account ID"
+		if sellerAccount.SingapayAccountID == "" {
+			result.recordFailure(tx, "seller account has no Singapay sub-account id")
 			c.logger.ErrorContext(ctx, "Platform fee transfer failed - invalid seller account",
 				"transaction_id", tx.UUID,
 				"invoice_number", tx.InvoiceNumber,
 				"seller_account_id", tx.SellerAccountID,
 			)
-			result.Failed++
-			result.Errors = append(result.Errors, PlatformFeeTransferError{
-				TransactionID: tx.UUID,
-				InvoiceNumber: tx.InvoiceNumber,
-				PlatformFee:   tx.Fee.PlatformFee,
-				ErrorMessage:  errMsg,
-			})
 			continue
 		}
 
-		// Ensure transfer_request_id exists before calling DOKU (enables idempotent retries)
-		requestID := tx.TransferRequestID
-		if requestID == "" {
-			requestID = uuid.NewString()
-			if err := c.repoProvider.ProductTransaction().SaveTransferRequestID(ctx, tx.UUID, requestID); err != nil {
-				errMsg := fmt.Sprintf("failed to save transfer request ID: %v", err)
-				c.logger.ErrorContext(ctx, "Platform fee transfer failed - could not persist request ID",
+		// The reference is derived from the invoice, not generated, so a retry presents
+		// the same one. It is still persisted: the stored value is what proves which
+		// reference a given row went out under if the derivation ever changes.
+		reference := platformFeeTransferReference(tx.InvoiceNumber)
+		if tx.TransferRequestID != reference {
+			if err := c.repoProvider.ProductTransaction().SaveTransferRequestID(ctx, tx.UUID, reference); err != nil {
+				result.recordFailure(tx, fmt.Sprintf("failed to save transfer reference: %v", err))
+				c.logger.ErrorContext(ctx, "Platform fee transfer failed - could not persist transfer reference",
 					"transaction_id", tx.UUID,
 					"invoice_number", tx.InvoiceNumber,
 					"error", err,
 				)
-				result.Failed++
-				result.Errors = append(result.Errors, PlatformFeeTransferError{
-					TransactionID: tx.UUID,
-					InvoiceNumber: tx.InvoiceNumber,
-					PlatformFee:   tx.Fee.PlatformFee,
-					ErrorMessage:  errMsg,
-				})
 				continue
 			}
 		}
 
-		transferReq := requests.DokuTransferSubAccountRequest{}
-		transferReq.Transfer.Origin = sellerAccount.DokuSubAccountID
-		transferReq.Transfer.Destination = platformAccount.DokuSubAccountID
-		transferReq.Transfer.Amount = int(tx.Fee.PlatformFee)
-		transferReq.Transfer.InvoiceNumber = platformFeeInvoiceNumber(tx.InvoiceNumber)
-
-		_, dokuErr := c.dokuClient.TransferSubAccount(requestID, transferReq)
-		if dokuErr != nil {
-			errMsg := fmt.Sprintf("DOKU transfer API failed: %v", dokuErr.Message)
-			c.logger.ErrorContext(ctx, "Platform fee transfer failed - DOKU API error",
+		_, gwErr := c.gateway.TransferBetweenAccounts(ctx, sellerAccount.SingapayAccountID, singapay.TransferRequest{
+			Amount:                   tx.Fee.PlatformFee,
+			BeneficiaryAccountNumber: platformAccount.SingapayAccountNumber,
+			MerchantRefNo:            reference,
+		})
+		if gwErr != nil {
+			result.recordFailure(tx, fmt.Sprintf("Singapay account transfer failed: %v", gwErr))
+			c.logger.ErrorContext(ctx, "Platform fee transfer failed - Singapay API error",
 				"transaction_id", tx.UUID,
 				"invoice_number", tx.InvoiceNumber,
 				"platform_fee", tx.Fee.PlatformFee,
-				"from_sac", sellerAccount.DokuSubAccountID,
-				"to_sac", platformAccount.DokuSubAccountID,
-				"error", dokuErr.Message,
+				"from_account", sellerAccount.SingapayAccountID,
+				"to_account_number", platformAccount.SingapayAccountNumber,
+				"merchant_ref_no", reference,
+				"error", gwErr,
 			)
-			result.Failed++
-			result.Errors = append(result.Errors, PlatformFeeTransferError{
-				TransactionID: tx.UUID,
-				InvoiceNumber: tx.InvoiceNumber,
-				PlatformFee:   tx.Fee.PlatformFee,
-				ErrorMessage:  errMsg,
-			})
 			continue
 		}
 
 		if err := c.repoProvider.ProductTransaction().MarkPlatformFeeTransferred(ctx, tx.UUID); err != nil {
-			c.logger.ErrorContext(ctx, "CRITICAL: DOKU transfer succeeded but DB update failed - requires manual reconciliation",
+			// Not lost: the next run re-sends the same merchant_ref_no, Singapay returns
+			// the original transfer without moving anything, and the flag is set then.
+			c.logger.ErrorContext(ctx, "Singapay transfer succeeded but the DB update failed - the next run will re-present the same reference",
 				"transaction_id", tx.UUID,
 				"invoice_number", tx.InvoiceNumber,
 				"platform_fee", tx.Fee.PlatformFee,
-				"from_sac", sellerAccount.DokuSubAccountID,
-				"to_sac", platformAccount.DokuSubAccountID,
+				"merchant_ref_no", reference,
 				"db_error", err,
 			)
-			result.Failed++
-			result.Errors = append(result.Errors, PlatformFeeTransferError{
-				TransactionID: tx.UUID,
-				InvoiceNumber: tx.InvoiceNumber,
-				PlatformFee:   tx.Fee.PlatformFee,
-				ErrorMessage:  fmt.Sprintf("DOKU succeeded but DB update failed: %v", err),
-			})
+			result.recordFailure(tx, fmt.Sprintf("Singapay transfer succeeded but DB update failed: %v", err))
 			continue
 		}
 
@@ -2202,16 +1508,16 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 			"transaction_id", tx.UUID,
 			"invoice_number", tx.InvoiceNumber,
 			"platform_fee", tx.Fee.PlatformFee,
-			"from_sac", sellerAccount.DokuSubAccountID,
-			"to_sac", platformAccount.DokuSubAccountID,
+			"from_account", sellerAccount.SingapayAccountID,
+			"to_account_number", platformAccount.SingapayAccountNumber,
 		)
 		result.Succeeded++
 		result.Transfers = append(result.Transfers, PlatformFeeTransferSuccess{
 			TransactionID:  tx.UUID,
 			InvoiceNumber:  tx.InvoiceNumber,
 			PlatformFee:    tx.Fee.PlatformFee,
-			FromSubAccount: sellerAccount.DokuSubAccountID,
-			ToSubAccount:   platformAccount.DokuSubAccountID,
+			FromSubAccount: sellerAccount.SingapayAccountID,
+			ToSubAccount:   platformAccount.SingapayAccountNumber,
 		})
 	}
 
@@ -2222,4 +1528,17 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 	)
 
 	return result, nil
+}
+
+// recordFailure appends one failed transfer. The four call sites above all built the same
+// struct by hand and differed only in the message, which is exactly the kind of repetition
+// that lets one of them quietly forget to increment the counter.
+func (r *PlatformFeeTransferResult) recordFailure(tx *domain.ProductTransaction, message string) {
+	r.Failed++
+	r.Errors = append(r.Errors, PlatformFeeTransferError{
+		TransactionID: tx.UUID,
+		InvoiceNumber: tx.InvoiceNumber,
+		PlatformFee:   tx.Fee.PlatformFee,
+		ErrorMessage:  message,
+	})
 }

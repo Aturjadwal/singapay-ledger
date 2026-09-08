@@ -12,7 +12,7 @@ The balance query functionality provides real-time visibility into a user's wall
 
 ```go
 type WalletBalanceResponse struct {
-    // AvailableBalance is the settled amount (net, after fees) ready for disbursement via "KIRIM DOKU"
+    // AvailableBalance is the settled amount (net, after fees) ready for disbursement via "KIRIM Singapay"
     AvailableBalance int64 `json:"available_balance"`
 
     // PendingBalance is the amount waiting for settlement (gross, typically 1-2 days after payment)
@@ -42,7 +42,7 @@ type WalletBalanceSummaryResponse struct {
 
 | Field | Source | Description |
 |-------|--------|-------------|
-| `available_balance` | `wallet.Balance` | Settled funds (net after fees), ready for "KIRIM DOKU" |
+| `available_balance` | `wallet.Balance` | Settled funds (net after fees), ready for "KIRIM Singapay" |
 | `pending_balance` | `wallet.PendingBalance` | Funds from paid transactions waiting for settlement |
 | `currency` | `wallet.Currency` | Currency code for this wallet |
 | `total_income` | `wallet.IncomeAccumulation` | Lifetime gross income from payments |
@@ -65,7 +65,7 @@ type WalletBalanceSummaryResponse struct {
 │   │   │                         │    │                         │            │  │
 │   │   │  • Gross amount         │    │  • Net amount           │            │  │
 │   │   │  • From PAID payments   │    │  • After fee deduction  │            │  │
-│   │   │  • Waiting 1-2 days     │    │  • Ready for KIRIM DOKU │            │  │
+│   │   │  • Waiting 1-2 days     │    │  • Ready for KIRIM Singapay │            │  │
 │   │   │                         │    │                         │            │  │
 │   │   └───────────┬─────────────┘    └─────────────┬───────────┘            │  │
 │   │               │                                │                         │  │
@@ -290,7 +290,7 @@ func (u *ledgerWalletUseCase) GetBalanceSummaryByAccount(
 │  - balance: 97,000                                                              │
 │  - withdraw_accumulation: 0                                                     │
 │                                                                                 │
-│  Disbursement (KIRIM DOKU):                                                    │
+│  Disbursement (KIRIM Singapay):                                                    │
 │  - amount: 50,000                                                               │
 │  - Status: SUCCESS                                                              │
 │                                                                                 │
@@ -355,7 +355,7 @@ func (u *ledgerWalletUseCase) GetBalanceSummaryByAccount(
 
 | Check | Formula | Use Case |
 |-------|---------|----------|
-| Can disburse amount? | `available_balance >= amount` | Validate before KIRIM DOKU |
+| Can disburse amount? | `available_balance >= amount` | Validate before KIRIM Singapay |
 | Total fees paid? | `total_income - (available_balance + pending_balance + total_withdrawn)` | Fee reporting |
 | Money in transit? | Query pending disbursements | Show processing withdrawals |
 

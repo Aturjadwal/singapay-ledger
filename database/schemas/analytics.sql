@@ -36,7 +36,7 @@ CREATE TABLE dim_account (
     owner_type VARCHAR(50),
     owner_id VARCHAR(255),
     currency VARCHAR(3),
-    doku_subaccount_id VARCHAR(255),
+    singapay_account_id VARCHAR(255),
     effective_date DATE,
     end_date DATE,
     is_current BOOLEAN DEFAULT FALSE

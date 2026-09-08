@@ -250,24 +250,51 @@ func (c *LedgerAnalyticsClient) ensureDimAccountOwnerType(ctx context.Context) e
 	return nil
 }
 
+// ensureDimBank populates the bank dimension from the payouts this ledger has made.
+//
+// There is no gateway catalogue to read. Singapay exposes no bank list through its API —
+// the destination bank of a payout is validated one account at a time through
+// check-beneficiary, and there is no endpoint that enumerates what it will accept. So the
+// dimension is built from observed fact: every distinct bank code that has appeared on a
+// disbursement.
+//
+// That makes it lag rather than lead — a bank nobody has been paid at yet is absent — which
+// is the correct behaviour for a dimension whose only consumers are fact tables keyed on
+// disbursements. Nothing can reference a bank that has never been used.
+//
+// bank_name is set to the code. Singapay returns a human name on check-beneficiary, but
+// this ledger does not store it, and inventing a lookup table here would be a second copy
+// of a list that belongs at the gateway.
 func (c *LedgerAnalyticsClient) ensureDimBank(ctx context.Context) error {
-	if c.dokuClient == nil {
-		return fmt.Errorf("doku client is not configured")
+	rows, err := c.ledgerDB.QueryContext(ctx, `
+		SELECT DISTINCT bank_code
+		FROM disbursements
+		WHERE bank_code IS NOT NULL AND bank_code <> ''
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var bankCodes []string
+	for rows.Next() {
+		var code string
+		if err := rows.Scan(&code); err != nil {
+			return err
+		}
+		bankCodes = append(bankCodes, code)
+	}
+	if err := rows.Err(); err != nil {
+		return err
 	}
 
-	banks := c.dokuClient.GetSupportedBanks()
-
-	for _, bank := range banks {
-		if bank.BICode == "" {
-			continue
-		}
-
+	for _, code := range bankCodes {
 		query := `
 			INSERT INTO dim_bank (uuid, randid, created_at, updated_at, bank_code, bank_name, swift_code)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
 			ON CONFLICT (bank_code) DO NOTHING
 		`
-		if _, err := c.ledgerAnalyticsDB.ExecContext(ctx, query, uuid.New().String(), uuid.New().String(), time.Now(), time.Now(), bank.BICode, bank.Name, bank.SwiftCode); err != nil {
+		if _, err := c.ledgerAnalyticsDB.ExecContext(ctx, query, uuid.New().String(), uuid.New().String(), time.Now(), time.Now(), code, code, ""); err != nil {
 			return err
 		}
 	}

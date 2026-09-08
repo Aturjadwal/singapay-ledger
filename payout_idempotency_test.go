@@ -2,32 +2,26 @@ package ledger
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
-	"sort"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	dokumodels "github.com/21strive/doku/app/models"
-	dokurequests "github.com/21strive/doku/app/requests"
-	dokuresponses "github.com/21strive/doku/app/responses"
-	dokuusecases "github.com/21strive/doku/app/usecases"
 	"github.com/21strive/ledger/domain"
+	"github.com/21strive/ledger/ledgererr"
 	"github.com/21strive/ledger/repo"
+	"github.com/21strive/ledger/singapay"
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Fakes
-// ─────────────────────────────────────────────────────────────────────────────
-
 // FakeDisbursementRepository is an in-memory DisbursementRepository. Save mirrors the
-// Postgres one on the point that matters here: payout_request_id is written once and never
-// overwritten by a later save.
+// Postgres one in the way that matters here: payout_request_id and gateway_fee are written
+// once and never overwritten, so a test can prove a retry reuses the reference it was
+// given rather than inventing one.
 type FakeDisbursementRepository struct {
 	disbursements map[string]*domain.Disbursement
-	saves         int
 }
 
 var _ domain.DisbursementRepository = (*FakeDisbursementRepository)(nil)
@@ -37,22 +31,37 @@ func NewFakeDisbursementRepository() *FakeDisbursementRepository {
 }
 
 func (f *FakeDisbursementRepository) Save(ctx context.Context, d *domain.Disbursement) error {
-	f.saves++
-	stored := *d
-	if existing, ok := f.disbursements[d.UUID]; ok && existing.PayoutRequestID != "" {
+	if existing, ok := f.disbursements[d.UUID]; ok {
+		stored := *d
 		stored.PayoutRequestID = existing.PayoutRequestID
+		stored.GatewayFee = existing.GatewayFee
+		f.disbursements[d.UUID] = &stored
+		return nil
 	}
+	stored := *d
 	f.disbursements[d.UUID] = &stored
 	return nil
 }
 
 func (f *FakeDisbursementRepository) GetByID(ctx context.Context, id string) (*domain.Disbursement, error) {
-	d, ok := f.disbursements[id]
-	if !ok {
+	if d, ok := f.disbursements[id]; ok {
+		copied := *d
+		return &copied, nil
+	}
+	return nil, repo.ErrNotFound
+}
+
+func (f *FakeDisbursementRepository) GetByPayoutRequestID(ctx context.Context, payoutRequestID string) (*domain.Disbursement, error) {
+	if payoutRequestID == "" {
 		return nil, repo.ErrNotFound
 	}
-	clone := *d
-	return &clone, nil
+	for _, d := range f.disbursements {
+		if d.PayoutRequestID == payoutRequestID {
+			copied := *d
+			return &copied, nil
+		}
+	}
+	return nil, repo.ErrNotFound
 }
 
 func (f *FakeDisbursementRepository) GetByLedgerID(ctx context.Context, ledgerID string, page, pageSize int) ([]*domain.Disbursement, error) {
@@ -67,121 +76,200 @@ func (f *FakeDisbursementRepository) GetPendingByLedgerID(ctx context.Context, l
 	return nil, nil
 }
 
-// GetPendingOlderThan mirrors the Postgres filter — PENDING, created before the cutoff,
-// oldest first — so a caller's sweep logic can be exercised without a database.
 func (f *FakeDisbursementRepository) GetPendingOlderThan(ctx context.Context, cutoff time.Time, limit int) ([]*domain.Disbursement, error) {
 	var pending []*domain.Disbursement
 	for _, d := range f.disbursements {
-		if d.Status == domain.DisbursementStatusPending && d.CreatedAt.Before(cutoff) {
-			clone := *d
-			pending = append(pending, &clone)
+		if d.IsPending() && d.CreatedAt.Before(cutoff) {
+			copied := *d
+			pending = append(pending, &copied)
 		}
 	}
-
-	sort.Slice(pending, func(i, j int) bool { return pending[i].CreatedAt.Before(pending[j].CreatedAt) })
-
-	if len(pending) > limit {
-		pending = pending[:limit]
-	}
-
 	return pending, nil
 }
 
 func (f *FakeDisbursementRepository) UpdateStatus(ctx context.Context, id string, status domain.DisbursementStatus, processedAt *time.Time, failureReason string) error {
-	d, ok := f.disbursements[id]
-	if !ok {
-		return repo.ErrNotFound
+	if d, ok := f.disbursements[id]; ok {
+		d.Status = status
+		d.ProcessedAt = processedAt
+		d.FailureReason = failureReason
+		return nil
 	}
-	d.Status = status
-	d.ProcessedAt = processedAt
-	d.FailureReason = failureReason
-	return nil
+	return repo.ErrNotFound
 }
 
-// fakePayoutClient records what SendPayoutSubAccount was called with and replies with a
-// scripted outcome. Everything else on the DOKU interface is unused here.
-type fakePayoutClient struct {
-	requestIDs []string
-	invoices   []string
-	amounts    []int
-	// bodies keeps each request whole, so a test can compare what was logged against
-	// what was actually handed to the client.
-	bodies []dokurequests.DokuSendPayoutSubAccountRequest
+// ═══════════════════════════════════════════════════════════════════════════
+// Fake gateway
+// ═══════════════════════════════════════════════════════════════════════════
 
-	// beforeCall runs at the moment DOKU would be hit, so a test can inspect what the
-	// database already knows at that instant.
+// fakeGateway is a scripted PaymentGateway. Only the money-out surface is exercised here;
+// the rest satisfies the interface and panics if a test reaches it by accident, which is
+// more useful than a silent zero value on a path that moves money.
+type fakeGateway struct {
+	// references records every reference_number a payout was sent under, in order. It is
+	// the whole point of the idempotency tests: a retry must reuse, never mint.
+	references []string
+	bodies     []singapay.DisburseRequest
+
+	// beforeCall runs at the moment the gateway would be hit, so a test can inspect what
+	// the ledger had already written by then.
 	beforeCall func()
 
-	response *dokuresponses.DokuSendPayoutSubAccountResponse
-	errorLog *dokumodels.ErrorLog
+	// disburse is what Disburse returns. err takes precedence when set.
+	disburse *singapay.Disbursement
+	err      error
+
+	// fee is what CheckFee quotes. feeErr makes the quote fail, which must not fail the
+	// withdrawal.
+	fee    int64
+	feeErr error
+
+	// inquiry is what InquiryDisbursement returns. Default is a not-found error, which is
+	// the only answer that makes re-sending safe.
+	inquiry    *singapay.Disbursement
+	inquiryErr error
+	inquiries  int
 }
 
-var _ dokuusecases.DokuUseCaseInterface = (*fakePayoutClient)(nil)
+var _ PaymentGateway = (*fakeGateway)(nil)
 
-func (f *fakePayoutClient) SendPayoutSubAccount(requestId string, request dokurequests.DokuSendPayoutSubAccountRequest) (*dokuresponses.DokuSendPayoutSubAccountResponse, *dokumodels.ErrorLog) {
+func (f *fakeGateway) Disburse(ctx context.Context, req singapay.DisburseRequest) (*singapay.Disbursement, error) {
 	if f.beforeCall != nil {
 		f.beforeCall()
 	}
-	f.requestIDs = append(f.requestIDs, requestId)
-	f.invoices = append(f.invoices, request.Payout.InvoiceNumber)
-	f.amounts = append(f.amounts, request.Payout.Amount)
-	f.bodies = append(f.bodies, request)
-	return f.response, f.errorLog
+	f.references = append(f.references, req.ReferenceNumber)
+	f.bodies = append(f.bodies, req)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.disburse, nil
 }
 
-func (f *fakePayoutClient) CreateAccount(*dokurequests.DokuCreateSubAccountRequest) (*dokuresponses.DokuCreateSubAccountAccountResponse, *dokumodels.ErrorLog) {
-	return nil, nil
-}
-func (f *fakePayoutClient) AcceptPayment(*dokurequests.DokuCreatePaymentRequest) (*dokuresponses.DokuCreatePaymentHTTPResponse, *dokumodels.ErrorLog) {
-	return nil, nil
-}
-func (f *fakePayoutClient) GetBalance(string) (*dokuresponses.DokuGetBalanceHTTPResponse, *dokumodels.ErrorLog) {
-	return nil, nil
-}
-func (f *fakePayoutClient) HandleNotification(*dokurequests.DokuNotificationRequest) (*dokuresponses.DokuPostNotificationHTTPResponse, *dokumodels.ErrorLog) {
-	return nil, nil
-}
-func (f *fakePayoutClient) GetToken() (*dokuresponses.GetTokenResponse, *dokumodels.ErrorLog) {
-	return nil, nil
-}
-func (f *fakePayoutClient) BankAccountInquiry(*dokurequests.DokuBankAccountInquiryRequest, string) (*dokuresponses.BankAccountInquiryResponse, *dokumodels.ErrorLog) {
-	return nil, nil
-}
-func (f *fakePayoutClient) GetSupportedBanks() []dokumodels.Bank { return nil }
-func (f *fakePayoutClient) TransferSubAccount(string, dokurequests.DokuTransferSubAccountRequest) (*dokuresponses.DokuTransferSubAccountResponse, *dokumodels.ErrorLog) {
-	return nil, nil
+func (f *fakeGateway) CheckFee(ctx context.Context, accountID, bankSwiftCode string, netAmount int64) (*singapay.FeeQuote, error) {
+	if f.feeErr != nil {
+		return nil, f.feeErr
+	}
+	return &singapay.FeeQuote{
+		TransferFee: singapay.NewAmount(f.fee, "IDR"),
+		NetAmount:   singapay.NewAmount(netAmount, "IDR"),
+		GrossAmount: singapay.NewAmount(netAmount+f.fee, "IDR"),
+	}, nil
 }
 
-func payoutSuccess() *dokuresponses.DokuSendPayoutSubAccountResponse {
-	resp := &dokuresponses.DokuSendPayoutSubAccountResponse{}
-	resp.Payout.Status = "SUCCESS"
-	resp.Payout.InvoiceNumber = "DOKU-INV-1"
-	return resp
+func (f *fakeGateway) InquiryDisbursement(ctx context.Context, accountID, referenceNumber string) (*singapay.Disbursement, error) {
+	f.inquiries++
+	if f.inquiry != nil {
+		return f.inquiry, nil
+	}
+	if f.inquiryErr != nil {
+		return nil, f.inquiryErr
+	}
+	return nil, &singapay.Error{StatusCode: http.StatusNotFound, Code: singapay.CodeTransactionNotFound, Message: "transaction not found"}
 }
 
-// newPayoutTestClient wires a seller account holding `available` in AVAILABLE balance.
-func newPayoutTestClient(t *testing.T, doku *fakePayoutClient, available int64) (*LedgerClient, *FakeRepositoryProvider, *domain.Account) {
+func (f *fakeGateway) CreateAccount(context.Context, singapay.CreateAccountRequest) (*singapay.Account, error) {
+	panic("fakeGateway.CreateAccount: not scripted for this test")
+}
+func (f *fakeGateway) GetAccount(context.Context, string) (*singapay.Account, error) {
+	panic("fakeGateway.GetAccount: not scripted for this test")
+}
+func (f *fakeGateway) GetAccountBalance(context.Context, string) (*singapay.Balance, error) {
+	panic("fakeGateway.GetAccountBalance: not scripted for this test")
+}
+func (f *fakeGateway) CreateVirtualAccount(context.Context, string, singapay.CreateVirtualAccountRequest) (*singapay.VirtualAccount, error) {
+	panic("fakeGateway.CreateVirtualAccount: not scripted for this test")
+}
+func (f *fakeGateway) GenerateQRIS(context.Context, string, singapay.GenerateQRISRequest) (*singapay.QRISTransaction, error) {
+	panic("fakeGateway.GenerateQRIS: not scripted for this test")
+}
+func (f *fakeGateway) CreateEwalletOrder(context.Context, singapay.CreateEwalletOrderRequest) (*singapay.EwalletTransaction, error) {
+	panic("fakeGateway.CreateEwalletOrder: not scripted for this test")
+}
+func (f *fakeGateway) CreatePaymentLink(context.Context, string, singapay.CreatePaymentLinkRequest) (*singapay.PaymentLink, error) {
+	panic("fakeGateway.CreatePaymentLink: not scripted for this test")
+}
+func (f *fakeGateway) ListVATransactions(context.Context, string, singapay.SettlementWindow) ([]singapay.VATransaction, singapay.Pagination, error) {
+	panic("fakeGateway.ListVATransactions: not scripted for this test")
+}
+func (f *fakeGateway) ListQRISTransactions(context.Context, string, singapay.SettlementWindow) ([]singapay.QRISTransaction, singapay.Pagination, error) {
+	panic("fakeGateway.ListQRISTransactions: not scripted for this test")
+}
+func (f *fakeGateway) ListEwalletTransactions(context.Context, string, singapay.SettlementWindow) ([]singapay.EwalletTransaction, singapay.Pagination, error) {
+	panic("fakeGateway.ListEwalletTransactions: not scripted for this test")
+}
+func (f *fakeGateway) ListPaymentLinkHistories(context.Context, string, singapay.SettlementWindow) ([]singapay.PaymentLinkHistory, singapay.Pagination, error) {
+	panic("fakeGateway.ListPaymentLinkHistories: not scripted for this test")
+}
+func (f *fakeGateway) CheckBeneficiary(context.Context, string, string) (*singapay.Beneficiary, error) {
+	panic("fakeGateway.CheckBeneficiary: not scripted for this test")
+}
+func (f *fakeGateway) TransferBetweenAccounts(context.Context, string, singapay.TransferRequest) (*singapay.AccountTransfer, error) {
+	panic("fakeGateway.TransferBetweenAccounts: not scripted for this test")
+}
+func (f *fakeGateway) VerifyWebhook(singapay.WebhookRequest) error {
+	panic("fakeGateway.VerifyWebhook: not scripted for this test")
+}
+
+// payoutWithStatus builds a Singapay disbursement carrying a given two-digit transaction
+// status.
+//
+// It goes through JSON rather than a struct literal because the status field's type is
+// unexported — which is the right design for the client and means these tests exercise the
+// real decoding path instead of a shape invented alongside it.
+func payoutWithStatus(t *testing.T, code string) *singapay.Disbursement {
+	t.Helper()
+
+	var d singapay.Disbursement
+	body := `{
+		"transaction_id": "SP-TX-1",
+		"reference_number": "ref-1",
+		"transaction_status": {"code": "` + code + `", "desc": "scripted"},
+		"gross_amount": "50000.00",
+		"net_amount": "50000.00",
+		"fee": "0.00"
+	}`
+	require.NoError(t, json.Unmarshal([]byte(body), &d))
+	return &d
+}
+
+// payoutSuccess is a completed payout (status 00).
+func payoutSuccess(t *testing.T) *singapay.Disbursement { return payoutWithStatus(t, "00") }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fixtures
+// ═══════════════════════════════════════════════════════════════════════════
+
+func newPayoutTestClient(t *testing.T, gw *fakeGateway, available int64) (*LedgerClient, *FakeRepositoryProvider, *domain.Account) {
 	t.Helper()
 
 	fakes := NewFakeRepositoryProvider()
-	account := createTestAccount(domain.OwnerTypeSeller, "seller-1", "SAC-SELLER-1")
-	require.NoError(t, fakes.Account().Save(context.Background(), account))
+	ctx := context.Background()
 
-	journal := domain.NewJournal(domain.EventTypeDisbursement, domain.SourceTypeDisbursement, "seed", nil)
-	fakes.ledgerEntryRepo.entries = append(fakes.ledgerEntryRepo.entries, &domain.LedgerEntry{
-		JournalUUID:   journal.UUID,
-		AccountUUID:   account.UUID,
-		BalanceBucket: domain.BalanceBucketAvailable,
-		Amount:        available,
-	})
+	account := domain.NewSellerAccount("01SELLERACCOUNTULID", "seller-1", domain.CurrencyIDR)
+	account.SetSingapayAccount("01SELLERACCOUNTULID", "000000000123")
+	require.NoError(t, fakes.Account().Save(ctx, &account))
+
+	if available > 0 {
+		journal := domain.NewJournal(domain.EventTypePaymentSuccess, domain.SourceTypeProductTransaction, "seed", nil)
+		require.NoError(t, fakes.Journal().Save(ctx, journal))
+		require.NoError(t, fakes.LedgerEntry().Save(ctx, &domain.LedgerEntry{
+			JournalUUID:   journal.UUID,
+			AccountUUID:   account.UUID,
+			Amount:        available,
+			BalanceBucket: domain.BalanceBucketAvailable,
+			EntryType:     domain.EntryTypeSettlement,
+			SourceType:    domain.SourceTypeProductTransaction,
+			SourceID:      "seed",
+		}))
+	}
 
 	client := &LedgerClient{
-		repoProvider: fakes,
 		txProvider:   NewFakeTransactionProvider(fakes),
+		repoProvider: fakes,
 		logger:       testLogger(),
-		dokuClient:   doku,
+		gateway:      gw,
 	}
-	return client, fakes, account
+
+	return client, fakes, &account
 }
 
 func withdrawRequest() *WithdrawRequest {
@@ -192,96 +280,250 @@ func withdrawRequest() *WithdrawRequest {
 		BankCode:      "BNINIDJA",
 		AccountNumber: "712739123020001",
 		AccountName:   "Ria Florensi",
-		Description:   "Disbursement request",
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────────────────────────────────────
+func countDebits(fakes *FakeRepositoryProvider) int {
+	n := 0
+	for _, e := range fakes.ledgerEntryRepo.entries {
+		if e.EntryType == domain.EntryTypeDisbursement {
+			n++
+		}
+	}
+	return n
+}
 
-// The row and its Request-Id must exist BEFORE the payout leaves. Previously DOKU was
-// called with no DB writes at all, so a crash before the commit left money gone and
-// nothing in our database naming it.
-func TestWithdraw_PersistsRequestIDBeforeCallingDoku(t *testing.T) {
-	doku := &fakePayoutClient{response: payoutSuccess()}
+func countReversals(fakes *FakeRepositoryProvider) int {
+	n := 0
+	for _, e := range fakes.ledgerEntryRepo.entries {
+		if e.EntryType == domain.EntryTypeDisbursementReversal {
+			n++
+		}
+	}
+	return n
+}
+
+func availableBalance(fakes *FakeRepositoryProvider, accountUUID string) int64 {
+	_, available, _ := fakes.ledgerEntryRepo.GetAllBalances(context.Background(), accountUUID)
+	return available
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The row and its reference must exist BEFORE the payout leaves. If the gateway were
+// called first, a crash between the payout and the commit would lose the reference and the
+// payout could never be asked about again.
+func TestWithdraw_PersistsReferenceBeforeCallingTheGateway(t *testing.T) {
+	gw := &fakeGateway{disburse: payoutSuccess(t)}
 
 	var storedAtCallTime *domain.Disbursement
-	client, fakes, _ := newPayoutTestClient(t, doku, 100000)
-	doku.beforeCall = func() {
+	client, fakes, _ := newPayoutTestClient(t, gw, 100000)
+	gw.beforeCall = func() {
 		for _, d := range fakes.disbursementRepo.disbursements {
-			clone := *d
-			storedAtCallTime = &clone
+			copied := *d
+			storedAtCallTime = &copied
 		}
 	}
 
 	resp, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest())
 	require.NoError(t, err)
 
-	require.NotNil(t, storedAtCallTime, "no disbursement row existed when DOKU was called")
-	assert.Equal(t, domain.DisbursementStatusPending, storedAtCallTime.Status)
-	assert.NotEmpty(t, storedAtCallTime.PayoutRequestID, "the row was written without a request id, so a retry has nothing to replay")
+	require.NotNil(t, storedAtCallTime, "no disbursement row existed when the gateway was called")
+	assert.NotEmpty(t, storedAtCallTime.PayoutRequestID)
 
-	// And the id on the row is the id DOKU actually saw.
-	require.Len(t, doku.requestIDs, 1)
-	assert.Equal(t, storedAtCallTime.PayoutRequestID, doku.requestIDs[0])
-
-	assert.Equal(t, string(domain.DisbursementStatusCompleted), resp.Status)
-	assert.Equal(t, resp.DisbursementID, doku.invoices[0], "disbursement id doubles as the DOKU invoice number")
+	// And the reference on the row is the reference Singapay actually saw.
+	require.Len(t, gw.references, 1)
+	assert.Equal(t, storedAtCallTime.PayoutRequestID, gw.references[0])
+	assert.Equal(t, resp.DisbursementID, storedAtCallTime.UUID)
 }
 
-// A timeout or a 5xx says nothing about whether the money left. Marking that FAILED would
-// be both a false claim and a trap: FAILED is terminal, so the row could never be replayed.
-func TestWithdraw_UnknownOutcomeStaysInFlight(t *testing.T) {
-	for _, statusCode := range []int{0, http.StatusInternalServerError, http.StatusBadGateway} {
-		t.Run(http.StatusText(statusCode), func(t *testing.T) {
-			doku := &fakePayoutClient{errorLog: &dokumodels.ErrorLog{StatusCode: statusCode, Message: "timeout"}}
-			client, fakes, _ := newPayoutTestClient(t, doku, 100000)
+// Singapay's amount is the NET the beneficiary receives; the transfer fee is charged on
+// top. Reserving only the net leaves the ledger short by the fee on every payout, and the
+// drift is silent — the books stay internally consistent and disagree only with Singapay.
+func TestWithdraw_ReservesTheGrossIncludingTheTransferFee(t *testing.T) {
+	gw := &fakeGateway{disburse: payoutSuccess(t), fee: 4000}
+	client, fakes, account := newPayoutTestClient(t, gw, 100000)
+
+	resp, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest()) // net 50000
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(4000), resp.TransferFee)
+	assert.Equal(t, int64(46000), availableBalance(fakes, account.UUID),
+		"the reservation must hold net + fee (50000 + 4000), not just the net")
+}
+
+// A quote that cannot be made is not a withdrawal that cannot be made. check-fee accepts
+// SWIFT codes only, so an account stored with a three-digit bank code can never be quoted —
+// refusing those payouts outright would be worse than under-reserving by the fee.
+func TestWithdraw_ProceedsWhenTheFeeCannotBeQuoted(t *testing.T) {
+	gw := &fakeGateway{
+		disburse: payoutSuccess(t),
+		feeErr:   &singapay.Error{StatusCode: http.StatusBadRequest, Code: singapay.CodeValidationError, Message: "bank_swift_code required"},
+	}
+	client, fakes, account := newPayoutTestClient(t, gw, 100000)
+
+	resp, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest())
+	require.NoError(t, err)
+
+	assert.Zero(t, resp.TransferFee)
+	assert.Len(t, gw.references, 1, "the payout must still have gone out")
+	assert.Equal(t, int64(50000), availableBalance(fakes, account.UUID))
+}
+
+// Outcome, not the HTTP status, decides whether the reservation may be released. Singapay
+// answers HTTP 400 for SP001, SP002, SP004 and SP005 and documents every one of them as
+// "call inquiry-status" — releasing on a 4xx is exactly how a payout gets made twice.
+func TestWithdraw_UnknownOutcomeKeepsTheReservationEvenOn4xx(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  *singapay.Error
+	}{
+		{"SP001 transaction failure arrives as HTTP 400", &singapay.Error{StatusCode: http.StatusBadRequest, Code: singapay.CodeTransactionFailure}},
+		{"SP005 timeout arrives as HTTP 400", &singapay.Error{StatusCode: http.StatusBadRequest, Code: singapay.CodeTimeout}},
+		{"SP004 duplicate reference arrives as HTTP 400", &singapay.Error{StatusCode: http.StatusBadRequest, Code: singapay.CodeDuplicateReference}},
+		{"a transport failure has no code at all", &singapay.Error{Err: context.DeadlineExceeded}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gw := &fakeGateway{err: tc.err}
+			client, fakes, account := newPayoutTestClient(t, gw, 100000)
 
 			_, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest())
-			require.Error(t, err, "the caller must still be told the withdrawal did not complete")
+			require.Error(t, err)
 
-			require.Len(t, fakes.disbursementRepo.disbursements, 1)
+			assert.Zero(t, countReversals(fakes), "an unknown outcome must not release the reservation")
+			assert.Equal(t, int64(50000), availableBalance(fakes, account.UUID),
+				"the money is still committed to a payout that may yet settle")
+
 			for _, d := range fakes.disbursementRepo.disbursements {
 				assert.Equal(t, domain.DisbursementStatusPending, d.Status,
-					"an unknown outcome must stay replayable, not be locked into a terminal state")
-				assert.NotEmpty(t, d.PayoutRequestID)
+					"a payout that may still settle must stay replayable, and FAILED is terminal")
 			}
-
-			// The reservation stays put. The payout may be on its way, and returning
-			// the money to the available balance is how it would go out twice.
-			assert.Equal(t, 1, countDebits(fakes), "the reservation must be held, not released")
-			assert.Zero(t, countReversals(fakes),
-				"an unknown outcome must never release the reservation")
 		})
 	}
 }
 
-// A 4xx is DOKU refusing outright. That one we do know, so it is terminal.
-func TestWithdraw_DefiniteRejectionIsTerminal(t *testing.T) {
-	doku := &fakePayoutClient{errorLog: &dokumodels.ErrorLog{StatusCode: http.StatusBadRequest, Message: "invalid bank account"}}
-	client, fakes, account := newPayoutTestClient(t, doku, 100000)
+// A refusal Singapay states outright is the one case where the money is known not to have
+// moved, so the reservation goes back.
+func TestWithdraw_RefusalReleasesTheReservation(t *testing.T) {
+	gw := &fakeGateway{err: &singapay.Error{
+		StatusCode: http.StatusBadRequest,
+		Code:       singapay.CodeBeneficiaryNotFound,
+		Message:    "beneficiary account not found",
+	}}
+	client, fakes, account := newPayoutTestClient(t, gw, 100000)
 
 	_, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest())
 	require.Error(t, err)
 
-	require.Len(t, fakes.disbursementRepo.disbursements, 1)
-	for _, d := range fakes.disbursementRepo.disbursements {
-		assert.Equal(t, domain.DisbursementStatusFailed, d.Status)
-		assert.Contains(t, d.FailureReason, "invalid bank account")
-	}
-
-	// Known refusal: the money never left, so the reservation is released and the seller
-	// can spend it again.
 	assert.Equal(t, 1, countReversals(fakes))
 	assert.Equal(t, int64(100000), availableBalance(fakes, account.UUID))
+	for _, d := range fakes.disbursementRepo.disbursements {
+		assert.Equal(t, domain.DisbursementStatusFailed, d.Status)
+	}
 }
 
-// The payoff: a replay presents the SAME Request-Id, which is what makes DOKU answer with
-// its original result instead of paying out again.
-func TestRetryDisbursement_ReusesTheStoredRequestID(t *testing.T) {
-	doku := &fakePayoutClient{errorLog: &dokumodels.ErrorLog{StatusCode: 0, Message: "timeout"}}
-	client, fakes, _ := newPayoutTestClient(t, doku, 100000)
+// SP000 means the instruction was accepted, not that money moved. The two-digit transaction
+// status is the answer, and 04, 05, 06 and 07 are terminal failures — reading them as
+// still-in-flight would hold a seller's balance against a transfer that will never complete.
+func TestWithdraw_TerminalTransactionStatusReleasesTheReservation(t *testing.T) {
+	for _, code := range []string{"04", "05", "06", "07"} {
+		t.Run("status "+code, func(t *testing.T) {
+			gw := &fakeGateway{disburse: payoutWithStatus(t, code)}
+			client, fakes, account := newPayoutTestClient(t, gw, 100000)
+
+			_, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest())
+			require.NoError(t, err, "a refused payout is a completed request, not a failed call")
+
+			assert.Equal(t, 1, countReversals(fakes))
+			assert.Equal(t, int64(100000), availableBalance(fakes, account.UUID))
+			for _, d := range fakes.disbursementRepo.disbursements {
+				assert.Equal(t, domain.DisbursementStatusFailed, d.Status)
+			}
+		})
+	}
+}
+
+// 01, 02 and 03 are accepted-and-moving. The money stays held.
+func TestWithdraw_InFlightStatusKeepsTheReservation(t *testing.T) {
+	for _, code := range []string{"01", "02", "03"} {
+		t.Run("status "+code, func(t *testing.T) {
+			gw := &fakeGateway{disburse: payoutWithStatus(t, code)}
+			client, fakes, account := newPayoutTestClient(t, gw, 100000)
+
+			_, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest())
+			require.NoError(t, err)
+
+			assert.Zero(t, countReversals(fakes))
+			assert.Equal(t, int64(50000), availableBalance(fakes, account.UUID))
+		})
+	}
+}
+
+// The payoff of storing the reference: a retry asks about it instead of sending it again.
+// Singapay answers SP004 for a reference it has already seen, so re-sending blind is both
+// useless and dangerous — the original may well have succeeded.
+func TestRetryDisbursement_InquiresInsteadOfResending(t *testing.T) {
+	gw := &fakeGateway{err: &singapay.Error{Err: context.DeadlineExceeded}}
+	client, fakes, account := newPayoutTestClient(t, gw, 100000)
+
+	_, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest())
+	require.Error(t, err)
+	require.Len(t, gw.references, 1)
+	firstReference := gw.references[0]
+
+	var pending *domain.Disbursement
+	for _, d := range fakes.disbursementRepo.disbursements {
+		pending = d
+	}
+	require.NotNil(t, pending)
+
+	// Singapay now says the payout it never answered about did in fact go through.
+	gw.err = nil
+	gw.inquiry = payoutSuccess(t)
+
+	resp, err := client.RetryDisbursement(context.Background(), pending.UUID)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, gw.inquiries, "the retry must ask before it sends")
+	assert.Len(t, gw.references, 1, "a payout that already exists must not be sent a second time")
+	assert.Equal(t, string(domain.DisbursementStatusCompleted), resp.Status)
+	assert.Equal(t, firstReference, pending.PayoutRequestID)
+	assert.Equal(t, int64(50000), availableBalance(fakes, account.UUID))
+}
+
+// Not-found is the one inquiry answer that makes re-sending safe: Singapay has no record of
+// the reference, so nothing can have been paid under it.
+func TestRetryDisbursement_ResendsOnlyWhenTheReferenceIsUnknown(t *testing.T) {
+	gw := &fakeGateway{err: &singapay.Error{Err: context.DeadlineExceeded}}
+	client, fakes, _ := newPayoutTestClient(t, gw, 100000)
+
+	_, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest())
+	require.Error(t, err)
+	firstReference := gw.references[0]
+
+	var pending *domain.Disbursement
+	for _, d := range fakes.disbursementRepo.disbursements {
+		pending = d
+	}
+
+	gw.err = nil
+	gw.disburse = payoutSuccess(t) // inquiry defaults to SP009 not-found
+
+	_, err = client.RetryDisbursement(context.Background(), pending.UUID)
+	require.NoError(t, err)
+
+	require.Len(t, gw.references, 2)
+	assert.Equal(t, firstReference, gw.references[1],
+		"the retry must present the reference the row already carries, not a fresh one")
+}
+
+// An inquiry that fails for any other reason leaves the question open, and an open question
+// is not a licence to send money again.
+func TestRetryDisbursement_RefusesToResendOnAnInconclusiveInquiry(t *testing.T) {
+	gw := &fakeGateway{err: &singapay.Error{Err: context.DeadlineExceeded}}
+	client, fakes, _ := newPayoutTestClient(t, gw, 100000)
 
 	_, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest())
 	require.Error(t, err)
@@ -290,85 +532,64 @@ func TestRetryDisbursement_ReusesTheStoredRequestID(t *testing.T) {
 	for _, d := range fakes.disbursementRepo.disbursements {
 		pending = d
 	}
-	require.NotNil(t, pending)
-	firstRequestID := pending.PayoutRequestID
 
-	// DOKU now answers — this is what a 409 replay of a payout that did go through looks
-	// like once the doku client has let the conflict through to normal parsing.
-	doku.errorLog = nil
-	doku.response = payoutSuccess()
+	gw.err = nil
+	gw.disburse = payoutSuccess(t)
+	gw.inquiryErr = &singapay.Error{StatusCode: http.StatusBadGateway, Message: "upstream unavailable"}
 
-	resp, err := client.RetryDisbursement(context.Background(), pending.UUID)
-	require.NoError(t, err)
-
-	require.Len(t, doku.requestIDs, 2)
-	assert.Equal(t, firstRequestID, doku.requestIDs[1],
-		"the retry minted a new request id, which is exactly how a payout gets sent twice")
-	assert.Equal(t, firstRequestID, doku.requestIDs[0])
-
-	assert.Equal(t, string(domain.DisbursementStatusCompleted), resp.Status)
-	assert.Equal(t, 1, countDebits(fakes),
-		"the debit belongs in the ledger exactly once — written at reservation, not again on retry")
-	assert.Zero(t, countReversals(fakes), "a payout that succeeded must not be given back")
+	_, err = client.RetryDisbursement(context.Background(), pending.UUID)
+	require.Error(t, err)
+	assert.True(t, ledgererr.IsAppError(err, ledgererr.ErrGatewayOutcomeUnknown),
+		"expected an unknown-outcome error, got: %v", err)
+	assert.Len(t, gw.references, 1, "no second payout may be sent while the outcome is unknown")
 }
 
-func TestRetryDisbursement_RefusesTerminalAndUnprotectedRows(t *testing.T) {
-	tests := []struct {
-		name    string
-		prepare func(d *domain.Disbursement)
+// Terminal rows are refused outright: COMPLETED has been paid and booked, FAILED is a
+// definite refusal. Neither may be replayed.
+func TestRetryDisbursement_RefusesTerminalRows(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		apply func(d *domain.Disbursement)
 	}{
-		{"already completed", func(d *domain.Disbursement) {
-			_ = d.MarkCompleted("DOKU-INV-1")
+		{"completed", func(d *domain.Disbursement) {
+			_ = d.MarkProcessing("SP-TX-1")
+			_ = d.MarkCompleted("SP-TX-1")
 		}},
-		{"definitely rejected", func(d *domain.Disbursement) {
-			_ = d.MarkFailed("DOKU rejected the payout")
-		}},
-		{"no stored request id", func(d *domain.Disbursement) {
-			d.PayoutRequestID = ""
-		}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			doku := &fakePayoutClient{response: payoutSuccess()}
-			client, fakes, account := newPayoutTestClient(t, doku, 100000)
+		{"failed", func(d *domain.Disbursement) { _ = d.MarkFailed("Singapay refused the payout") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gw := &fakeGateway{disburse: payoutSuccess(t)}
+			client, fakes, account := newPayoutTestClient(t, gw, 100000)
 
 			d, err := domain.NewDisbursementWithID(domain.GenerateID(), account.UUID, 50000, domain.CurrencyIDR,
 				domain.BankAccount{BankCode: "BNINIDJA", AccountNumber: "712739123020001", AccountName: "Ria Florensi"}, "")
 			require.NoError(t, err)
-			d.PayoutRequestID = "stored-request-id"
-			tt.prepare(d)
+			d.PayoutRequestID = "some-reference"
+			tc.apply(d)
 			require.NoError(t, fakes.Disbursement().Save(context.Background(), d))
 
 			_, err = client.RetryDisbursement(context.Background(), d.UUID)
 			require.Error(t, err)
-			assert.Empty(t, doku.requestIDs, "DOKU must not be called at all for a row that cannot be safely replayed")
+			assert.Empty(t, gw.references, "the gateway must not be called at all for a row that cannot be safely replayed")
+			assert.Zero(t, gw.inquiries)
 		})
 	}
 }
 
-// countDebits counts reservations (-amount), ignoring the AVAILABLE balance seeded by the
-// fixture. countReversals counts releases (+amount).
-func countDebits(fakes *FakeRepositoryProvider) int {
-	return countEntriesOfType(fakes, domain.EntryTypeDisbursement)
-}
+// A row with no stored reference cannot be replayed at all. Minting one now would look like
+// a protected retry while handing Singapay a reference it has never seen — so a payout that
+// already went out would go out again.
+func TestRetryDisbursement_RefusesARowWithNoReference(t *testing.T) {
+	gw := &fakeGateway{disburse: payoutSuccess(t)}
+	client, fakes, account := newPayoutTestClient(t, gw, 100000)
 
-func countReversals(fakes *FakeRepositoryProvider) int {
-	return countEntriesOfType(fakes, domain.EntryTypeDisbursementReversal)
-}
+	d, err := domain.NewDisbursementWithID(domain.GenerateID(), account.UUID, 50000, domain.CurrencyIDR,
+		domain.BankAccount{BankCode: "BNINIDJA", AccountNumber: "712739123020001", AccountName: "Ria Florensi"}, "")
+	require.NoError(t, err)
+	require.NoError(t, fakes.Disbursement().Save(context.Background(), d))
 
-func countEntriesOfType(fakes *FakeRepositoryProvider, entryType domain.EntryType) int {
-	n := 0
-	for _, e := range fakes.ledgerEntryRepo.entries {
-		if e.SourceType == domain.SourceTypeDisbursement && e.EntryType == entryType {
-			n++
-		}
-	}
-	return n
-}
-
-// availableBalance derives what the seller can actually withdraw right now.
-func availableBalance(fakes *FakeRepositoryProvider, accountID string) int64 {
-	_, available, _ := fakes.LedgerEntry().GetAllBalances(context.Background(), accountID)
-	return available
+	_, err = client.RetryDisbursement(context.Background(), d.UUID)
+	require.Error(t, err)
+	assert.Empty(t, gw.references)
+	assert.Zero(t, gw.inquiries)
 }

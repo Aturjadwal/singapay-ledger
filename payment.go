@@ -4,13 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"strconv"
 	"time"
 
-	"github.com/21strive/doku/app/requests"
-	dokuRequests "github.com/21strive/doku/app/requests"
 	"github.com/21strive/ledger/domain"
 	"github.com/21strive/ledger/ledgererr"
 	"github.com/21strive/ledger/repo"
+	"github.com/21strive/ledger/singapay"
 )
 
 // GeneratePaymentRequest contains the parameters to generate a payment
@@ -31,11 +31,16 @@ type GeneratePaymentRequest struct {
 	Metadata    map[string]any `json:"metadata"`     // Product details (title, resolution, etc.)
 
 	// Payment configuration
-	PaymentChannel        string   `json:"payment_channel"`         // QRIS, VIRTUAL_ACCOUNT_MANDIRI, etc.
-	ExpiresIn             int64    `json:"expires_in"`              // Payment expiration in minutes (default: 60 minutes, max: 999999)
+	// PaymentChannel is a Singapay channel code: "QRIS", "VA_BCA", "EWALLET_DANA", …
+	// Leaving it empty issues a payment link and lets the payer choose — which costs
+	// fee reconciliation, because a payment link reports no per-transaction fee
+	// anywhere. Name the channel whenever it is known.
+	PaymentChannel        string   `json:"payment_channel"`
+	ExpiresIn             int64    `json:"expires_in"`              // Payment expiration in minutes (default: 60)
 	FeeModel              FeeModel `json:"fee_model"`               // Who pays gateway fee (defaults to GATEWAY_ON_CUSTOMER)
 	SkipPlatformFee       bool     `json:"skip_platform_fee"`       // When true, platform fee is not charged
-	PlatformFeeMultiplier int      `json:"platform_fee_multiplier"` // Multiplies platform fee only (e.g. installment: N due terms → multiplier=N). DOKU fee is not affected.
+	PlatformFeeMultiplier int      `json:"platform_fee_multiplier"` // Multiplies platform fee only (e.g. installment: N due terms → multiplier=N). The gateway fee is not affected.
+	CustomerPhone         string   `json:"customer_phone"`          // Required by some e-wallet vendors (OVO push-to-pay among them)
 }
 
 // GeneratePaymentResponse contains the result of payment generation
@@ -43,34 +48,41 @@ type GeneratePaymentResponse struct {
 	TransactionID string `json:"transaction_id"`
 	InvoiceNumber string `json:"invoice_number"`
 	PaymentURL    string `json:"payment_url"`
-	PaymentCode   string `json:"payment_code,omitempty"` // VA number, QRIS code, etc.
+	PaymentCode   string `json:"payment_code,omitempty"` // VA number, or the QRIS payload to render
 	ExpiresAt     int64  `json:"expires_at"`             // Unix timestamp
+	// PaymentChannel echoes the channel actually used. It differs from the request when
+	// none was named: the response says PAYMENT_LINK, and the payer picks from there.
+	PaymentChannel string `json:"payment_channel"`
 
 	// Fee breakdown for transparency
 	SellerPrice     int64  `json:"seller_price"`
 	SellerNetAmount int64  `json:"seller_net_amount"` // What seller actually receives
 	PlatformFee     int64  `json:"platform_fee"`
-	DokuFee         int64  `json:"doku_fee"`
+	GatewayFee      int64  `json:"gateway_fee"`
 	TotalCharged    int64  `json:"total_charged"`
 	FeeModel        string `json:"fee_model"`
 	Currency        string `json:"currency"`
 }
 
-// GeneratePayment creates a new payment for a product purchase
-// Flow: Calculate fees → Create ProductTransaction → Call DOKU API → Create PaymentRequest
+// GeneratePayment creates a new payment for a product purchase.
+// Flow: calculate fees → build ProductTransaction → issue the Singapay instrument → save both
 func (c *LedgerClient) GeneratePayment(ctx context.Context, req *GeneratePaymentRequest) (*GeneratePaymentResponse, error) {
 	// Validate required fields
 	if err := c.validateGeneratePaymentRequest(req); err != nil {
 		return nil, err
 	}
 
-	// Get seller's ledger to obtain DOKU SAC ID
+	// Get the seller's ledger account to obtain its Singapay sub-account ULID
 	sellerAcccount, err := c.repoProvider.Account().GetBySellerID(ctx, req.SellerAccountID)
 	if err != nil {
 		if ledgererr.IsAppError(err, repo.ErrNotFound) {
 			return nil, ledgererr.ErrLedgerNotFound.WithError(fmt.Errorf("seller account not found for seller_id: %s", req.SellerAccountID))
 		}
 		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to get seller account", err)
+	}
+	if sellerAcccount.SingapayAccountID == "" {
+		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest,
+			fmt.Sprintf("seller account %s has no Singapay sub-account id; nothing can be charged into it", req.SellerAccountID), nil)
 	}
 
 	// Load fee configurations
@@ -105,7 +117,7 @@ func (c *LedgerClient) GeneratePayment(ctx context.Context, req *GeneratePayment
 	c.logger.InfoContext(ctx, "Calculated fee breakdown",
 		"seller_price", feeBreakdown.SellerPrice,
 		"platform_fee", feeBreakdown.PlatformFee,
-		"doku_fee", feeBreakdown.DokuFee,
+		"gateway_fee", feeBreakdown.GatewayFee,
 		"total_charged", feeBreakdown.TotalCharged,
 		"seller_net_amount", feeBreakdown.SellerNetAmount,
 		"fee_model", feeBreakdown.FeeModel,
@@ -135,61 +147,40 @@ func (c *LedgerClient) GeneratePayment(ctx context.Context, req *GeneratePayment
 		req.Metadata,
 	)
 
-	// Call DOKU API to create payment
-	dokuResp, dokuErr := c.dokuClient.AcceptPayment(&dokuRequests.DokuCreatePaymentRequest{
-		Amount:         feeBreakdown.TotalCharged,
-		CustomerName:   req.BuyerName,
-		CustomerEmail:  req.BuyerEmail,
-		SacID:          sellerAcccount.DokuSubAccountID,
-		PaymentDueDate: expiresInMinutes, // DOKU expects minutes
-		InvoiceNumber:  invoiceNumber,
-		PaymentMethod:  req.PaymentChannel,
+	// Issue the payment instrument at Singapay. Which product that is depends on the
+	// channel; see issuePaymentInstrument.
+	instrument, err := c.issuePaymentInstrument(ctx, paymentInstrumentRequest{
+		AccountID:     sellerAcccount.SingapayAccountID,
+		Channel:       req.PaymentChannel,
+		Amount:        feeBreakdown.TotalCharged,
+		InvoiceNumber: invoiceNumber,
+		CustomerName:  req.BuyerName,
+		CustomerEmail: req.BuyerEmail,
+		CustomerPhone: req.CustomerPhone,
+		Description:   req.ProductType,
+		ExpiresAt:     expiresAt,
 	})
-
-	if dokuErr != nil {
-		c.logger.ErrorContext(ctx, "DOKU AcceptPayment failed",
+	if err != nil {
+		c.logger.ErrorContext(ctx, "Singapay payment creation failed",
 			"invoice_number", invoiceNumber,
-			"error", dokuErr.Err,
-			"message", dokuErr.Message,
-			"status_code", dokuErr.StatusCode,
+			"payment_channel", req.PaymentChannel,
+			"error", err,
 		)
-		return nil, ledgererr.NewError(ledgererr.CodeDokuAPIError, "failed to create payment with DOKU", fmt.Errorf("status: %d, error: %v", dokuErr.StatusCode, dokuErr.Message))
-	}
-
-	// Extract payment details from DOKU response
-	var paymentURL string
-	var paymentCode string
-	var dokuRequestID string
-
-	if dokuResp.Response.Payment != nil {
-		if dokuResp.Response.Payment.URL.Valid {
-			paymentURL = dokuResp.Response.Payment.URL.String
-		}
-		if dokuResp.Response.Payment.TokenID.Valid {
-			dokuRequestID = dokuResp.Response.Payment.TokenID.String
-		}
-	}
-
-	if dokuResp.Response.Order != nil {
-		if dokuResp.Response.Order.SessionID.Valid {
-			if dokuRequestID == "" {
-				dokuRequestID = dokuResp.Response.Order.SessionID.String
-			}
-		}
+		return nil, err
 	}
 
 	// Create PaymentRequest
 	paymentReq := domain.NewPaymentRequest(
 		productTx.UUID,
-		dokuRequestID,
-		req.PaymentChannel,
+		instrument.GatewayID,
+		instrument.Channel,
 		feeBreakdown.TotalCharged,
 		currency,
 		expiresAt,
 	)
-	paymentReq.SetPaymentURL(paymentURL)
-	if paymentCode != "" {
-		paymentReq.SetPaymentCode(paymentCode)
+	paymentReq.SetPaymentURL(instrument.PaymentURL)
+	if instrument.PaymentCode != "" {
+		paymentReq.SetPaymentCode(instrument.PaymentCode)
 	}
 
 	// Save both ProductTransaction and PaymentRequest in a transaction
@@ -219,20 +210,21 @@ func (c *LedgerClient) GeneratePayment(ctx context.Context, req *GeneratePayment
 		"transaction_id", productTx.UUID,
 		"invoice_number", invoiceNumber,
 		"total_charged", feeBreakdown.TotalCharged,
-		"payment_channel", req.PaymentChannel,
-		"checkout_url", paymentURL,
+		"payment_channel", instrument.Channel,
+		"checkout_url", instrument.PaymentURL,
 	)
 
 	return &GeneratePaymentResponse{
 		TransactionID:   productTx.UUID,
 		InvoiceNumber:   invoiceNumber,
-		PaymentURL:      paymentURL,
-		PaymentCode:     paymentCode,
+		PaymentURL:      instrument.PaymentURL,
+		PaymentCode:     instrument.PaymentCode,
+		PaymentChannel:  instrument.Channel,
 		ExpiresAt:       expiresAt.Unix(),
 		SellerPrice:     feeBreakdown.SellerPrice,
 		SellerNetAmount: feeBreakdown.SellerNetAmount,
 		PlatformFee:     feeBreakdown.PlatformFee,
-		DokuFee:         feeBreakdown.DokuFee,
+		GatewayFee:      feeBreakdown.GatewayFee,
 		TotalCharged:    feeBreakdown.TotalCharged,
 		FeeModel:        string(feeBreakdown.FeeModel),
 		Currency:        string(currency),
@@ -255,22 +247,27 @@ type GenerateSubscriptionPaymentRequest struct {
 
 	// Payment configuration
 	ExpiresIn int64 `json:"expires_in"` // Payment expiration in minutes (default: 60)
-	// FeeModel is always GATEWAY_ON_SELLER: customer pays subscription_price only, platform absorbs DOKU fee.
-	// PaymentChannel is not required — buyer selects channel via DOKU Checkout (payment_url).
+	// FeeModel is always GATEWAY_ON_SELLER: the customer pays subscription_price only and
+	// the platform absorbs the gateway fee.
+	// PaymentChannel is not required — the buyer selects one on the Singapay payment link.
 }
 
 // GenerateSubscriptionPayment creates a payment for a platform subscription purchase.
-// Unlike GeneratePayment, there is no seller — the platform receives all net proceeds.
-// The platform account's DOKU SAC is used for the payment gateway call.
+// Unlike GeneratePayment, there is no seller — the platform receives all net proceeds, and
+// the payment is issued against the platform's own Singapay sub-account.
 func (c *LedgerClient) GenerateSubscriptionPayment(ctx context.Context, req *GenerateSubscriptionPaymentRequest) (*GeneratePaymentResponse, error) {
 	if err := c.validateGenerateSubscriptionPaymentRequest(req); err != nil {
 		return nil, err
 	}
 
-	// Platform is the beneficiary — use platform account's DOKU SAC
+	// Platform is the beneficiary — the payment is issued against its sub-account
 	platformAccount, err := c.repoProvider.Account().GetPlatformAccount(ctx)
 	if err != nil {
 		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to get platform account", err)
+	}
+	if platformAccount.SingapayAccountID == "" {
+		return nil, ledgererr.NewError(ledgererr.CodeInternal,
+			"platform account has no Singapay sub-account id; it is provisioned once per environment by hand", nil)
 	}
 
 	// Load fee configurations
@@ -283,9 +280,12 @@ func (c *LedgerClient) GenerateSubscriptionPayment(ctx context.Context, req *Gen
 
 	currency := domain.Currency(req.Currency)
 
-	// GATEWAY_ON_SELLER: customer pays subscription_price only, platform absorbs DOKU fee.
-	// SkipPlatformFee=true: platform IS the beneficiary, no additional commission split.
-	// PaymentChannel is empty — buyer selects channel via DOKU Checkout, so DOKU fee is unknown upfront.
+	// GATEWAY_ON_SELLER: the customer pays subscription_price only and the platform
+	// absorbs the gateway fee.
+	// SkipPlatformFee=true: the platform IS the beneficiary, so there is no commission split.
+	// PaymentChannel is empty — the buyer picks one on the payment link, so the gateway fee
+	// is not known up front. It is also never learned: a payment link reports no
+	// per-transaction fee, so a subscription's fee delta is always zero by construction.
 	feeBreakdown := feeCalc.GetFeeBreakdownWithOptions(req.SubscriptionPrice, "", currency, domain.FeeBreakdownOptions{
 		FeeModel:        domain.FeeModelGatewayOnSeller,
 		SkipPlatformFee: true,
@@ -293,7 +293,7 @@ func (c *LedgerClient) GenerateSubscriptionPayment(ctx context.Context, req *Gen
 
 	c.logger.InfoContext(ctx, "Calculated subscription fee breakdown",
 		"subscription_price", feeBreakdown.SellerPrice,
-		"doku_fee", feeBreakdown.DokuFee,
+		"gateway_fee", feeBreakdown.GatewayFee,
 		"total_charged", feeBreakdown.TotalCharged,
 		"platform_net_amount", feeBreakdown.SellerNetAmount,
 		"fee_model", feeBreakdown.FeeModel,
@@ -319,57 +319,35 @@ func (c *LedgerClient) GenerateSubscriptionPayment(ctx context.Context, req *Gen
 		req.Metadata,
 	)
 
-	dokuResp, dokuErr := c.dokuClient.AcceptPayment(&dokuRequests.DokuCreatePaymentRequest{
-		Amount:         feeBreakdown.TotalCharged,
-		CustomerName:   req.BuyerName,
-		CustomerEmail:  req.BuyerEmail,
-		SacID:          platformAccount.DokuSubAccountID,
-		PaymentDueDate: expiresInMinutes,
-		InvoiceNumber:  invoiceNumber,
+	instrument, err := c.issuePaymentInstrument(ctx, paymentInstrumentRequest{
+		AccountID:     platformAccount.SingapayAccountID,
+		Channel:       "", // no channel pinned — the buyer picks one on the hosted page
+		Amount:        feeBreakdown.TotalCharged,
+		InvoiceNumber: invoiceNumber,
+		CustomerName:  req.BuyerName,
+		CustomerEmail: req.BuyerEmail,
+		Description:   "SUBSCRIPTION",
+		ExpiresAt:     expiresAt,
 	})
-
-	if dokuErr != nil {
-		c.logger.ErrorContext(ctx, "DOKU AcceptPayment failed for subscription",
+	if err != nil {
+		c.logger.ErrorContext(ctx, "Singapay subscription payment creation failed",
 			"invoice_number", invoiceNumber,
-			"error", dokuErr.Err,
-			"message", dokuErr.Message,
-			"status_code", dokuErr.StatusCode,
+			"error", err,
 		)
-		return nil, ledgererr.NewError(ledgererr.CodeDokuAPIError, "failed to create subscription payment with DOKU", fmt.Errorf("status: %d, error: %v", dokuErr.StatusCode, dokuErr.Message))
-	}
-
-	var paymentURL string
-	var paymentCode string
-	var dokuRequestID string
-
-	if dokuResp.Response.Payment != nil {
-		if dokuResp.Response.Payment.URL.Valid {
-			paymentURL = dokuResp.Response.Payment.URL.String
-		}
-		if dokuResp.Response.Payment.TokenID.Valid {
-			dokuRequestID = dokuResp.Response.Payment.TokenID.String
-		}
-	}
-
-	if dokuResp.Response.Order != nil {
-		if dokuResp.Response.Order.SessionID.Valid {
-			if dokuRequestID == "" {
-				dokuRequestID = dokuResp.Response.Order.SessionID.String
-			}
-		}
+		return nil, err
 	}
 
 	paymentReq := domain.NewPaymentRequest(
 		productTx.UUID,
-		dokuRequestID,
-		"", // channel unknown at creation; buyer selects via DOKU Checkout
+		instrument.GatewayID,
+		instrument.Channel,
 		feeBreakdown.TotalCharged,
 		currency,
 		expiresAt,
 	)
-	paymentReq.SetPaymentURL(paymentURL)
-	if paymentCode != "" {
-		paymentReq.SetPaymentCode(paymentCode)
+	paymentReq.SetPaymentURL(instrument.PaymentURL)
+	if instrument.PaymentCode != "" {
+		paymentReq.SetPaymentCode(instrument.PaymentCode)
 	}
 
 	err = c.txProvider.Transact(ctx, func(tx repo.Tx) error {
@@ -394,19 +372,20 @@ func (c *LedgerClient) GenerateSubscriptionPayment(ctx context.Context, req *Gen
 		"transaction_id", productTx.UUID,
 		"invoice_number", invoiceNumber,
 		"total_charged", feeBreakdown.TotalCharged,
-		"checkout_url", paymentURL,
+		"checkout_url", instrument.PaymentURL,
 	)
 
 	return &GeneratePaymentResponse{
 		TransactionID:   productTx.UUID,
 		InvoiceNumber:   invoiceNumber,
-		PaymentURL:      paymentURL,
-		PaymentCode:     paymentCode,
+		PaymentURL:      instrument.PaymentURL,
+		PaymentCode:     instrument.PaymentCode,
+		PaymentChannel:  instrument.Channel,
 		ExpiresAt:       expiresAt.Unix(),
 		SellerPrice:     feeBreakdown.SellerPrice,
 		SellerNetAmount: feeBreakdown.SellerNetAmount,
 		PlatformFee:     feeBreakdown.PlatformFee,
-		DokuFee:         feeBreakdown.DokuFee,
+		GatewayFee:      feeBreakdown.GatewayFee,
 		TotalCharged:    feeBreakdown.TotalCharged,
 		FeeModel:        string(feeBreakdown.FeeModel),
 		Currency:        string(currency),
@@ -439,146 +418,155 @@ func (c *LedgerClient) GeneratePaymentGatewayOnCustomer(ctx context.Context, req
 	return c.GeneratePayment(ctx, req)
 }
 
-type NotifyPaymentSuccessRequest struct {
-	TransactionID string
-	InvoiceNumber string
-	PaymentCode   string
-	PaymentURL    string
-	ExpiresAt     int64
-	SellerPrice   int64
-	PlatformFee   int64
-	DokuFee       int64
-	TotalCharged  int64
-	Currency      string
+// paymentInstrumentRequest is what every money-in channel needs, before the differences.
+type paymentInstrumentRequest struct {
+	AccountID     string // Singapay sub-account ULID that will receive the funds
+	Channel       string // Singapay channel code, or "" to issue a payment link
+	Amount        int64  // Total charged, in whole rupiah
+	InvoiceNumber string // Our invoice, sent as the merchant reference on every channel
+	CustomerName  string
+	CustomerEmail string
+	CustomerPhone string
+	Description   string
+	ExpiresAt     time.Time
 }
 
-func (c *LedgerClient) HandlePaymentSuccess(ctx context.Context, req *requests.DokuNotificationRequest) error {
-	dokuResp, dokuErr := c.dokuClient.HandleNotification(req)
-	if dokuErr != nil {
-		return ledgererr.NewError(ledgererr.CodeDokuAPIError, "failed to notify payment success", fmt.Errorf("status: %d, error: %v", dokuErr.StatusCode, dokuErr.Message))
+// paymentInstrument is the part of a Singapay money-in response the ledger keeps.
+type paymentInstrument struct {
+	// GatewayID is Singapay's own id for the instrument — a VA ULID, a numeric link or
+	// QRIS id, an e-wallet id. Stored so a support question can be answered without
+	// guessing which product issued it.
+	GatewayID string
+	// PaymentURL is where to send the payer. QRIS has none: it returns a payload to
+	// render instead, in PaymentCode.
+	PaymentURL string
+	// PaymentCode is the VA number, or the QRIS string to draw.
+	PaymentCode string
+	// Channel is the channel actually used, which is PAYMENT_LINK when none was named.
+	Channel string
+}
+
+// issuePaymentInstrument creates the payment at Singapay, choosing the product from the
+// channel.
+//
+// The choice matters beyond checkout ergonomics. A virtual account, a QRIS charge and an
+// e-wallet order each report the fee Singapay took on that transaction; a payment link
+// reports no fee anywhere — not on the webhook, not on the history row, not on any
+// endpoint. Fee reconciliation is built on that number, so pinning the channel is what
+// keeps it possible. A payment link is issued only when the caller names no channel, which
+// is a deliberate trade rather than a default.
+func (c *LedgerClient) issuePaymentInstrument(ctx context.Context, req paymentInstrumentRequest) (*paymentInstrument, error) {
+	if req.AccountID == "" {
+		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest,
+			"cannot issue a payment against an account with no Singapay sub-account id", nil)
 	}
 
-	if dokuResp.Transaction.Status.String != "SUCCESS" {
-		return ledgererr.NewError(ledgererr.CodeDokuAPIError, "payment status is not paid", fmt.Errorf("status: %s", dokuResp.Transaction.Status.String))
-	}
-
-	// 1. Get the invoice number from the DOKU response
-	if dokuResp.Order == nil || !dokuResp.Order.InvoiceNumber.Valid {
-		return ledgererr.NewError(ledgererr.CodeInvalidRequest, "missing invoice number in notification", nil)
-	}
-	invoiceNumber := dokuResp.Order.InvoiceNumber.String
-
-	// 2. Fetch the corresponding ProductTransaction
-	productTx, err := c.repoProvider.ProductTransaction().GetByInvoiceNumber(ctx, invoiceNumber)
-	if err != nil {
-		if ledgererr.IsAppError(err, repo.ErrNotFound) {
-			return ledgererr.NewError(ledgererr.CodeNotFound, "product transaction not found", err)
+	switch paymentChannelKind(req.Channel) {
+	case channelVirtualAccount:
+		bank, err := vaBankFromChannel(req.Channel)
+		if err != nil {
+			return nil, ledgererr.ErrUnsupportedPaymentChannel.WithError(err)
 		}
-		return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to get product transaction", err)
-	}
-
-	// Double webhook idempotency check: if not PENDING, already processed or terminal
-	if !productTx.IsPending() {
-		c.logger.InfoContext(ctx, "Payment notification received for non-pending transaction", "invoice_number", invoiceNumber, "status", productTx.Status)
-		return nil
-	}
-
-	// 3. Fetch related PaymentRequest
-	paymentReq, err := c.repoProvider.PaymentRequest().GetByProductTransactionID(ctx, productTx.UUID)
-	if err != nil {
-		return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to get payment request", err)
-	}
-
-	// 4. Resolve the system accounts needed for ledger entries
-	platformAccount, err := c.repoProvider.Account().GetPlatformAccount(ctx)
-	if err != nil {
-		return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to get platform account", err)
-	}
-
-	dokuAccount, err := c.repoProvider.Account().GetPaymentGatewayAccount(ctx)
-	if err != nil {
-		return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to get payment gateway account", err)
-	}
-
-	// 5. Create journal for PAYMENT_SUCCESS event
-	journal := domain.NewJournal(
-		domain.EventTypePaymentSuccess,
-		domain.SourceTypeProductTransaction,
-		productTx.UUID,
-		map[string]any{
-			"invoice_number":    invoiceNumber,
-			"seller_price":      productTx.Fee.SellerPrice,
-			"seller_net_amount": productTx.Fee.SellerNetAmount,
-			"platform_fee":      productTx.Fee.PlatformFee,
-			"doku_fee":          productTx.Fee.DokuFee,
-			"fee_model":         productTx.Fee.FeeModel,
-		},
-	)
-
-	// 6. Generate ledger entries (PENDING credit to seller, platform, and doku)
-	ledgerEntries := domain.NewPaymentEntries(
-		journal.UUID,
-		productTx.UUID,
-		productTx.SellerAccountID,
-		productTx.Fee.SellerNetAmount, // Use net amount (accounts for fee model)
-		platformAccount.UUID,
-		productTx.Fee.PlatformFee,
-		dokuAccount.UUID,
-		productTx.Fee.DokuFee,
-	)
-
-	// 7. Persist everything in single transaction
-	err = c.txProvider.Transact(ctx, func(tx repo.Tx) error {
-		// Save journal first
-		if err := tx.Journal().Save(ctx, journal); err != nil {
-			return err
+		// A single invoice is a temporary, closed, single-use account with an expiry.
+		// Note the encoding: Singapay wants 13-digit Unix milliseconds as a *string*
+		// here, where a payment link wants ISO 8601. The helpers keep that straight.
+		va, gwErr := c.gateway.CreateVirtualAccount(ctx, req.AccountID, singapay.CreateVirtualAccountRequest{
+			BankCode:       bank,
+			Kind:           singapay.VATemporary,
+			AmountType:     singapay.VAClosed,
+			Name:           req.CustomerName,
+			MerchantReffNo: req.InvoiceNumber,
+			ExpiredAt:      singapay.MillisTimestamp(req.ExpiresAt),
+			MaxUsage:       1,
+			Amount:         req.Amount,
+		})
+		if gwErr != nil {
+			return nil, ledgererr.NewError(ledgererr.CodeGatewayAPIError, "failed to create virtual account", gwErr)
 		}
+		return &paymentInstrument{
+			GatewayID:   va.ID,
+			PaymentCode: va.Number,
+			Channel:     req.Channel,
+		}, nil
 
-		// Update PaymentRequest to COMPLETED
-		if err := paymentReq.MarkCompleted(); err != nil {
-			return err
+	case channelQRIS:
+		qr, gwErr := c.gateway.GenerateQRIS(ctx, req.AccountID, singapay.GenerateQRISRequest{
+			Amount:         req.Amount,
+			ExpiredAt:      singapay.ISO8601Timestamp(req.ExpiresAt),
+			MerchantReffNo: req.InvoiceNumber,
+		})
+		if gwErr != nil {
+			return nil, ledgererr.NewError(ledgererr.CodeGatewayAPIError, "failed to generate QRIS", gwErr)
 		}
-		if err := tx.PaymentRequest().Update(ctx, paymentReq); err != nil {
-			return err
-		}
+		// QRIS has no hosted page: QRData is the payload the caller renders as a code.
+		return &paymentInstrument{
+			GatewayID:   strconv.FormatInt(qr.ID, 10),
+			PaymentCode: qr.QRData,
+			Channel:     req.Channel,
+		}, nil
 
-		// Update ProductTransaction to COMPLETED
-		if err := productTx.MarkCompleted(); err != nil {
-			return err
+	case channelEwallet:
+		order, gwErr := c.gateway.CreateEwalletOrder(ctx, singapay.CreateEwalletOrderRequest{
+			AccountID:      req.AccountID,
+			Amount:         req.Amount,
+			Vendor:         req.Channel,
+			ExpiredAt:      singapay.ISO8601Timestamp(req.ExpiresAt),
+			CustomerName:   req.CustomerName,
+			CustomerEmail:  req.CustomerEmail,
+			CustomerPhone:  req.CustomerPhone,
+			MerchantReffNo: req.InvoiceNumber,
+		})
+		if gwErr != nil {
+			return nil, ledgererr.NewError(ledgererr.CodeGatewayAPIError, "failed to create e-wallet order", gwErr)
 		}
-		if err := tx.ProductTransaction().UpdateStatus(ctx, productTx.UUID, productTx.Status, *productTx.CompletedAt); err != nil {
-			return err
+		return &paymentInstrument{
+			GatewayID:  strconv.FormatInt(order.ID, 10),
+			PaymentURL: order.CheckoutURL,
+			Channel:    req.Channel,
+		}, nil
+
+	case channelPaymentLink:
+		maxUsage := 1
+		link, gwErr := c.gateway.CreatePaymentLink(ctx, req.AccountID, singapay.CreatePaymentLinkRequest{
+			ReffNo:      req.InvoiceNumber,
+			Description: req.Description,
+			Type:        singapay.PaymentLinkTotal,
+			TotalAmount: req.Amount,
+			MaxUsage:    &maxUsage,
+			// Absolute, not a lifetime in minutes: compute it before calling.
+			ExpiredAt: singapay.ISO8601Timestamp(req.ExpiresAt),
+			// Only accepted when the link resolves to single use, which it does here.
+			CustomerName:  req.CustomerName,
+			CustomerEmail: req.CustomerEmail,
+			CustomerPhone: req.CustomerPhone,
+		})
+		if gwErr != nil {
+			return nil, ledgererr.NewError(ledgererr.CodeGatewayAPIError, "failed to create payment link", gwErr)
 		}
+		return &paymentInstrument{
+			GatewayID:  strconv.FormatInt(link.ID, 10),
+			PaymentURL: link.PaymentURL,
+			Channel:    ChannelPaymentLink,
+		}, nil
 
-		// Insert immutable ledger entries
-		if err := tx.LedgerEntry().SaveBatch(ctx, ledgerEntries); err != nil {
-			return err
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		c.logger.ErrorContext(ctx, "Failed to persist payment success", "invoice_number", invoiceNumber, "error", err)
-		return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to persist payment success transaction", err)
+	default:
+		return nil, ledgererr.ErrUnsupportedPaymentChannel.WithError(
+			fmt.Errorf("payment channel %q is not a Singapay money-in product; expected QRIS, VA_*, EWALLET_*, or empty for a payment link", req.Channel),
+		)
 	}
-
-	c.logger.InfoContext(ctx, "Payment success securely handled", "invoice_number", invoiceNumber, "product_tx_id", productTx.UUID)
-
-	return nil
 }
 
 // CalculateFeesForCustomer returns the fee breakdown without creating a transaction.
 // Useful for showing the buyer the total cost before purchase.
 // Uses GATEWAY_ON_CUSTOMER model: customer pays seller_price + platform_fee + gateway_fee.
-// The response also includes the payment channel with the lowest DOKU fee for the same seller price.
+// The response also includes the payment channel with the lowest gateway fee for the same seller price.
 //
 // platformFeeMultiplier controls platform fee behaviour:
 //   - 0 → skip platform fee entirely
 //   - 1 → normal platform fee (no multiply)
 //   - >1 → platform fee multiplied by this value (e.g. installment with 2 due terms → 2)
 //
-// Gateway/DOKU fee is never multiplied regardless of the multiplier value.
+// The gateway fee is never multiplied regardless of the multiplier value.
 func (c *LedgerClient) CalculateFeesForCustomer(ctx context.Context, sellerPrice int64, paymentChannel string, currency string, platformFeeMultiplier int) (*FeeCalculationResponse, error) {
 	feeConfigs, err := c.repoProvider.FeeConfig().GetAllActive(ctx)
 	if err != nil {
@@ -601,7 +589,7 @@ func (c *LedgerClient) CalculateFeesForCustomer(ctx context.Context, sellerPrice
 		FeeBreakdown: breakdown,
 		CheapestPaymentChannel: CheapestChannelInfo{
 			PaymentChannel: cheapestChannel,
-			DokuFee:        cheapestBreakdown.DokuFee,
+			GatewayFee:     cheapestBreakdown.GatewayFee,
 			TotalCharged:   cheapestBreakdown.TotalCharged,
 		},
 	}, nil

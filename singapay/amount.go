@@ -15,9 +15,9 @@ import (
 // accepts all of them and stores minor units — sen — so nothing is lost on the way in.
 //
 // The ledger works in whole rupiah, so reading one out goes through [Amount.Rupiah],
-// which returns an error rather than rounding. That is deliberate: the DOKU path reads
-// balances with fmt.Sscanf("%d", …), which turns "1234.56" into 1234 and reports success,
-// and a balance comparison that is quietly wrong is worse than one that fails.
+// which returns an error rather than rounding. That is deliberate: reading a balance with
+// fmt.Sscanf("%d", …) turns "1234.56" into 1234 and reports success, and a balance
+// comparison that is quietly wrong is worse than one that fails.
 type Amount struct {
 	minor    int64 // value × 100
 	Currency string
