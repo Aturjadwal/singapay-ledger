@@ -87,6 +87,21 @@ func (c *LedgerClient) GetAccountByDokuSubAccountID(ctx context.Context, dokuSub
 	return account, nil
 }
 
+// GetAccountBySingapayAccountID returns an account by its Singapay sub-account ULID.
+//
+// Not by account number: the number appears only as a transfer beneficiary, and rows that
+// have no number would be unreachable through it.
+func (c *LedgerClient) GetAccountBySingapayAccountID(ctx context.Context, singapayAccountID string) (*domain.Account, error) {
+	account, err := c.repoProvider.Account().GetBySingapayAccountID(ctx, singapayAccountID)
+	if err != nil {
+		if ledgererr.IsAppError(err, repo.ErrNotFound) {
+			return nil, ledgererr.ErrLedgerNotFound.WithError(err)
+		}
+		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to get account", err)
+	}
+	return account, nil
+}
+
 // GetAccountBySellerID returns an account by its seller ID (owner_type=SELLER, owner_id=sellerID).
 func (c *LedgerClient) GetAccountBySellerID(ctx context.Context, sellerID string) (*domain.Account, error) {
 	account, err := c.repoProvider.Account().GetBySellerID(ctx, sellerID)

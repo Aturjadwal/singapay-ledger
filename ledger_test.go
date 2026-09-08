@@ -71,6 +71,15 @@ func (f *FakeAccountRepository) GetByDokuSubAccountID(ctx context.Context, dokuS
 	return nil, repo.ErrNotFound
 }
 
+func (f *FakeAccountRepository) GetBySingapayAccountID(ctx context.Context, singapayAccountID string) (*domain.Account, error) {
+	for _, acc := range f.accounts {
+		if acc.SingapayAccountID != "" && acc.SingapayAccountID == singapayAccountID {
+			return acc, nil
+		}
+	}
+	return nil, repo.ErrNotFound
+}
+
 func (f *FakeAccountRepository) GetBySellerID(ctx context.Context, sellerID string) (*domain.Account, error) {
 	if acc, ok := f.bySeller[sellerID]; ok {
 		return acc, nil

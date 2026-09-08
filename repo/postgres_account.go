@@ -17,24 +17,34 @@ func NewPostgresAccountRepository(db DBTX) *PostgresAccountRepository {
 }
 
 const accountSelectColumns = `
-	uuid, randid, doku_subaccount_id, owner_type, owner_id, currency,
+	uuid, randid, doku_subaccount_id, singapay_account_id, singapay_account_number,
+	owner_type, owner_id, currency,
 	pending_balance, available_balance, total_withdrawal_amount, total_deposit_amount,
 	created_at, updated_at
 `
 
 // scanAccount scans a single row into a domain.Account.
-// It handles the nullable doku_subaccount_id column.
+//
+// Every gateway identifier is nullable: an account is backed by one gateway, so the
+// other's columns are empty, and singapay_account_number can be empty even on a Singapay
+// account because Singapay may not assign one at creation.
 func scanAccount(row interface {
 	Scan(dest ...any) error
 }) (*domain.Account, error) {
 	var a domain.Account
 	redifu.InitRecord(&a)
-	var dokuSubAccountID sql.NullString
+	var (
+		dokuSubAccountID      sql.NullString
+		singapayAccountID     sql.NullString
+		singapayAccountNumber sql.NullString
+	)
 
 	err := row.Scan(
 		&a.UUID,
 		&a.RandId,
 		&dokuSubAccountID,
+		&singapayAccountID,
+		&singapayAccountNumber,
 		&a.OwnerType,
 		&a.OwnerID,
 		&a.Currency,
@@ -52,9 +62,9 @@ func scanAccount(row interface {
 		return nil, ErrFailedScanSQL.WithError(err)
 	}
 
-	if dokuSubAccountID.Valid {
-		a.DokuSubAccountID = dokuSubAccountID.String
-	}
+	a.DokuSubAccountID = dokuSubAccountID.String
+	a.SingapayAccountID = singapayAccountID.String
+	a.SingapayAccountNumber = singapayAccountNumber.String
 
 	return &a, nil
 }
@@ -107,6 +117,21 @@ func (r *PostgresAccountRepository) GetByDokuSubAccountID(ctx context.Context, d
 	return scanAccount(row)
 }
 
+// GetBySingapayAccountID looks an account up by its Singapay ULID.
+//
+// The ULID, not the account number: the number identifies the same account but is only
+// ever used as a transfer beneficiary, and is not present on every row.
+func (r *PostgresAccountRepository) GetBySingapayAccountID(ctx context.Context, singapayAccountID string) (*domain.Account, error) {
+	query := `
+		SELECT` + accountSelectColumns + `
+		FROM ledger_accounts
+		WHERE singapay_account_id = $1
+	`
+
+	row := r.db.QueryRowContext(ctx, query, singapayAccountID)
+	return scanAccount(row)
+}
+
 func (r *PostgresAccountRepository) GetBySellerID(ctx context.Context, sellerID string) (*domain.Account, error) {
 	query := `
 		SELECT` + accountSelectColumns + `
@@ -145,12 +170,15 @@ func (r *PostgresAccountRepository) GetPaymentGatewayAccount(ctx context.Context
 func (r *PostgresAccountRepository) Save(ctx context.Context, account *domain.Account) error {
 	query := `
 		INSERT INTO ledger_accounts (
-			uuid, randid, doku_subaccount_id, owner_type, owner_id, currency,
+			uuid, randid, doku_subaccount_id, singapay_account_id, singapay_account_number,
+			owner_type, owner_id, currency,
 			pending_balance, available_balance, total_withdrawal_amount, total_deposit_amount,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		ON CONFLICT (uuid) DO UPDATE SET
 			doku_subaccount_id      = EXCLUDED.doku_subaccount_id,
+			singapay_account_id     = EXCLUDED.singapay_account_id,
+			singapay_account_number = EXCLUDED.singapay_account_number,
 			owner_type              = EXCLUDED.owner_type,
 			owner_id                = EXCLUDED.owner_id,
 			currency                = EXCLUDED.currency,
@@ -161,10 +189,12 @@ func (r *PostgresAccountRepository) Save(ctx context.Context, account *domain.Ac
 			updated_at              = EXCLUDED.updated_at
 	`
 
-	dokuSubAccountID := sql.NullString{
-		String: account.DokuSubAccountID,
-		Valid:  account.DokuSubAccountID != "",
-	}
+	// Empty is written as NULL, never as "". The unique indexes on these columns are
+	// partial (WHERE ... IS NOT NULL); a literal empty string would collide across every
+	// account that has no identifier for that gateway.
+	dokuSubAccountID := nullIfEmpty(account.DokuSubAccountID)
+	singapayAccountID := nullIfEmpty(account.SingapayAccountID)
+	singapayAccountNumber := nullIfEmpty(account.SingapayAccountNumber)
 
 	_, err := r.db.ExecContext(
 		ctx,
@@ -172,6 +202,8 @@ func (r *PostgresAccountRepository) Save(ctx context.Context, account *domain.Ac
 		account.UUID,
 		account.RandId,
 		dokuSubAccountID,
+		singapayAccountID,
+		singapayAccountNumber,
 		account.OwnerType,
 		account.OwnerID,
 		account.Currency,
@@ -287,4 +319,10 @@ func (r *PostgresAccountRepository) Delete(ctx context.Context, id string) error
 	}
 
 	return nil
+}
+
+// nullIfEmpty maps "" to SQL NULL, keeping the partial unique indexes on the gateway
+// identifier columns meaningful.
+func nullIfEmpty(s string) sql.NullString {
+	return sql.NullString{String: s, Valid: s != ""}
 }

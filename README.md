@@ -19,7 +19,14 @@
 
 Accept payments via QRIS, Virtual Account, and more — with built-in balance tracking, settlement reconciliation, and disbursement. No manual ledger wiring required.
 
-> **This package is built for DOKU and DOKU only.** Account creation, balance inquiry, bank account validation, withdrawals, and settlement reconciliation are all implemented against DOKU APIs and CSV formats. It is not designed to be payment-gateway-agnostic.
+> **Every `LedgerClient` operation still runs on DOKU.** Account creation, payments,
+> balance inquiry, bank account validation, withdrawals and settlement reconciliation are
+> implemented against DOKU APIs and CSV formats.
+>
+> A complete **Singapay** API client ships alongside in [`singapay/`](singapay/) and is
+> usable on its own today — but it is **not wired into `LedgerClient` yet**. Calling it
+> directly transacts against Singapay; it does not record anything in the ledger. See
+> [Singapay](#singapay-migration-in-progress) below.
 
 ---
 
@@ -52,6 +59,8 @@ ledger/
 │   ├── settlement_batch.go
 │   └── settlement_item.go
 ├── repo/                  # Repository interfaces + PostgreSQL implementations
+├── singapay/              # Singapay API client — standalone, not yet wired to LedgerClient
+├── cmd/singapay-smoke/    # Verifies a Singapay connection end to end
 ├── docs/                  # Architecture docs and reconciliation flow diagrams
 └── analytics/             # Read-side analytics queries
 ```
@@ -282,9 +291,108 @@ becomes the wrong place for every platform fee. This package only ever reads it.
 
 ---
 
+## Singapay (migration in progress)
+
+[`singapay/`](singapay/) is a full client for the Singapay merchant API — the intended
+replacement for DOKU. It speaks HTTP and returns Singapay's own shapes; it touches no
+database and knows nothing about the ledger domain.
+
+**What is ready**
+
+| Area | Covered |
+|---|---|
+| Security | access-token, request and webhook signatures (three separate HMAC-SHA512 schemes) |
+| Sub-accounts | create, get, list, update |
+| Money in | Payment Link, Virtual Account, QRIS, e-wallet |
+| Money out | disbursement, check-fee, check-beneficiary, inquiry-status |
+| Transfers | between sub-accounts |
+| Balances | merchant and per-account |
+| Webhooks | parsers for money-in (4 channels), disbursement and settlement |
+
+**What is not**
+
+- `LedgerClient` does not call it. `GeneratePayment`, `HandlePaymentSuccess`, `Withdraw`
+  and `ProcessReconciliation` all still go to DOKU, and `NewLedgerClient` still takes a
+  DOKU client. A caller wanting payments recorded in the ledger must still use DOKU.
+- Reconciliation is unsolved: Singapay has no equivalent of DOKU's settlement CSV.
+- Nothing has been verified against a live Singapay environment.
+
+`ledger_accounts` already carries `singapay_account_id` and `singapay_account_number`
+(migrations 016/017), and `domain.Account` reads both — Singapay names one sub-account
+with two identifiers, and an account transfer accepts only the number.
+
+**Verifying a connection**
+
+```bash
+go run ./cmd/singapay-smoke                    # credentials, IP allowlist, token
+go run ./cmd/singapay-smoke -step signature    # which X-Timestamp format is accepted
+go run ./cmd/singapay-smoke -step va   -account-id 01K9... -amount 10000
+go run ./cmd/singapay-smoke -step qris -account-id 01K9... -amount 10000
+```
+
+Full mapping of every DOKU call to its Singapay equivalent, plus the open questions:
+[105 — Singapay Migration](docs/105-singapay-migration.md).
+
+---
+
+## Environment variables
+
+This package reads no environment itself — `LedgerClient` takes a `*sql.DB` and a gateway
+client, both constructed by the host application. The variables below are read by the
+gateway clients and by the tooling in `cmd/`.
+
+### Database
+
+| Variable | Required | Notes |
+|---|---|---|
+| `DATABASE_URL` | yes | PostgreSQL DSN. Consumed by the host application, which passes the `*sql.DB` to `NewLedgerClient`. |
+
+### DOKU — required today
+
+Read by `github.com/21strive/doku` via `config.InitConfigFromEnv()`.
+
+| Variable | Required | Notes |
+|---|---|---|
+| `DOKU_API_CLIENT_ID` | yes | |
+| `DOKU_API_SECRET_KEY` | yes | |
+| `DOKU_API_PRIVATE_KEY` | yes | RSA key for request signing |
+| `DOKU_PRINT_CURL` | no | Mirrors outgoing calls to the log as curl, **headers included**. Off in production by default; set explicitly to override either way. |
+| `TRANSACTION_FEE_*` | no | Per-channel rates with built-in defaults. Used only by DOKU's own settlement fee calculator — this package's fee maths reads the `fee_configs` table instead. |
+
+### Singapay — required only when using `singapay/`
+
+Read by `singapay.ConfigFromEnv()` / `singapay.NewFromEnv()`, and by
+`cmd/singapay-smoke`. Passing a `singapay.Config` directly needs none of them.
+
+| Variable | Required | Notes |
+|---|---|---|
+| `SINGAPAY_CLIENT_ID` | yes | |
+| `SINGAPAY_CLIENT_SECRET` | yes | HMAC key for **every** signature, and the key that verifies inbound webhooks. Never leaves the process. |
+| `SINGAPAY_PARTNER_ID` | yes | Merchant API key, sent as `X-PARTNER-ID` |
+| `SINGAPAY_PRODUCTION` | no | `true` targets production. Anything else — including unset — stays on sandbox. |
+| `SINGAPAY_BASE_URL` | no | Overrides the host entirely. For tests against a stub. |
+| `SINGAPAY_TIMESTAMP_FORMAT` | no | `unix` (default) or `iso`. |
+
+Two notes worth reading before deploying:
+
+- **`SINGAPAY_TIMESTAMP_FORMAT` exists because Singapay's documentation contradicts
+  itself.** The signing guide says `X-Timestamp` is Unix seconds; the OpenAPI spec for
+  the disbursement endpoint says ISO-8601. A wrong guess surfaces only as `SP016`. It is
+  an environment variable so flipping it needs no release — `cmd/singapay-smoke -step
+  signature` reports which one the server actually accepts.
+- **Singapay requires an IP allowlist**, sandbox included. Register every outbound IP,
+  workers as well as web, in the merchant dashboard. Requests from elsewhere fail
+  `SP017`, not with a network error.
+
+Webhook URLs (`transaction_notif_url`, `disbursement_notif_url`, `settlement_notif_url`)
+are configured in the Singapay dashboard, not through environment variables.
+
+---
+
 ## Docs
 
 - [101 — Payment Execution](docs/101-payment-execution.md)
 - [102 — Settlement & Reconciliation](docs/102-settlement-reconciliation.md)
 - [103 — Withdrawal / Disbursement](docs/103-withdrawal-disbursement.md)
 - [104 — Fee Mismatch Reconciliation](docs/104-fee-mismatch-reconciliation.md)
+- [105 — Singapay Migration](docs/105-singapay-migration.md)

@@ -2,6 +2,12 @@ CREATE TABLE ledger_accounts (
     uuid VARCHAR(255) PRIMARY KEY,
     randid VARCHAR(255) NOT NULL UNIQUE,
     doku_subaccount_id VARCHAR(100) UNIQUE,
+    -- Singapay names one sub-account with two different identifiers (migration 016).
+    -- singapay_account_id is the ULID used by every endpoint; singapay_account_number is
+    -- the 12-digit form, accepted only as an account transfer's beneficiary and nullable
+    -- because Singapay may not assign one at creation.
+    singapay_account_id VARCHAR(64),
+    singapay_account_number VARCHAR(32),
     owner_type VARCHAR(20) NOT NULL CHECK (
         owner_type IN (
             'SELLER',
@@ -30,6 +36,16 @@ WHERE
 CREATE UNIQUE INDEX idx_accounts_unique_payment_gateway ON ledger_accounts(owner_type)
 WHERE
     owner_type = 'PAYMENT_GATEWAY';
+
+-- Singapay identifiers (migration 016). Partial, because most rows legitimately have
+-- neither while they are still DOKU-only.
+CREATE UNIQUE INDEX idx_ledger_accounts_singapay_account_id ON ledger_accounts(singapay_account_id)
+WHERE
+    singapay_account_id IS NOT NULL;
+
+CREATE UNIQUE INDEX idx_ledger_accounts_singapay_account_number ON ledger_accounts(singapay_account_number)
+WHERE
+    singapay_account_number IS NOT NULL;
 
 -- Journals: Represents atomic accounting events
 -- Each journal groups related ledger_entries into a single business event
@@ -303,21 +319,11 @@ CREATE TABLE IF NOT EXISTS fee_configs (
     uuid VARCHAR(255) PRIMARY KEY,
     randid VARCHAR(255) NOT NULL UNIQUE,
     config_type VARCHAR(20) NOT NULL CHECK (config_type IN ('PLATFORM', 'DOKU')),
-    payment_channel VARCHAR(50) CHECK (
-        payment_channel IN (
-            'QRIS',
-            'VIRTUAL_ACCOUNT_MANDIRI',
-            'VIRTUAL_ACCOUNT_BCA',
-            'VIRTUAL_ACCOUNT_BNI',
-            'VIRTUAL_ACCOUNT_BRI',
-            'VIRTUAL_ACCOUNT',
-            'CREDIT_CARD',
-            'E_WALLET',
-            'PLATFORM'
-        )
-    ),
+    -- Deliberately unconstrained (migration 017): channel codes are spelled by the
+    -- gateway itself and change when it adds one, so a whitelist here can only go stale.
+    payment_channel VARCHAR(50),
     name VARCHAR(100) NOT NULL DEFAULT '',
-    fee_type VARCHAR(20) NOT NULL CHECK (fee_type IN ('FIXED', 'PERCENTAGE')),
+    fee_type VARCHAR(20) NOT NULL CHECK (fee_type IN ('FIXED', 'PERCENTAGE', 'HYBRID')),
     fixed_amount BIGINT DEFAULT 0,
     percentage DECIMAL(10, 6) DEFAULT 0,
     is_active BOOLEAN DEFAULT TRUE,

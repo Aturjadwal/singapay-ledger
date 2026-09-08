@@ -22,6 +22,11 @@ This folder contains high-level architecture diagrams and technical documentatio
     - Covers adjustment rules for both fee models (`GATEWAY_ON_CUSTOMER`, `GATEWAY_ON_SELLER`).
     - Documents the `FEE_ADJUSTMENT` ledger entry type and its terminal nature.
 
+5. **Singapay Migration Reference** ([`105-singapay-migration.md`](./105-singapay-migration.md))
+    - Maps every DOKU call in this repo to its Singapay equivalent (sub-account, payment, payout, transfer, balance, bank inquiry, reconciliation).
+    - Documents how Singapay operates: account hierarchy, pending → available money cycle, the three signature schemes, and the full endpoint catalogue.
+    - Flags what is **not** 1:1 — settlement CSV has no equivalent, Payment Link exposes no per-transaction fee, sub-account creation is not idempotent.
+
 ## Maintenance
 
 Diagrams are maintained in Markdown using Mermaid JS. To edit:
