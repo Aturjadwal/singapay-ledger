@@ -80,8 +80,15 @@ type CreateAccountRequest struct {
 	Name string      `json:"name"`
 	Type AccountType `json:"account_type"`
 
-	// InviteMembers grants dashboard access to additional emails. The calling
-	// merchant's own login is always granted regardless.
+	// InviteMembers grants dashboard access to the new sub-account. The calling
+	// merchant's own login is always granted regardless, so this is only for handing
+	// a colleague access to one account.
+	//
+	// Every address here must ALREADY be a member of the calling merchant. Singapay
+	// answers an address that is not with "http 422: One or more emails do not belong
+	// to a member of this merchant" and creates nothing — so this cannot be used to
+	// enrol a sub-merchant, a seller, or anyone else outside the merchant. There is no
+	// API for adding a merchant member; that happens in the dashboard.
 	//
 	// Note this is the only place an email appears. Singapay does not identify a
 	// sub-account by email — the ULID does that — and imposes no length limit on one.
@@ -131,7 +138,9 @@ type UpdateAccountRequest struct {
 	Name   string        `json:"name,omitempty"`
 	Status AccountStatus `json:"status,omitempty"`
 	// InviteMembers *replaces* the member list entirely. Omitting it leaves the
-	// current members alone; sending an empty list is not the same thing.
+	// current members alone; sending an empty list is not the same thing. The same
+	// constraint as on create applies: every address must already be a member of the
+	// calling merchant, or the call is a 422 and nothing changes.
 	InviteMembers []string `json:"invite_members,omitempty"`
 }
 

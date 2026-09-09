@@ -100,7 +100,7 @@ Konsekuensi memilih `owned` yang perlu diketahui (bukan penghalang, tapi keputus
 | Nama yang dilihat pembeli saat bayar | **nama Master Account (platform)**, bukan nama seller |
 | Penerima invoice | Master Account |
 | Konfigurasi webhook | otomatis mewarisi milik Master Account — **satu URL untuk semua seller**, tidak perlu setup per seller |
-| Akses seller ke dashboard | tidak ada, kecuali di-`invite_members` secara eksplisit |
+| Akses seller ke dashboard | **tidak ada, dan tidak bisa diberikan lewat API** — lihat §5.1 |
 
 Dua yang pertama perlu dicek terhadap perilaku DOKU hari ini kalau branding seller di
 halaman bayar itu penting. Yang ketiga justru menguntungkan repo ini: satu
@@ -408,7 +408,7 @@ field `event` di body**.
 | | DOKU | Singapay |
 | --- | --- | --- |
 | Endpoint | `POST /sac-merchant/v1/accounts` | `POST /api/v1.0/accounts` |
-| Body | `{account:{email,type:"STANDARD",name}}` | `{name, account_type:"owned", invite_members?:[email]}` |
+| Body | `{account:{email,type:"STANDARD",name}}` | `{name, account_type:"owned"}` — **tanpa email** |
 | ID hasil | `SAC-xxxx-xxxx` | ULID, mis. `01K946KF851RK7FX075GJHBVKF` |
 | Duplikat | 409 kalau email sudah dipakai | **tidak ada proteksi** |
 
@@ -430,7 +430,24 @@ Dampak ke kode:
   [doku_subaccount.go](../doku_subaccount.go) menjadi tidak relevan.** Batasan DOKU
   (email ≤ 40 karakter, nama huruf saja ≤ 100) tidak ada padanannya di skema Singapay.
   Jangan dibawa migrasi tanpa dikonfirmasi ulang — sanitasi yang tidak dibutuhkan justru
-  memotong nama seller tanpa alasan.
+  memotong nama seller tanpa alasan. `validateSubAccountEmail` akhirnya dihapus, karena
+  emailnya sendiri tidak lagi dikirim (poin berikutnya).
+- **`invite_members` tidak bisa dipakai untuk seller, dan email seller tidak boleh
+  dikirim sama sekali.** Ini baru ketahuan saat mencoba di staging: implementasi awal
+  mengirim `invite_members: [email seller]`, dan Singapay menolaknya dengan
+
+  ```
+  http 422: One or more emails do not belong to a member of this merchant.
+  ```
+
+  `invite_members` bukan undangan ke orang luar — ia hanya memberi akses dashboard ke
+  alamat yang **sudah menjadi member merchant kita**. Email seller tidak akan pernah
+  memenuhi syarat itu, dan tidak ada endpoint untuk menambah member merchant (itu
+  dilakukan di dashboard). Efeknya fatal karena `CreateAccount` dipanggil di dalam
+  booking berbayar **pertama** setiap seller: selama field ini terkirim, booking pertama
+  setiap seller baru gagal dengan 500. Body-nya sekarang benar-benar hanya
+  `{name, account_type}` — sama seperti contoh di atas dan sama seperti yang sudah
+  dipakai `cmd/singapay-smoke`.
 - **`Account.DokuSubAccountID` harus menyimpan dua nilai, bukan satu**: `id` (ULID, untuk
   path parameter dan `account_id` di body) **dan** `account_number` (12 digit, satu-satunya
   cara menunjuk akun tujuan di account transfer). `account_number` bertipe nullable di

@@ -112,7 +112,15 @@ func (c *LedgerClient) GetAccountBySellerID(ctx context.Context, sellerID string
 // the same name — so a retry after a timeout can leave behind an account that holds money
 // and that nothing references. The existing-row check runs first for exactly that reason,
 // and a caller retrying a timeout must check for the account before calling again.
-func (c *LedgerClient) CreateAccount(ctx context.Context, accountID string, email, name string, currency domain.Currency) (*domain.Account, error) {
+//
+// No email is sent, and that is deliberate rather than an omission. The only place an
+// email could go is invite_members, and Singapay rejects any address that is not already
+// a member of *our* merchant — "http 422: One or more emails do not belong to a member of
+// this merchant." A seller's own address never is, so passing it failed every seller's
+// first paid booking. invite_members grants an existing colleague dashboard access to a
+// sub-account; it is not a way to enrol a stranger. Sellers get no Singapay dashboard,
+// which is what an `owned` sub-account means in the first place.
+func (c *LedgerClient) CreateAccount(ctx context.Context, accountID string, name string, currency domain.Currency) (*domain.Account, error) {
 	// Check for existing account
 	existing, err := c.repoProvider.Account().GetByOwner(ctx, domain.OwnerTypeSeller, accountID)
 	if err == nil {
@@ -125,9 +133,6 @@ func (c *LedgerClient) CreateAccount(ctx context.Context, accountID string, emai
 	// This call sits inside the seller's first paid booking — the worst possible place
 	// to discover a 4xx from an unusual display name.
 	sanitizedName := sanitizeSubAccountName(name)
-	if err := validateSubAccountEmail(email); err != nil {
-		return nil, err
-	}
 	if sanitizedName != name {
 		c.logger.InfoContext(ctx, "Sub-account name sanitized for Singapay", "owner_id", accountID, "original", name, "sanitized", sanitizedName)
 	}
@@ -137,9 +142,8 @@ func (c *LedgerClient) CreateAccount(ctx context.Context, accountID string, emai
 	// at Singapay must approve — and an inactive account cannot accept the payment that
 	// is waiting on this call.
 	account, gwErr := c.gateway.CreateAccount(ctx, singapay.CreateAccountRequest{
-		Name:          sanitizedName,
-		Type:          singapay.AccountTypeOwned,
-		InviteMembers: []string{strings.TrimSpace(email)},
+		Name: sanitizedName,
+		Type: singapay.AccountTypeOwned,
 	})
 	if gwErr != nil {
 		c.logger.ErrorContext(ctx, "Singapay CreateAccount failed", "owner_id", accountID, "error", gwErr)

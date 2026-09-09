@@ -301,9 +301,3 @@ func repeatString(s string, n int) string {
 	}
 	return out
 }
-
-func TestValidateSubAccountEmail(t *testing.T) {
-	assert.NoError(t, validateSubAccountEmail("seller@example.com"))
-	assert.Error(t, validateSubAccountEmail(""), "an account nobody can open in the dashboard is unsupportable")
-	assert.Error(t, validateSubAccountEmail("not-an-email"))
-}

@@ -32,6 +32,25 @@ HMAC signature before reading any field. `HandleDisbursementNotification` is new
 **required**: a Singapay payout is asynchronous, so without it a seller's balance stays
 reserved against a payout that already failed.
 
+**`CreateAccount` takes no email.** The signature is now
+`CreateAccount(ctx, accountID, name string, currency)` — the `email` argument is gone, and
+`validateSubAccountEmail` with it.
+
+```go
+// Before
+client.CreateAccount(ctx, seller.UUID, seller.Email, seller.Name, domain.CurrencyIDR)
+// After
+client.CreateAccount(ctx, seller.UUID, seller.Name, domain.CurrencyIDR)
+```
+
+The email had one destination, `invite_members`, and Singapay rejects any address there
+that is not already a member of the calling merchant — `http 422: One or more emails do not
+belong to a member of this merchant`. A seller's own address never is, and there is no API
+for adding a merchant member, so the field cannot carry a seller at all. Because this call
+sits inside a seller's **first paid booking**, sending it failed that booking outright with
+a 500. Sellers get no Singapay dashboard access; that is what an `owned` sub-account has
+always meant here.
+
 **Payment channels are Singapay's codes.** `QRIS`, `VA_BCA`, `EWALLET_DANA` — from
 `GET /payment-link-manage/payment-methods`. `VIRTUAL_ACCOUNT_MANDIRI` and the other DOKU
 spellings are not accepted anywhere in the API. The channel now selects the product that

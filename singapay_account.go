@@ -1,10 +1,6 @@
 package ledger
 
-import (
-	"strings"
-
-	"github.com/Aturjadwal/singapay-ledger/ledgererr"
-)
+import "strings"
 
 const (
 	// maxSubAccountNameLength bounds the name sent to POST /api/v1.0/accounts.
@@ -72,22 +68,7 @@ func truncateRunes(s string, max int) string {
 
 func utf8RuneStart(b byte) bool { return b&0xC0 != 0x80 }
 
-// validateSubAccountEmail checks the address that will be granted dashboard access to the
-// new sub-account.
-//
-// Singapay carries it in invite_members rather than using it as the account's identity,
-// so it is not permanent the way it was under the previous gateway and a bad one is
-// recoverable. It is still required: an account nobody can open in the dashboard is an
-// account nobody can support.
-func validateSubAccountEmail(email string) error {
-	trimmed := strings.TrimSpace(email)
-	if trimmed == "" {
-		return ledgererr.NewError(ledgererr.CodeInvalidRequest,
-			"a sub-account cannot be created without an email to grant dashboard access to", nil)
-	}
-	if !strings.Contains(trimmed, "@") {
-		return ledgererr.NewError(ledgererr.CodeInvalidRequest,
-			"invite email must be a valid address", nil)
-	}
-	return nil
-}
+// Sub-account creation takes no email. Singapay identifies an account by its ULID, and
+// the one field that accepts an address — invite_members — only accepts addresses that
+// already belong to a member of our merchant; anything else is a 422. A seller's own
+// address never qualifies, so there is nothing to validate here any more.
