@@ -128,6 +128,12 @@ type fakeGateway struct {
 	inquiry    *singapay.Disbursement
 	inquiryErr error
 	inquiries  int
+
+	// verifyWebhook scripts signature verification for the webhook tests. Leaving it nil
+	// keeps the money-out tests' behaviour: reaching verification is a panic, because a
+	// path that was not supposed to check a signature quietly returning "valid" is worse
+	// than a crash.
+	verifyWebhook func(singapay.WebhookRequest) error
 }
 
 var _ PaymentGateway = (*fakeGateway)(nil)
@@ -205,8 +211,11 @@ func (f *fakeGateway) CheckBeneficiary(context.Context, string, string) (*singap
 func (f *fakeGateway) TransferBetweenAccounts(context.Context, string, singapay.TransferRequest) (*singapay.AccountTransfer, error) {
 	panic("fakeGateway.TransferBetweenAccounts: not scripted for this test")
 }
-func (f *fakeGateway) VerifyWebhook(singapay.WebhookRequest) error {
-	panic("fakeGateway.VerifyWebhook: not scripted for this test")
+func (f *fakeGateway) VerifyWebhook(req singapay.WebhookRequest) error {
+	if f.verifyWebhook == nil {
+		panic("fakeGateway.VerifyWebhook: not scripted for this test")
+	}
+	return f.verifyWebhook(req)
 }
 
 // payoutWithStatus builds a Singapay disbursement carrying a given two-digit transaction

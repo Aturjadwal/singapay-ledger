@@ -286,6 +286,38 @@ func (r *PostgresProductTransactionRepository) UpdateStatus(ctx context.Context,
 	return nil
 }
 
+// UpdateStatusIf performs the compare-and-set described on
+// domain.ProductTransactionRepository. A false return is not an error: it is the answer
+// "somebody else already moved this row".
+func (r *PostgresProductTransactionRepository) UpdateStatusIf(ctx context.Context, id string, from, to domain.TransactionStatus, timestamp time.Time) (bool, error) {
+	var query string
+	var args []any
+
+	switch to {
+	case domain.TransactionStatusCompleted:
+		query = `UPDATE product_transactions SET status = $1, completed_at = $2 WHERE uuid = $3 AND status = $4`
+		args = []any{to, timestamp, id, from}
+	case domain.TransactionStatusSettled:
+		query = `UPDATE product_transactions SET status = $1, settled_at = $2 WHERE uuid = $3 AND status = $4`
+		args = []any{to, timestamp, id, from}
+	default:
+		query = `UPDATE product_transactions SET status = $1 WHERE uuid = $2 AND status = $3`
+		args = []any{to, id, from}
+	}
+
+	result, err := r.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return false, ErrFailedInsertSQL.WithError(err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, ErrFailedQuerySQL.WithError(err)
+	}
+
+	return rowsAffected > 0, nil
+}
+
 // scanOne scans a single row into a ProductTransaction
 func (r *PostgresProductTransactionRepository) scanOne(ctx context.Context, query string, args ...any) (*domain.ProductTransaction, error) {
 	rows, err := r.db.QueryContext(ctx, query, args...)

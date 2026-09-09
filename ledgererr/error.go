@@ -88,6 +88,13 @@ const (
 	// a handler can answer 401 rather than 400 and so forged deliveries are countable.
 	CodeWebhookVerificationFailed ErrorCode = 401001
 
+	// CodeWebhookAmountMismatch is a verified money-in webhook reporting that the payer
+	// was charged less than the transaction was priced at. It is a refusal to book, not
+	// a signature problem: the delivery is genuine and the money is real, but crediting
+	// the full price against a partial payment would put money in a seller's balance
+	// that never arrived.
+	CodeWebhookAmountMismatch ErrorCode = 409008
+
 	CodeSubaccountAlreadyExists ErrorCode = 409001
 
 	// Ledger error codes
@@ -196,6 +203,15 @@ var (
 	ErrSettlementItemNotFound       = NewError(CodeSettlementItemNotFound, "settlement item not found", nil)
 
 	ErrInvalidRequest = NewError(CodeInvalidRequest, "invalid request", nil)
+)
+
+// Webhook errors
+var (
+	// ErrWebhookAmountMismatch refuses a verified money-in webhook whose charged amount
+	// falls short of what the transaction was priced at. Nothing is booked and the
+	// transaction stays PENDING, so a corrected delivery — or a human — can still settle
+	// it. See HandlePaymentSuccess for why an overpayment is booked instead.
+	ErrWebhookAmountMismatch = NewError(CodeWebhookAmountMismatch, "webhook amount does not match the transaction", nil)
 )
 
 // Gateway errors

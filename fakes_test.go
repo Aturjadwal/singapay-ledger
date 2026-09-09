@@ -214,6 +214,10 @@ func (f *FakeLedgerEntryRepository) GetLastBalanceAfter(ctx context.Context, acc
 type FakeProductTransactionRepository struct {
 	transactions map[string]*domain.ProductTransaction
 	byInvoice    map[string]*domain.ProductTransaction
+
+	// beforeCAS, when set, runs once immediately before UpdateStatusIf compares. It is
+	// how a test lands a concurrent delivery inside the read-then-write window.
+	beforeCAS func()
 }
 
 func NewFakeProductTransactionRepository() *FakeProductTransactionRepository {
@@ -223,16 +227,27 @@ func NewFakeProductTransactionRepository() *FakeProductTransactionRepository {
 	}
 }
 
+// detach copies a stored transaction on the way out, the way a real read does.
+//
+// Handing back the stored pointer makes a test that mutates what it read also mutate the
+// "row", which quietly turns a read-then-conditional-write into a single aliased object —
+// and that is exactly the shape the compare-and-set exists to defend against. The fake has
+// to be able to disagree with the caller's copy or it cannot model the race at all.
+func detach(tx *domain.ProductTransaction) *domain.ProductTransaction {
+	copied := *tx
+	return &copied
+}
+
 func (f *FakeProductTransactionRepository) GetByID(ctx context.Context, id string) (*domain.ProductTransaction, error) {
 	if tx, ok := f.transactions[id]; ok {
-		return tx, nil
+		return detach(tx), nil
 	}
 	return nil, repo.ErrNotFound
 }
 
 func (f *FakeProductTransactionRepository) GetByInvoiceNumber(ctx context.Context, invoiceNumber string) (*domain.ProductTransaction, error) {
 	if tx, ok := f.byInvoice[invoiceNumber]; ok {
-		return tx, nil
+		return detach(tx), nil
 	}
 	return nil, repo.ErrNotFound
 }
@@ -279,6 +294,40 @@ func (f *FakeProductTransactionRepository) UpdateStatus(ctx context.Context, id 
 		tx.SettledAt = &timestamp
 	}
 	return nil
+}
+
+// UpdateStatusIf is the fake's compare-and-set. It is not concurrency-safe and does not
+// need to be — the map behind it is not either — but it reproduces the property the real
+// one is there for: the second caller to ask for the same transition is told no.
+//
+// beforeCAS runs just before the comparison, which is where a test injects the concurrent
+// delivery that commits first. In Postgres that window is closed by the row lock; here it
+// is opened deliberately, because the point is to prove the loser writes nothing.
+func (f *FakeProductTransactionRepository) UpdateStatusIf(ctx context.Context, id string, from, to domain.TransactionStatus, timestamp time.Time) (bool, error) {
+	if f.beforeCAS != nil {
+		hook := f.beforeCAS
+		f.beforeCAS = nil // once: the injected delivery must not recurse into itself
+		hook()
+	}
+	return f.updateStatusIf(id, from, to, timestamp)
+}
+
+func (f *FakeProductTransactionRepository) updateStatusIf(id string, from, to domain.TransactionStatus, timestamp time.Time) (bool, error) {
+	tx, ok := f.transactions[id]
+	if !ok {
+		return false, repo.ErrNotFound
+	}
+	if tx.Status != from {
+		return false, nil
+	}
+	tx.Status = to
+	switch to {
+	case domain.TransactionStatusCompleted:
+		tx.CompletedAt = &timestamp
+	case domain.TransactionStatusSettled:
+		tx.SettledAt = &timestamp
+	}
+	return true, nil
 }
 
 func (f *FakeProductTransactionRepository) SaveTransferRequestID(ctx context.Context, id string, requestID string) error {
@@ -526,6 +575,73 @@ func (f *FakeReconciliationDiscrepancyRepository) MarkResolved(ctx context.Conte
 	return nil // Stub - implement if needed
 }
 
+// FakePaymentRequestRepository provides in-memory payment-request storage, keyed the two
+// ways the money-in webhook looks one up.
+type FakePaymentRequestRepository struct {
+	byID      map[string]*domain.PaymentRequest
+	byProduct map[string]*domain.PaymentRequest
+
+	// updates counts Update calls, so a duplicate delivery can be shown to have written
+	// nothing rather than merely to have returned nil.
+	updates int
+}
+
+func NewFakePaymentRequestRepository() *FakePaymentRequestRepository {
+	return &FakePaymentRequestRepository{
+		byID:      make(map[string]*domain.PaymentRequest),
+		byProduct: make(map[string]*domain.PaymentRequest),
+	}
+}
+
+func (f *FakePaymentRequestRepository) GetByID(ctx context.Context, id string) (*domain.PaymentRequest, error) {
+	if pr, ok := f.byID[id]; ok {
+		return pr, nil
+	}
+	return nil, repo.ErrNotFound
+}
+
+func (f *FakePaymentRequestRepository) GetByRequestID(ctx context.Context, requestID string) (*domain.PaymentRequest, error) {
+	for _, pr := range f.byID {
+		if pr.RequestID == requestID {
+			return pr, nil
+		}
+	}
+	return nil, repo.ErrNotFound
+}
+
+func (f *FakePaymentRequestRepository) GetByPaymentCode(ctx context.Context, paymentCode string) (*domain.PaymentRequest, error) {
+	for _, pr := range f.byID {
+		if pr.PaymentCode == paymentCode {
+			return pr, nil
+		}
+	}
+	return nil, repo.ErrNotFound
+}
+
+func (f *FakePaymentRequestRepository) GetByProductTransactionID(ctx context.Context, productTransactionID string) (*domain.PaymentRequest, error) {
+	if pr, ok := f.byProduct[productTransactionID]; ok {
+		return pr, nil
+	}
+	return nil, repo.ErrNotFound
+}
+
+func (f *FakePaymentRequestRepository) GetPendingExpired(ctx context.Context, before time.Time) ([]*domain.PaymentRequest, error) {
+	return nil, nil
+}
+
+func (f *FakePaymentRequestRepository) Save(ctx context.Context, pr *domain.PaymentRequest) error {
+	f.byID[pr.UUID] = pr
+	f.byProduct[pr.ProductTransactionUUID] = pr
+	return nil
+}
+
+func (f *FakePaymentRequestRepository) Update(ctx context.Context, pr *domain.PaymentRequest) error {
+	f.updates++
+	f.byID[pr.UUID] = pr
+	f.byProduct[pr.ProductTransactionUUID] = pr
+	return nil
+}
+
 // FakeRepositoryProvider implements repo.RepositoryProvider interface
 // This allows us to inject fakes into LedgerClient
 type FakeRepositoryProvider struct {
@@ -537,6 +653,7 @@ type FakeRepositoryProvider struct {
 	journalRepo                   *FakeJournalRepository
 	reconciliationDiscrepancyRepo *FakeReconciliationDiscrepancyRepository
 	disbursementRepo              *FakeDisbursementRepository
+	paymentRequestRepo            *FakePaymentRequestRepository
 }
 
 // Ensure FakeRepositoryProvider implements repo.RepositoryProvider at compile time
@@ -555,6 +672,7 @@ func NewFakeRepositoryProvider() *FakeRepositoryProvider {
 		journalRepo:                   NewFakeJournalRepository(),
 		reconciliationDiscrepancyRepo: NewFakeReconciliationDiscrepancyRepository(),
 		disbursementRepo:              NewFakeDisbursementRepository(),
+		paymentRequestRepo:            NewFakePaymentRequestRepository(),
 	}
 }
 
@@ -587,7 +705,7 @@ func (f *FakeRepositoryProvider) ReconciliationDiscrepancy() domain.Reconciliati
 }
 
 func (f *FakeRepositoryProvider) PaymentRequest() domain.PaymentRequestRepository {
-	return nil // Not needed for reconciliation tests
+	return f.paymentRequestRepo
 }
 
 func (f *FakeRepositoryProvider) FeeConfig() domain.FeeConfigRepository {

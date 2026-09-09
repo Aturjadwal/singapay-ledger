@@ -2,6 +2,8 @@ package ledger
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/21strive/ledger/domain"
@@ -15,6 +17,12 @@ import (
 // Singapay's own guidance is five minutes. What happens to a stale delivery is a separate
 // decision, taken in warnIfStale: a forged webhook is refused, a late one is not.
 const webhookReplayTolerance = 5 * time.Minute
+
+// errAlreadyBooked aborts the money-in transaction when the compare-and-set finds the
+// row already moved out of PENDING — a concurrent delivery won the race. It never leaves
+// HandlePaymentSuccess: it exists to roll the transaction back without writing anything,
+// and the caller is answered with success, because a duplicate delivery is not a failure.
+var errAlreadyBooked = errors.New("ledger: product transaction was booked by a concurrent delivery")
 
 // HandlePaymentSuccess books a money-in webhook: the payer paid, so the seller, the
 // platform and the gateway expense account each get their PENDING entry.
@@ -90,19 +98,58 @@ func (c *LedgerClient) HandlePaymentSuccess(ctx context.Context, req singapay.We
 	// What the payer was actually charged, which is not always the transaction's own
 	// amount field: QRIS adds a tip into total_amount, and e-wallet's documented sample
 	// shows amount as the net against a gross total_amount.
-	charged, chargedErr := notification.Charged().Rupiah()
-	if chargedErr != nil {
-		c.logger.WarnContext(ctx, "Money-in amount is not a whole rupiah value",
+	//
+	// This is checked before anything is booked, and a shortfall is refused. The
+	// signature proves the delivery came from Singapay, not that the payer paid what we
+	// asked — and the entries below are built from the transaction as priced, so booking
+	// a short payment would credit a seller money that never arrived. The transaction
+	// stays PENDING, which is recoverable: a corrected delivery, or a human, can still
+	// settle it. Crediting first and discovering it at settlement is not.
+	//
+	// The asymmetry is deliberate. An overpayment is booked and warned about, because on
+	// QRIS the amount legitimately exceeds the price — total_amount includes the payer's
+	// tip — and refusing those would reject ordinary traffic. An overpayment also cannot
+	// credit a balance that is not covered by money received.
+	chargedAmount := notification.Charged()
+	if !chargedAmount.Set {
+		c.logger.ErrorContext(ctx, "Refusing a money-in webhook that carries no amount — nothing was booked",
 			"invoice_number", invoiceNumber,
-			"amount", notification.Charged().String(),
+			"event", notification.Kind(),
+		)
+		return ledgererr.ErrWebhookAmountMismatch.WithError(
+			fmt.Errorf("money-in notification for %s carries no amount to verify against the transaction", invoiceNumber))
+	}
+
+	charged, chargedErr := chargedAmount.Rupiah()
+	if chargedErr != nil {
+		// The ledger works in whole rupiah. An amount it cannot represent is an amount
+		// it cannot check, and an unchecked amount is the thing this block exists to
+		// prevent.
+		c.logger.ErrorContext(ctx, "Refusing a money-in webhook whose amount is not a whole rupiah value — nothing was booked",
+			"invoice_number", invoiceNumber,
+			"amount", chargedAmount.String(),
 			"error", chargedErr,
 		)
-	} else if charged != productTx.Fee.TotalCharged {
-		// Booked anyway. The ledger's entries come from the transaction as priced, not
-		// from the webhook, so a mismatch does not corrupt the books — but it means
-		// somebody paid a different amount than we asked for, and settlement will
-		// disagree. It belongs in the log and in the journal, loudly, now.
-		c.logger.WarnContext(ctx, "Payer was charged a different amount than the transaction expects",
+		return ledgererr.ErrWebhookAmountMismatch.WithError(chargedErr)
+	}
+
+	if charged < productTx.Fee.TotalCharged {
+		c.logger.ErrorContext(ctx, "Refusing a money-in webhook that underpays the transaction — nothing was booked and it stays PENDING",
+			"invoice_number", invoiceNumber,
+			"expected", productTx.Fee.TotalCharged,
+			"charged", charged,
+			"shortfall", productTx.Fee.TotalCharged-charged,
+		)
+		return ledgererr.ErrWebhookAmountMismatch.WithError(
+			fmt.Errorf("invoice %s expects %d but the payer was charged %d",
+				invoiceNumber, productTx.Fee.TotalCharged, charged))
+	}
+
+	if charged > productTx.Fee.TotalCharged {
+		// Booked. On QRIS this is the payer's tip and entirely normal; on any other
+		// channel it means settlement will carry more than our books recognise, which is
+		// worth a line now rather than a surprise later.
+		c.logger.WarnContext(ctx, "Payer was charged more than the transaction expects — booking the transaction as priced",
 			"invoice_number", invoiceNumber,
 			"expected", productTx.Fee.TotalCharged,
 			"charged", charged,
@@ -176,7 +223,30 @@ func (c *LedgerClient) HandlePaymentSuccess(ctx context.Context, req singapay.We
 		productTx.Fee.GatewayFee,
 	)
 
+	// The transition is validated without mutating anything: the row in the database is
+	// what decides whether this delivery books, and it decides it under the
+	// compare-and-set below. Stamping COMPLETED on the in-memory entity first would be a
+	// second, earlier answer to the same question, and the one that is wrong when a
+	// concurrent delivery gets there first.
+	if !productTx.CanTransitionTo(domain.TransactionStatusCompleted) {
+		return ledgererr.ErrInvalidTransactionStatus.WithError(
+			fmt.Errorf("transaction %s is %s and cannot be completed", productTx.UUID, productTx.Status))
+	}
+	completedAt := time.Now()
+
 	err = c.txProvider.Transact(ctx, func(tx repo.Tx) error {
+		// First, and conditionally: this is the row lock that serialises two deliveries
+		// arriving at once. Everything after it is written only by the delivery that
+		// actually moved the transaction out of PENDING.
+		moved, err := tx.ProductTransaction().UpdateStatusIf(ctx, productTx.UUID,
+			domain.TransactionStatusPending, domain.TransactionStatusCompleted, completedAt)
+		if err != nil {
+			return err
+		}
+		if !moved {
+			return errAlreadyBooked
+		}
+
 		if err := tx.Journal().Save(ctx, journal); err != nil {
 			return err
 		}
@@ -188,15 +258,18 @@ func (c *LedgerClient) HandlePaymentSuccess(ctx context.Context, req singapay.We
 			return err
 		}
 
-		if err := productTx.MarkCompleted(); err != nil {
-			return err
-		}
-		if err := tx.ProductTransaction().UpdateStatus(ctx, productTx.UUID, productTx.Status, *productTx.CompletedAt); err != nil {
-			return err
-		}
-
 		return tx.LedgerEntry().SaveBatch(ctx, ledgerEntries)
 	})
+
+	if errors.Is(err, errAlreadyBooked) {
+		// The other delivery booked it. Nothing was written here, and the caller is
+		// answered with success: Singapay retries, and a duplicate is ordinary traffic.
+		c.logger.InfoContext(ctx, "Payment was booked by a concurrent delivery — this one wrote nothing",
+			"invoice_number", invoiceNumber,
+			"product_tx_id", productTx.UUID,
+		)
+		return nil
+	}
 
 	if err != nil {
 		c.logger.ErrorContext(ctx, "Failed to persist payment success", "invoice_number", invoiceNumber, "error", err)

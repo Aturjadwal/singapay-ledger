@@ -78,6 +78,21 @@ type ProductTransactionRepository interface {
 	GetBySellerAccountIDWithCursor(ctx context.Context, sellerAccountID string, cursor string, pageSize int, sortOrder string) ([]*ProductTransaction, error)
 	Save(ctx context.Context, tx *ProductTransaction) error
 	UpdateStatus(ctx context.Context, id string, status TransactionStatus, timestamp time.Time) error
+
+	// UpdateStatusIf moves a transaction from one status to another only if it is
+	// currently in `from`, and reports whether the row actually moved.
+	//
+	// This is the idempotency boundary for the money-in webhook, and it is a
+	// conditional write rather than a read-then-write because Singapay retries and can
+	// deliver the same confirmation twice at once. Two concurrent deliveries both read
+	// PENDING, and without a condition on the write both go on to save a journal and a
+	// full set of ledger entries — crediting the seller twice for one payment, in a
+	// table that is insert-only and cannot be corrected without an audit.
+	//
+	// Called inside a transaction, the conditional UPDATE takes the row lock first: the
+	// loser blocks, re-evaluates against the committed row, matches nothing, and reports
+	// false. Its caller rolls back having written nothing.
+	UpdateStatusIf(ctx context.Context, id string, from, to TransactionStatus, timestamp time.Time) (bool, error)
 	SaveTransferRequestID(ctx context.Context, id string, requestID string) error
 	MarkPlatformFeeTransferred(ctx context.Context, id string) error
 	GetSettledWithoutPlatformFeeTransfer(ctx context.Context, limit int) ([]*ProductTransaction, error)
