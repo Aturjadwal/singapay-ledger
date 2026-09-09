@@ -161,7 +161,7 @@ func (r *PostgresAccountRepository) Save(ctx context.Context, account *domain.Ac
 			owner_type, owner_id, currency,
 			pending_balance, available_balance, total_withdrawal_amount, total_deposit_amount,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT (uuid) DO UPDATE SET
 			singapay_account_id     = EXCLUDED.singapay_account_id,
 			singapay_account_number = EXCLUDED.singapay_account_number,
