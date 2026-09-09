@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/21strive/ledger/singapay"
+	"github.com/Aturjadwal/singapay-ledger/singapay"
 )
 
 // PaymentGateway is the slice of the Singapay API this ledger uses.

@@ -6,7 +6,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/21strive/ledger/ledgererr"
+	"github.com/Aturjadwal/singapay-ledger/ledgererr"
 	"github.com/google/uuid"
 )
 

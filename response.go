@@ -1,6 +1,6 @@
 package ledger
 
-import "github.com/21strive/ledger/domain"
+import "github.com/Aturjadwal/singapay-ledger/domain"
 
 // MoneyResponse represents a monetary amount with currency
 type MoneyResponse struct {

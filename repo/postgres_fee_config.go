@@ -5,9 +5,9 @@ import (
 	"database/sql"
 	"time"
 
-	"github.com/21strive/ledger/domain"
-	"github.com/21strive/ledger/ledgererr"
 	"github.com/21strive/redifu"
+	"github.com/Aturjadwal/singapay-ledger/domain"
+	"github.com/Aturjadwal/singapay-ledger/ledgererr"
 )
 
 type PostgresFeeConfigRepository struct {

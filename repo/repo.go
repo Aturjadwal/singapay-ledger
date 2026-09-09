@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/21strive/ledger/domain"
+	"github.com/Aturjadwal/singapay-ledger/domain"
 )
 
 type DBTX interface {

@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/21strive/ledger/domain"
-	"github.com/21strive/ledger/ledgererr"
-	"github.com/21strive/ledger/repo"
-	"github.com/21strive/ledger/singapay"
+	"github.com/Aturjadwal/singapay-ledger/domain"
+	"github.com/Aturjadwal/singapay-ledger/ledgererr"
+	"github.com/Aturjadwal/singapay-ledger/repo"
+	"github.com/Aturjadwal/singapay-ledger/singapay"
 )
 
 // webhookReplayTolerance is how old a verified delivery may be before it is called stale.

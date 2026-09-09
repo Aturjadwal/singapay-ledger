@@ -3,9 +3,9 @@ package ledger
 import (
 	"context"
 
-	"github.com/21strive/ledger/domain"
-	"github.com/21strive/ledger/ledgererr"
-	"github.com/21strive/ledger/repo"
+	"github.com/Aturjadwal/singapay-ledger/domain"
+	"github.com/Aturjadwal/singapay-ledger/ledgererr"
+	"github.com/Aturjadwal/singapay-ledger/repo"
 	"github.com/google/uuid"
 )
 

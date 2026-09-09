@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/21strive/ledger/ledgererr"
+	"github.com/Aturjadwal/singapay-ledger/ledgererr"
 )
 
 // PlatformWalletOverviewCards represents the top summary cards on platform wallet page.

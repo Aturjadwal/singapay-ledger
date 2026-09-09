@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/21strive/ledger/domain"
+	"github.com/Aturjadwal/singapay-ledger/domain"
 )
 
 // accountColumns is the SELECT list accountSelectColumns produces, in order. The scan

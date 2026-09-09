@@ -5,7 +5,7 @@ import (
 
 	"context"
 
-	"github.com/21strive/ledger/ledgererr"
+	"github.com/Aturjadwal/singapay-ledger/ledgererr"
 )
 
 // SettlementItem is one settled gateway transaction, matched to a ProductTransaction by

@@ -3,7 +3,7 @@ package repo
 import (
 	"database/sql"
 
-	"github.com/21strive/ledger/domain"
+	"github.com/Aturjadwal/singapay-ledger/domain"
 )
 
 type Tx interface {

@@ -1,4 +1,4 @@
-module github.com/21strive/ledger
+module github.com/Aturjadwal/singapay-ledger
 
 go 1.25.1
 

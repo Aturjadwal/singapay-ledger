@@ -3,7 +3,7 @@ package domain_test
 import (
 	"testing"
 
-	"github.com/21strive/ledger/domain"
+	"github.com/Aturjadwal/singapay-ledger/domain"
 	"github.com/stretchr/testify/assert"
 )
 

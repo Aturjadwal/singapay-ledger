@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/21strive/ledger/domain"
-	"github.com/21strive/ledger/ledgererr"
-	"github.com/21strive/ledger/singapay"
 	"github.com/21strive/redifu"
+	"github.com/Aturjadwal/singapay-ledger/domain"
+	"github.com/Aturjadwal/singapay-ledger/ledgererr"
+	"github.com/Aturjadwal/singapay-ledger/singapay"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

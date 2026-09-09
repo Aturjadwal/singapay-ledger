@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 
-	"github.com/21strive/ledger/ledgererr"
+	"github.com/Aturjadwal/singapay-ledger/ledgererr"
 )
 
 // UserWalletOverviewCards represents the summary cards for the user wallets page.

@@ -1,6 +1,6 @@
 package repo
 
-import "github.com/21strive/ledger/ledgererr"
+import "github.com/Aturjadwal/singapay-ledger/ledgererr"
 
 var (
 	ErrNotFound        = ledgererr.NewError(ledgererr.CodeNotFound, "record not found", nil)

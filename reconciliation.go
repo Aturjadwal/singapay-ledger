@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/21strive/ledger/domain"
-	"github.com/21strive/ledger/ledgererr"
+	"github.com/Aturjadwal/singapay-ledger/domain"
+	"github.com/Aturjadwal/singapay-ledger/ledgererr"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────

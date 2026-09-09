@@ -11,8 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/21strive/ledger/domain"
-	"github.com/21strive/ledger/singapay"
+	"github.com/Aturjadwal/singapay-ledger/domain"
+	"github.com/Aturjadwal/singapay-ledger/singapay"
 )
 
 func TestMaskAccountNumber(t *testing.T) {

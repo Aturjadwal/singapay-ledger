@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/21strive/ledger/ledgererr"
+	"github.com/Aturjadwal/singapay-ledger/ledgererr"
 )
 
 // UserWalletRow represents one seller row in the user wallets table.

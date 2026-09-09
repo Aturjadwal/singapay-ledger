@@ -19,7 +19,7 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/21strive/ledger/analytics"
+	"github.com/Aturjadwal/singapay-ledger/analytics"
 )
 
 type config struct {

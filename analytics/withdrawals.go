@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/21strive/ledger/ledgererr"
+	"github.com/Aturjadwal/singapay-ledger/ledgererr"
 )
 
 // WithdrawalsSummary represents summary cards for withdrawals page.

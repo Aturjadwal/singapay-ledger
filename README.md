@@ -99,8 +99,8 @@ table is therefore the only place the expected fee exists before a transaction s
 
 ```go
 import (
-    "github.com/21strive/ledger"
-    "github.com/21strive/ledger/singapay"
+    "github.com/Aturjadwal/singapay-ledger"
+    "github.com/Aturjadwal/singapay-ledger/singapay"
 )
 
 gateway, err := singapay.NewFromEnv()

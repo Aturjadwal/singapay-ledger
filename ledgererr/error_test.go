@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/21strive/ledger/ledgererr"
+	"github.com/Aturjadwal/singapay-ledger/ledgererr"
 	"github.com/stretchr/testify/assert"
 )
 

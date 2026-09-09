@@ -10,7 +10,7 @@ recursive: false
 require-template-schema-exists: false
 template: testify
 packages:
-  github.com/21strive/ledger/domain:
+  github.com/Aturjadwal/singapay-ledger/domain:
     interfaces:
       LedgerRepository:
       ReconciliationLogRepository:

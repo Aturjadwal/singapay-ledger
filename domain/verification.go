@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/21strive/ledger/ledgererr"
 	"github.com/21strive/redifu"
+	"github.com/Aturjadwal/singapay-ledger/ledgererr"
 )
 
 // VerificationStatus represents the approval state of a verification
