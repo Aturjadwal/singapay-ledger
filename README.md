@@ -453,8 +453,9 @@ Passing a `singapay.Config` directly needs none of them.
 | Variable | Required | Notes |
 |---|---|---|
 | `SINGAPAY_CLIENT_ID` | yes | |
-| `SINGAPAY_CLIENT_SECRET` | yes | HMAC key for **every** signature, and the key that verifies inbound webhooks. Never leaves the process. |
-| `SINGAPAY_PARTNER_ID` | yes | Merchant API key, sent as `X-PARTNER-ID` |
+| `SINGAPAY_CLIENT_SECRET` | yes | HMAC key for every **outbound** signature. Never leaves the process. |
+| `SINGAPAY_PARTNER_ID` | yes | Merchant API key, sent as `X-PARTNER-ID`. The dashboard labels it as a merchant or API key, not a "partner id". |
+| `SINGAPAY_WEBHOOK_KEY` | no | HMAC key for verifying **inbound** webhooks. Unset means the client secret. See below. |
 | `SINGAPAY_PRODUCTION` | no | `true` targets production. Anything else — including unset — stays on sandbox. |
 | `SINGAPAY_BASE_URL` | no | Overrides the host entirely. For tests against a stub. |
 | `SINGAPAY_TIMESTAMP_FORMAT` | no | `unix` (default) or `iso`. |
@@ -475,6 +476,29 @@ Three notes worth reading before deploying:
   not with a network error, so they are easy to misdiagnose.
 - **Whitespace is trimmed from every value.** A newline from a secrets mount would otherwise
   end up in the HMAC key and fail every signature with no useful clue.
+- **`SINGAPAY_WEBHOOK_KEY` exists because it is not settled which secret signs a callback.**
+  The API documentation describes one `client_secret` used for everything, but the merchant
+  dashboard also issues something it calls an HMAC validation key. Only one of them verifies
+  a real delivery, and the wrong choice fails in a misleading way: every callback is
+  rejected for a signature mismatch, which reads like a canonicalisation bug and sends you
+  looking at JSON encoding rather than at credentials.
+
+  Leaving it unset keeps today's behaviour exactly. To settle it, capture one real delivery
+  and replay it:
+
+  ```bash
+  go run ./cmd/singapay-smoke -step verify-webhook \
+      -webhook-body ./delivery.json \
+      -webhook-endpoint /singapay/notification \
+      -webhook-signature "<X-Signature>" \
+      -webhook-timestamp "<X-Timestamp>" \
+      -webhook-authorization "<Authorization>"
+  ```
+
+  It tries each candidate against the untouched bytes and names the one that matches.
+  Nothing is sent anywhere. If neither matches, the callback signature *scheme* differs
+  from the request scheme and no key will fix it — which the output says, so the search
+  does not turn into a hunt for a third secret.
 
 Webhook URLs (`transaction_notif_url`, `disbursement_notif_url`, `settlement_notif_url`) are
 configured in the Singapay dashboard, not through environment variables.

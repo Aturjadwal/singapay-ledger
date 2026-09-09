@@ -40,7 +40,9 @@ BEGIN;
 -- singapay_account_id and singapay_account_number were added in migration 016 and stay as
 -- they are. This removes the column they replace. See the archive note above.
 
-DROP INDEX IF EXISTS ledger_accounts_doku_subaccount_id_key;
+-- Dropping the column takes its UNIQUE constraint and that constraint's index with it.
+-- An explicit DROP INDEX here would fail: ledger_accounts_doku_subaccount_id_key is owned
+-- by the constraint, and Postgres refuses to drop a constraint's index on its own.
 ALTER TABLE ledger_accounts DROP COLUMN IF EXISTS doku_subaccount_id;
 
 -- The PAYMENT_GATEWAY account is a bookkeeping account holding recognised gateway fees.

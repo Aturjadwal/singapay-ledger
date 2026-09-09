@@ -53,12 +53,25 @@ type options struct {
 	baseURL     string
 	reff        string
 	bankVA      string
+
+	// verify-webhook inputs: a delivery captured off the wire, replayed against each
+	// candidate key.
+	webhookFile      string
+	webhookEndpoint  string
+	webhookSignature string
+	webhookTimestamp string
+	webhookAuth      string
 }
 
 func run(args []string) error {
 	fs := flag.NewFlagSet("singapay-smoke", flag.ContinueOnError)
 	var o options
-	fs.StringVar(&o.step, "step", "readonly", "readonly | token | balance | accounts | methods | signature | beneficiary | fee | create-account | payment-link | va | qris")
+	fs.StringVar(&o.step, "step", "readonly", "readonly | token | balance | accounts | methods | signature | verify-webhook | beneficiary | fee | create-account | payment-link | va | qris")
+	fs.StringVar(&o.webhookFile, "webhook-body", "", "verify-webhook: file holding the raw webhook body, byte for byte as received")
+	fs.StringVar(&o.webhookEndpoint, "webhook-endpoint", "/singapay/notification", "verify-webhook: the path Singapay signed")
+	fs.StringVar(&o.webhookSignature, "webhook-signature", "", "verify-webhook: the X-Signature header from the delivery")
+	fs.StringVar(&o.webhookTimestamp, "webhook-timestamp", "", "verify-webhook: the X-Timestamp header from the delivery")
+	fs.StringVar(&o.webhookAuth, "webhook-authorization", "", "verify-webhook: the Authorization header from the delivery")
 	fs.BoolVar(&o.production, "production", false, "target production instead of sandbox")
 	fs.StringVar(&o.timestamp, "timestamp", "unix", "X-Timestamp format: unix | iso")
 	fs.StringVar(&o.name, "name", "", "create-account: the sub-account name")
@@ -75,17 +88,22 @@ func run(args []string) error {
 		return err
 	}
 
+	// Built by hand rather than through ConfigFromEnv so -production and -base-url can
+	// override the environment. The names are trimmed the same way ConfigFromEnv trims
+	// them: a trailing newline from a secrets mount lands inside the HMAC key and fails
+	// every signature with nothing pointing at the cause.
 	cfg := singapay.Config{
-		ClientID:     os.Getenv("SINGAPAY_CLIENT_ID"),
-		ClientSecret: os.Getenv("SINGAPAY_CLIENT_SECRET"),
-		PartnerID:    os.Getenv("SINGAPAY_PARTNER_ID"),
+		ClientID:     strings.TrimSpace(os.Getenv(singapay.EnvClientID)),
+		ClientSecret: strings.TrimSpace(os.Getenv(singapay.EnvClientSecret)),
+		PartnerID:    strings.TrimSpace(os.Getenv(singapay.EnvPartnerID)),
+		WebhookKey:   strings.TrimSpace(os.Getenv(singapay.EnvWebhookKey)),
 		IsProduction: o.production,
 		BaseURL:      o.baseURL,
 	}
 	for name, value := range map[string]string{
-		"SINGAPAY_CLIENT_ID":     cfg.ClientID,
-		"SINGAPAY_CLIENT_SECRET": cfg.ClientSecret,
-		"SINGAPAY_PARTNER_ID":    cfg.PartnerID,
+		singapay.EnvClientID:     cfg.ClientID,
+		singapay.EnvClientSecret: cfg.ClientSecret,
+		singapay.EnvPartnerID:    cfg.PartnerID,
 	} {
 		if value == "" {
 			return fmt.Errorf("%s is not set", name)
@@ -146,6 +164,8 @@ func run(args []string) error {
 		return stepFee(ctx, client, o)
 	case "create-account":
 		return stepCreateAccount(ctx, client, o)
+	case "verify-webhook":
+		return stepVerifyWebhook(cfg, o)
 	default:
 		return fmt.Errorf("unknown step %q", o.step)
 	}
@@ -518,4 +538,104 @@ func orDash(s string) string {
 		return "—"
 	}
 	return s
+}
+
+// stepVerifyWebhook answers which secret Singapay actually signs callbacks with.
+//
+// The question exists because the API documentation describes a single client_secret used
+// for everything, while the merchant dashboard also issues a separate HMAC validation key.
+// Only one of them verifies a real delivery, and guessing has a bad failure mode: the wrong
+// key produces a signature mismatch on every callback, which reads like a canonicalisation
+// bug and sends you looking at JSON encoding instead of at credentials.
+//
+// So this does not guess. Capture one real delivery — body, X-Signature, X-Timestamp,
+// Authorization — and replay it here. Each candidate key is tried against the untouched
+// bytes and the one that matches is the answer.
+//
+// Nothing is sent anywhere: this is pure local computation against a captured payload.
+func stepVerifyWebhook(base singapay.Config, o options) error {
+	if o.webhookFile == "" {
+		return fmt.Errorf("-webhook-body is required: point it at a file holding the raw delivery body")
+	}
+	if o.webhookSignature == "" {
+		return fmt.Errorf("-webhook-signature is required: copy the X-Signature header from the delivery")
+	}
+
+	// Read, never re-encode. The signature covers the bytes Singapay sent, so a
+	// round-trip through a JSON decoder would change what is hashed and make every
+	// candidate fail for a reason that has nothing to do with the key.
+	body, err := os.ReadFile(o.webhookFile)
+	if err != nil {
+		return fmt.Errorf("reading webhook body: %w", err)
+	}
+
+	fmt.Printf("endpoint    : %s\n", o.webhookEndpoint)
+	fmt.Printf("body        : %d bytes from %s\n", len(body), o.webhookFile)
+	fmt.Printf("timestamp   : %s\n\n", o.webhookTimestamp)
+
+	candidates := []struct {
+		label string
+		key   string
+	}{
+		{"client secret (SINGAPAY_CLIENT_SECRET)", base.ClientSecret},
+	}
+	if base.WebhookKey != "" && base.WebhookKey != base.ClientSecret {
+		candidates = append(candidates, struct {
+			label string
+			key   string
+		}{"webhook key   (SINGAPAY_WEBHOOK_KEY)", base.WebhookKey})
+	}
+
+	req := singapay.WebhookRequest{
+		Endpoint:      o.webhookEndpoint,
+		Body:          body,
+		Signature:     o.webhookSignature,
+		Timestamp:     o.webhookTimestamp,
+		Authorization: o.webhookAuth,
+	}
+
+	var matched []string
+	for _, candidate := range candidates {
+		if candidate.key == "" {
+			fmt.Printf("  %-40s — not set, skipped\n", candidate.label)
+			continue
+		}
+
+		cfg := base
+		cfg.WebhookKey = candidate.key
+		c, err := singapay.New(cfg)
+		if err != nil {
+			return err
+		}
+
+		if err := c.VerifyWebhook(req); err != nil {
+			fmt.Printf("  %-40s ✘ mismatch\n", candidate.label)
+			continue
+		}
+		fmt.Printf("  %-40s ✔ MATCHES\n", candidate.label)
+		matched = append(matched, candidate.label)
+	}
+
+	fmt.Println()
+	switch len(matched) {
+	case 1:
+		fmt.Printf("Singapay signs callbacks with the %s.\n", strings.TrimSpace(matched[0]))
+		fmt.Println("Set SINGAPAY_WEBHOOK_KEY accordingly (leave it unset if that is the client secret).")
+		return nil
+	case 0:
+		// Worth being explicit that a failure here is not necessarily the key. If the
+		// scheme itself differs, no key will ever match, and hunting for a third secret
+		// would be the wrong search.
+		fmt.Println("Neither key verifies this delivery. Before looking for another secret, check that:")
+		fmt.Println("  - the body is the raw bytes, not re-serialised by a proxy or an editor")
+		fmt.Println("  - -webhook-endpoint is the path registered in the dashboard, not the rewritten one")
+		fmt.Println("  - X-Timestamp and Authorization are copied exactly, including the Bearer prefix or its absence")
+		fmt.Println("If all three hold, Singapay's callback signature scheme differs from its request")
+		fmt.Println("scheme, and no choice of key will fix it — the scheme is what needs changing.")
+		return fmt.Errorf("no candidate key verified the delivery")
+	default:
+		// Both keys matching means they are the same secret under two labels.
+		fmt.Println("Both candidates verify, so they are the same secret — leave SINGAPAY_WEBHOOK_KEY unset.")
+		return nil
+	}
 }

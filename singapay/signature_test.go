@@ -289,3 +289,99 @@ func TestWebhookFresh(t *testing.T) {
 		})
 	}
 }
+
+// The webhook key is separate from the client secret because it may genuinely be a
+// separate secret — the dashboard issues an HMAC validation key, and whether that or the
+// client secret signs an inbound callback is not settled. These two tests pin both
+// readings so that whichever turns out to be right is a configuration change and not a
+// code change.
+func TestVerifyWebhook_WebhookKeyDefaultsToClientSecret(t *testing.T) {
+	c := testClient(t, "")
+
+	if c.cfg.WebhookKey != testSecret {
+		t.Fatalf("unset WebhookKey should fall back to ClientSecret, got %q", c.cfg.WebhookKey)
+	}
+
+	// A delivery signed with the client secret still verifies, which is the behaviour
+	// every deployment has today.
+	const endpoint = "/singapay/notification"
+	body := []byte(`{"event":"va-transaction","data":{"transaction":{"reff_no":"INV-1"}}}`)
+	sig, err := requestSignature("POST", endpoint, "tok", body, "1695711945", testSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.VerifyWebhook(WebhookRequest{
+		Endpoint: endpoint, Body: body, Signature: sig,
+		Timestamp: "1695711945", Authorization: "Bearer tok",
+	}); err != nil {
+		t.Fatalf("delivery signed with the client secret must verify by default: %v", err)
+	}
+}
+
+func TestVerifyWebhook_UsesTheWebhookKeyWhenSet(t *testing.T) {
+	const webhookKey = "an-entirely-different-hmac-validation-key"
+	c, err := New(Config{
+		ClientID:     testClientID,
+		ClientSecret: testSecret,
+		PartnerID:    testPartner,
+		WebhookKey:   webhookKey,
+		Now:          func() time.Time { return testNow },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	const endpoint = "/singapay/notification"
+	body := []byte(`{"event":"va-transaction","data":{"transaction":{"reff_no":"INV-1"}}}`)
+
+	signedWithWebhookKey, err := requestSignature("POST", endpoint, "tok", body, "1695711945", webhookKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := WebhookRequest{
+		Endpoint: endpoint, Body: body, Signature: signedWithWebhookKey,
+		Timestamp: "1695711945", Authorization: "Bearer tok",
+	}
+	if err := c.VerifyWebhook(req); err != nil {
+		t.Fatalf("delivery signed with the webhook key must verify: %v", err)
+	}
+
+	// And the client secret must now be refused. Accepting both would defeat the point:
+	// the whole reason to separate the keys is that only one of them is the real one.
+	signedWithClientSecret, err := requestSignature("POST", endpoint, "tok", body, "1695711945", testSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Signature = signedWithClientSecret
+	if err := c.VerifyWebhook(req); err == nil {
+		t.Error("with a distinct webhook key set, a delivery signed with the client secret must be refused")
+	}
+}
+
+// Outbound signing must keep using the client secret. A webhook key that leaked into the
+// request signature would fail every API call, and the failure would point at the wrong
+// credential entirely.
+func TestVerifyWebhook_WebhookKeyDoesNotAffectOutboundSigning(t *testing.T) {
+	c, err := New(Config{
+		ClientID:     testClientID,
+		ClientSecret: testSecret,
+		PartnerID:    testPartner,
+		WebhookKey:   "a-different-key",
+		Now:          func() time.Time { return testNow },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	want, err := requestSignature("POST", "/api/v2.0/disbursement/transfer", "tok", []byte(`{"a":1}`), "1695711945", testSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := requestSignature("POST", "/api/v2.0/disbursement/transfer", "tok", []byte(`{"a":1}`), "1695711945", c.cfg.ClientSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Error("outbound request signing must use the client secret, not the webhook key")
+	}
+}

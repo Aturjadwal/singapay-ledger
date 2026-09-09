@@ -13,6 +13,7 @@ const (
 	EnvClientID     = "SINGAPAY_CLIENT_ID"
 	EnvClientSecret = "SINGAPAY_CLIENT_SECRET"
 	EnvPartnerID    = "SINGAPAY_PARTNER_ID"
+	EnvWebhookKey   = "SINGAPAY_WEBHOOK_KEY"
 	EnvProduction   = "SINGAPAY_PRODUCTION"
 	EnvBaseURL      = "SINGAPAY_BASE_URL"
 	EnvTimestamp    = "SINGAPAY_TIMESTAMP_FORMAT"
@@ -23,7 +24,13 @@ const (
 //	SINGAPAY_CLIENT_ID          required
 //	SINGAPAY_CLIENT_SECRET      required — HMAC key for every signature, and the key
 //	                            that verifies inbound webhooks
-//	SINGAPAY_PARTNER_ID         required — merchant API key, sent as X-PARTNER-ID
+//	SINGAPAY_PARTNER_ID         required — merchant API key, sent as X-PARTNER-ID. The
+//	                            dashboard labels it as a merchant or API key rather than
+//	                            a "partner id"
+//	SINGAPAY_WEBHOOK_KEY        optional — HMAC key for verifying INBOUND webhooks.
+//	                            Unset means SINGAPAY_CLIENT_SECRET. Set it only if the
+//	                            dashboard issues a distinct HMAC validation key AND that
+//	                            key is what signs callbacks; see [Config.WebhookKey]
 //	SINGAPAY_PRODUCTION         optional — "true" targets production; anything else,
 //	                            including unset, stays on sandbox
 //	SINGAPAY_BASE_URL           optional — overrides the host entirely
@@ -41,6 +48,7 @@ func ConfigFromEnv() (Config, error) {
 		ClientID:     strings.TrimSpace(os.Getenv(EnvClientID)),
 		ClientSecret: strings.TrimSpace(os.Getenv(EnvClientSecret)),
 		PartnerID:    strings.TrimSpace(os.Getenv(EnvPartnerID)),
+		WebhookKey:   strings.TrimSpace(os.Getenv(EnvWebhookKey)),
 		BaseURL:      strings.TrimSpace(os.Getenv(EnvBaseURL)),
 	}
 

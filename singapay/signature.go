@@ -151,6 +151,10 @@ func WebhookRequestFromHTTP(r *http.Request, endpoint string, body []byte) Webho
 // The scheme is the same as [requestSignature] with METHOD fixed to POST — the difference
 // is only which side computes it. Comparison is constant time.
 //
+// The key is [Config.WebhookKey], which defaults to ClientSecret. Inbound deliveries may
+// be signed with a different secret than the one this client signs its own requests with;
+// see that field for why the question is open.
+//
 // Verifying does not make the payload trustworthy on its own: pair this with the IP
 // allowlist, and treat a replayed-but-valid delivery as a duplicate rather than a second
 // event. Singapay retries, so duplicates are expected traffic.
@@ -160,7 +164,7 @@ func (c *Client) VerifyWebhook(req WebhookRequest) error {
 	}
 
 	token := strings.TrimSpace(strings.TrimPrefix(req.Authorization, "Bearer "))
-	want, err := requestSignature(http.MethodPost, req.Endpoint, token, req.Body, req.Timestamp, c.cfg.ClientSecret)
+	want, err := requestSignature(http.MethodPost, req.Endpoint, token, req.Body, req.Timestamp, c.cfg.WebhookKey)
 	if err != nil {
 		return &Error{StatusCode: http.StatusBadRequest, Message: "webhook body is not valid JSON", Err: err}
 	}

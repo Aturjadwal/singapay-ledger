@@ -30,8 +30,25 @@ type Config struct {
 	// key for every signature scheme — it is never sent on the wire.
 	ClientID     string
 	ClientSecret string
-	// PartnerID is the merchant API key, sent as X-PARTNER-ID on every call.
+	// PartnerID is the merchant API key, sent as X-PARTNER-ID on every call. The
+	// merchant dashboard labels it as a merchant or API key rather than a "partner id".
 	PartnerID string
+
+	// WebhookKey is the HMAC key that verifies INBOUND webhook deliveries. Empty means
+	// ClientSecret, which is the behaviour this client shipped with.
+	//
+	// It is separate from ClientSecret because it may genuinely be a separate secret.
+	// Singapay's API documentation describes one client_secret used for everything, but
+	// the merchant dashboard also issues something it calls an HMAC validation key, and
+	// which of the two signs an inbound callback is not settled. Getting it wrong is not
+	// subtle in its consequences and is very subtle in its symptoms: every delivery fails
+	// verification with a signature mismatch, which reads like a canonicalisation bug
+	// rather than a wrong key.
+	//
+	// Defaulting to ClientSecret keeps the two readings collapsed until a real sandbox
+	// delivery separates them. `singapay-smoke -step verify-webhook` does exactly that:
+	// it tries a captured delivery against both and reports which one matches.
+	WebhookKey string
 
 	// IsProduction selects the production host. Ignored when BaseURL is set.
 	IsProduction bool
@@ -81,6 +98,11 @@ func New(cfg Config) (*Client, error) {
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	// Not validated separately: an unset webhook key means "the same secret", which is
+	// what Singapay's own documentation describes.
+	if cfg.WebhookKey == "" {
+		cfg.WebhookKey = cfg.ClientSecret
 	}
 
 	baseURL := cfg.BaseURL
