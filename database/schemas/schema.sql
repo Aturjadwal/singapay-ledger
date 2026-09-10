@@ -244,8 +244,9 @@ CREATE TABLE IF NOT EXISTS payment_requests (
     -- Payment gateway details
     request_id VARCHAR(100) NOT NULL UNIQUE,
     -- Singapay's own id for the payment instrument (VA ULID, QRIS/link id, e-wallet id)
-    payment_code VARCHAR(100),
-    -- VA number, QRIS code, etc.
+    payment_code TEXT,
+    -- VA number, or the whole EMVCo QRIS payload the buyer scans - the gateway decides the
+    -- length, so this is TEXT rather than a fixed width (see migration 021)
     payment_channel VARCHAR(50) NOT NULL,
     -- QRIS, VA_BCA, VA_BRI, etc.
     payment_url TEXT,

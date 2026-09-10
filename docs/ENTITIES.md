@@ -148,7 +148,7 @@ Melacak lifecycle integrasi dengan Singapay payment gateway. Satu `PaymentReques
 | `randid` | VARCHAR(255) UNIQUE | ID acak untuk referensi publik |
 | `product_transaction_uuid` | VARCHAR(255) FK | Transaksi yang ditautkan |
 | `request_id` | VARCHAR(100) UNIQUE | ID payment request dari Singapay |
-| `payment_code` | VARCHAR(100) | Nomor VA, kode QRIS, dsb. |
+| `payment_code` | TEXT | Nomor VA, atau payload EMVCo QRIS lengkap yang di-scan pembeli. |
 | `payment_channel` | VARCHAR(50) | `QRIS`, `VA_BCA`, `VA_BRI`, `VA_MANDIRI`, `VA_BNI`, `CREDIT_CARD`, `E_WALLET` |
 | `payment_url` | TEXT | URL bagi buyer untuk menyelesaikan pembayaran |
 | `amount` | BIGINT | Total yang dibebankan ke buyer |
