@@ -34,6 +34,19 @@ type PaymentGateway interface {
 	// settlement batch covered are read back from these, filtered on the batch's
 	// window.
 	ListVATransactions(ctx context.Context, accountID string, w singapay.SettlementWindow) ([]singapay.VATransaction, singapay.Pagination, error)
+
+	// The per-transaction reads. These are what the settlement pass actually uses: it
+	// asks about each invoice it is waiting on rather than replaying a batch's window,
+	// which is why the window's undocumented timezone stops mattering.
+	//
+	// GetVATransactionsByVANumber is the odd one out, and has to be: a VA transaction's
+	// own id is not known until someone pays, so the VA number — known at creation — is
+	// the only key a payment record can offer.
+	GetVATransaction(ctx context.Context, accountID, transactionID string) (*singapay.VATransaction, error)
+	GetVATransactionsByVANumber(ctx context.Context, accountID, vaNumber string) ([]singapay.VATransaction, singapay.Pagination, error)
+	GetQRISTransaction(ctx context.Context, accountID string, id int64) (*singapay.QRISTransaction, error)
+	GetEwalletTransaction(ctx context.Context, accountID, transactionID string) (*singapay.EwalletTransaction, error)
+	GetPaymentLinkHistory(ctx context.Context, accountID string, historyID int64) (*singapay.PaymentLinkHistory, error)
 	ListQRISTransactions(ctx context.Context, accountID string, w singapay.SettlementWindow) ([]singapay.QRISTransaction, singapay.Pagination, error)
 	ListEwalletTransactions(ctx context.Context, accountID string, w singapay.SettlementWindow) ([]singapay.EwalletTransaction, singapay.Pagination, error)
 	ListPaymentLinkHistories(ctx context.Context, accountID string, w singapay.SettlementWindow) ([]singapay.PaymentLinkHistory, singapay.Pagination, error)

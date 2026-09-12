@@ -196,6 +196,29 @@ func (c *Client) GetVATransaction(ctx context.Context, accountID, transactionID 
 	return &out, nil
 }
 
+// GetVATransactionsByVANumber reads the payments made into one virtual account.
+//
+// This is the VA route into the per-transaction settlement read, and it exists because
+// GetVATransaction cannot be reached from what a payment records. Creating a VA returns
+// the VA's own ULID; the transaction that later arrives in it carries a different,
+// business identifier ("VA-20251024-0001H9X8ZK"), and only the second one opens
+// GetVATransaction. The VA number, by contrast, is known at creation and stored.
+//
+// Singapay answers with a collection because a virtual account can in general be paid into
+// more than once. The ones this ledger issues cannot: they are created temporary, closed
+// and MaxUsage 1, so exactly one transaction can exist per VA and the caller can take the
+// single element. A second element would mean the VA was not issued by this code path,
+// which is worth noticing rather than silently taking the first.
+func (c *Client) GetVATransactionsByVANumber(ctx context.Context, accountID, vaNumber string) ([]VATransaction, Pagination, error) {
+	var out []VATransaction
+	var page Pagination
+	path := "/api/v1.0/va-transactions/" + accountID + "/detail-by-va-number/" + vaNumber
+	if err := c.callPaged(ctx, http.MethodGet, path, nil, &out, &page); err != nil {
+		return nil, Pagination{}, err
+	}
+	return out, page, nil
+}
+
 // MillisTimestamp renders a time as the 13-digit millisecond string Singapay expects in
 // virtual-account request bodies.
 func MillisTimestamp(t interface{ UnixMilli() int64 }) string {

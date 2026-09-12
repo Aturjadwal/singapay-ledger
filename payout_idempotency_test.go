@@ -202,6 +202,21 @@ func (f *fakeGateway) ListQRISTransactions(context.Context, string, singapay.Set
 func (f *fakeGateway) ListEwalletTransactions(context.Context, string, singapay.SettlementWindow) ([]singapay.EwalletTransaction, singapay.Pagination, error) {
 	panic("fakeGateway.ListEwalletTransactions: not scripted for this test")
 }
+func (f *fakeGateway) GetVATransaction(context.Context, string, string) (*singapay.VATransaction, error) {
+	panic("fakeGateway.GetVATransaction: not scripted for this test")
+}
+func (f *fakeGateway) GetVATransactionsByVANumber(context.Context, string, string) ([]singapay.VATransaction, singapay.Pagination, error) {
+	panic("fakeGateway.GetVATransactionsByVANumber: not scripted for this test")
+}
+func (f *fakeGateway) GetQRISTransaction(context.Context, string, int64) (*singapay.QRISTransaction, error) {
+	panic("fakeGateway.GetQRISTransaction: not scripted for this test")
+}
+func (f *fakeGateway) GetEwalletTransaction(context.Context, string, string) (*singapay.EwalletTransaction, error) {
+	panic("fakeGateway.GetEwalletTransaction: not scripted for this test")
+}
+func (f *fakeGateway) GetPaymentLinkHistory(context.Context, string, int64) (*singapay.PaymentLinkHistory, error) {
+	panic("fakeGateway.GetPaymentLinkHistory: not scripted for this test")
+}
 func (f *fakeGateway) ListPaymentLinkHistories(context.Context, string, singapay.SettlementWindow) ([]singapay.PaymentLinkHistory, singapay.Pagination, error) {
 	panic("fakeGateway.ListPaymentLinkHistories: not scripted for this test")
 }

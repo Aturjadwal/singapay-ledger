@@ -61,6 +61,26 @@ type ProductTransaction struct {
 	PlatformFeeTransferred   bool           // Whether platform fee has been transferred to platform sub-account
 	PlatformFeeTransferredAt *time.Time     // When platform fee was successfully transferred between sub-accounts
 	TransferRequestID        string         // merchant_ref_no used for the platform fee transfer (for idempotent retries)
+
+	// SettledPlatformFee and SettledGatewayFee are what the fees turned out to be once
+	// Singapay reported what it actually took, as opposed to Fee.PlatformFee and
+	// Fee.GatewayFee, which are what was priced at checkout.
+	//
+	// They differ when the gateway's actual fee misses the expected one. Who absorbs the
+	// difference depends on the fee model (see docs/104-fee-mismatch-reconciliation.md):
+	// on GATEWAY_ON_CUSTOMER the platform does, so the platform fee that survives
+	// settlement can be smaller than the one priced. On GATEWAY_ON_SELLER the seller's
+	// net absorbs it and the platform fee is untouched.
+	//
+	// This matters beyond bookkeeping: ProcessPlatformFeeTransfer moves real money out of
+	// the seller's Singapay sub-account, and moving the priced figure when the ledger
+	// booked a smaller one puts the gateway and the ledger out of step — always against
+	// the seller. The transfer reads SettledPlatformFee and falls back to Fee.PlatformFee.
+	//
+	// nil means "not recorded" — a transaction that settled before these were kept, or
+	// one that has not settled at all. It never means zero.
+	SettledPlatformFee *int64
+	SettledGatewayFee  *int64
 }
 
 // ProductTransactionRepository defines data access for product transactions
@@ -102,6 +122,20 @@ type ProductTransactionRepository interface {
 	// on: Singapay's settlement webhook carries totals and a date window but no list of
 	// the transactions the batch covered.
 	GetAwaitingSettlement(ctx context.Context, limit int) ([]*ProductTransaction, error)
+
+	// SaveSettledFees records what the fees turned out to be. Called inside the same
+	// transaction as the status move, so a transaction never reaches SETTLED with the
+	// figures the transfer step reads still unset.
+	SaveSettledFees(ctx context.Context, id string, platformFee, gatewayFee int64) error
+
+	// OldestAwaitingSettlement returns when the oldest unsettled COMPLETED transaction
+	// was completed, and false when there are none.
+	//
+	// This is the health signal the settlement worker leans on, and the one alarm that
+	// cannot be fooled by a reconciler that runs cleanly and books nothing: if settlement
+	// stops, this age climbs monotonically. A "worker succeeded" metric stays green
+	// throughout.
+	OldestAwaitingSettlement(ctx context.Context) (time.Time, bool, error)
 }
 
 // NewFeeBreakdown creates a FeeBreakdown with specified fee model and validates amounts

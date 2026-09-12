@@ -17,6 +17,7 @@ type Tx interface {
 	Disbursement() domain.DisbursementRepository
 	SettlementBatch() domain.SettlementBatchRepository
 	SettlementItem() domain.SettlementItemRepository
+	SettlementNotification() domain.SettlementNotificationRepository
 }
 
 type postgresTx struct {
@@ -57,6 +58,10 @@ func (p *postgresTx) SettlementBatch() domain.SettlementBatchRepository {
 
 func (p *postgresTx) SettlementItem() domain.SettlementItemRepository {
 	return NewPostgresSettlementItemRepository(p.tx)
+}
+
+func (p *postgresTx) SettlementNotification() domain.SettlementNotificationRepository {
+	return NewPostgresSettlementNotificationRepository(p.tx)
 }
 
 func (p *postgresTx) ReconciliationDiscrepancy() domain.ReconciliationDiscrepancyRepository {

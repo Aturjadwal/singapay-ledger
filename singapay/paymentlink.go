@@ -248,6 +248,21 @@ func withQuery(path string, q url.Values) string {
 	return path + "?" + q.Encode()
 }
 
+// GetPaymentLinkHistory reads one payment attempt by its numeric history id.
+//
+// Note the id: this is payment_link_histories.id, the id of one ATTEMPT, not the id of the
+// payment link it belongs to. Creating a link returns the latter, so a caller holding only
+// a created link cannot reach this endpoint — use ListPaymentLinkHistories filtered on
+// ReffNo instead, which is why that filter exists.
+func (c *Client) GetPaymentLinkHistory(ctx context.Context, accountID string, historyID int64) (*PaymentLinkHistory, error) {
+	var out PaymentLinkHistory
+	path := "/api/v1.0/payment-link-histories/" + accountID + "/" + strconv.FormatInt(historyID, 10)
+	if err := c.call(ctx, http.MethodGet, path, nil, &out, false); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // ListPaymentLinkHistories returns payment attempts for an account, newest first.
 func (c *Client) ListPaymentLinkHistories(ctx context.Context, accountID string, w SettlementWindow) ([]PaymentLinkHistory, Pagination, error) {
 	var out []PaymentLinkHistory

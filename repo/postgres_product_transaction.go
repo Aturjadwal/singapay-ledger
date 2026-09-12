@@ -26,7 +26,8 @@ func (r *PostgresProductTransactionRepository) GetByID(ctx context.Context, id s
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
-		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
+		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
+		       settled_platform_fee, settled_gateway_fee
 		FROM product_transactions
 		WHERE uuid = $1
 	`
@@ -39,7 +40,8 @@ func (r *PostgresProductTransactionRepository) GetByInvoiceNumber(ctx context.Co
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
-		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
+		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
+		       settled_platform_fee, settled_gateway_fee
 		FROM product_transactions
 		WHERE invoice_number = $1
 	`
@@ -53,7 +55,8 @@ func (r *PostgresProductTransactionRepository) GetBySellerAccountID(ctx context.
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
-		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
+		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
+		       settled_platform_fee, settled_gateway_fee
 		FROM product_transactions
 		WHERE seller_account_id = $1
 		ORDER BY created_at DESC
@@ -69,7 +72,8 @@ func (r *PostgresProductTransactionRepository) GetByBuyerAccountID(ctx context.C
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
-		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
+		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
+		       settled_platform_fee, settled_gateway_fee
 		FROM product_transactions
 		WHERE buyer_account_id = $1
 		ORDER BY created_at DESC
@@ -99,7 +103,8 @@ func (r *PostgresProductTransactionRepository) GetBySellerAccountIDWithCursor(ct
 			SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
 			       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 			       status, created_at, updated_at, completed_at, settled_at,
-			       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
+			       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
+		       settled_platform_fee, settled_gateway_fee
 			FROM product_transactions
 			WHERE seller_account_id = $1
 			ORDER BY created_at %s
@@ -114,7 +119,8 @@ func (r *PostgresProductTransactionRepository) GetBySellerAccountIDWithCursor(ct
 				SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
 				       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 				       status, created_at, updated_at, completed_at, settled_at,
-				       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
+				       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
+		       settled_platform_fee, settled_gateway_fee
 				FROM product_transactions
 				WHERE seller_account_id = $1 
 				  AND (created_at < (SELECT created_at FROM product_transactions WHERE randid = $2)
@@ -127,7 +133,8 @@ func (r *PostgresProductTransactionRepository) GetBySellerAccountIDWithCursor(ct
 				SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
 				       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 				       status, created_at, updated_at, completed_at, settled_at,
-				       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
+				       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
+		       settled_platform_fee, settled_gateway_fee
 				FROM product_transactions
 				WHERE seller_account_id = $1 
 				  AND (created_at > (SELECT created_at FROM product_transactions WHERE randid = $2)
@@ -147,7 +154,8 @@ func (r *PostgresProductTransactionRepository) GetPendingBySellerAccountID(ctx c
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
-		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
+		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
+		       settled_platform_fee, settled_gateway_fee
 		FROM product_transactions
 		WHERE seller_account_id = $1 AND status = 'PENDING'
 		ORDER BY created_at DESC
@@ -161,7 +169,8 @@ func (r *PostgresProductTransactionRepository) GetCompletedNotSettled(ctx contex
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
-		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
+		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
+		       settled_platform_fee, settled_gateway_fee
 		FROM product_transactions
 		WHERE seller_account_id = $1 AND status = 'COMPLETED'
 		ORDER BY created_at ASC
@@ -175,7 +184,8 @@ func (r *PostgresProductTransactionRepository) GetAllBySellerID(ctx context.Cont
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
-		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
+		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
+		       settled_platform_fee, settled_gateway_fee
 		FROM product_transactions
 		WHERE seller_account_id = $1
 		ORDER BY created_at DESC
@@ -383,6 +393,8 @@ func (r *PostgresProductTransactionRepository) scanRow(rows *sql.Rows) (*domain.
 		PlatformFeeTransferredAt sql.NullTime
 		TransferRequestID        sql.NullString
 		Metadata                 []byte
+		SettledPlatformFee       sql.NullInt64
+		SettledGatewayFee        sql.NullInt64
 	}
 
 	err := rows.Scan(
@@ -409,6 +421,8 @@ func (r *PostgresProductTransactionRepository) scanRow(rows *sql.Rows) (*domain.
 		&row.PlatformFeeTransferredAt,
 		&row.TransferRequestID,
 		&row.Metadata,
+		&row.SettledPlatformFee,
+		&row.SettledGatewayFee,
 	)
 	if err != nil {
 		return nil, ErrFailedScanSQL.WithError(err)
@@ -427,6 +441,19 @@ func (r *PostgresProductTransactionRepository) scanRow(rows *sql.Rows) (*domain.
 	var platformFeeTransferredAt *time.Time
 	if row.PlatformFeeTransferredAt.Valid {
 		platformFeeTransferredAt = &row.PlatformFeeTransferredAt.Time
+	}
+
+	// NULL here means "not recorded" — a transaction that settled before these columns
+	// existed, or one that has not settled. It is not zero, and must not collapse to it:
+	// the platform fee transfer reads this and falls back to the priced figure.
+	var settledPlatformFee *int64
+	if row.SettledPlatformFee.Valid {
+		settledPlatformFee = &row.SettledPlatformFee.Int64
+	}
+
+	var settledGatewayFee *int64
+	if row.SettledGatewayFee.Valid {
+		settledGatewayFee = &row.SettledGatewayFee.Int64
 	}
 
 	var metadata map[string]any
@@ -458,6 +485,8 @@ func (r *PostgresProductTransactionRepository) scanRow(rows *sql.Rows) (*domain.
 		PlatformFeeTransferred:   row.PlatformFeeTransferred,
 		PlatformFeeTransferredAt: platformFeeTransferredAt,
 		TransferRequestID:        row.TransferRequestID.String,
+		SettledPlatformFee:       settledPlatformFee,
+		SettledGatewayFee:        settledGatewayFee,
 	}
 	redifu.InitRecord(tx)
 	// Override auto-generated values with database values
@@ -531,7 +560,8 @@ func (r *PostgresProductTransactionRepository) GetSettledWithoutPlatformFeeTrans
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
-		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
+		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
+		       settled_platform_fee, settled_gateway_fee
 		FROM product_transactions
 		WHERE status = 'SETTLED' 
 		  AND platform_fee_transferred = false 
@@ -556,7 +586,8 @@ func (r *PostgresProductTransactionRepository) GetAwaitingSettlement(ctx context
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
-		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata
+		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
+		       settled_platform_fee, settled_gateway_fee
 		FROM product_transactions
 		WHERE status = 'COMPLETED'
 		ORDER BY completed_at ASC
@@ -564,4 +595,61 @@ func (r *PostgresProductTransactionRepository) GetAwaitingSettlement(ctx context
 	`
 
 	return r.scanMany(ctx, query, limit)
+}
+
+// SaveSettledFees records what the fees turned out to be once Singapay reported what it
+// actually took.
+//
+// Written inside the same transaction as the COMPLETED -> SETTLED move, so a transaction
+// can never reach SETTLED with these unset — ProcessPlatformFeeTransfer reads them the
+// moment the status changes, and an unset value there means it silently moves the priced
+// figure instead of the booked one.
+func (r *PostgresProductTransactionRepository) SaveSettledFees(ctx context.Context, id string, platformFee, gatewayFee int64) error {
+	query := `
+		UPDATE product_transactions
+		SET settled_platform_fee = $1, settled_gateway_fee = $2, updated_at = $3
+		WHERE uuid = $4
+	`
+
+	result, err := r.db.ExecContext(ctx, query, platformFee, gatewayFee, time.Now(), id)
+	if err != nil {
+		return ErrFailedUpdateSQL.WithError(err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return ErrFailedQuerySQL.WithError(err)
+	}
+
+	if rowsAffected == 0 {
+		return ErrNotFound
+	}
+
+	return nil
+}
+
+// OldestAwaitingSettlement returns when the oldest unsettled COMPLETED transaction was
+// completed, and false when there are none.
+//
+// This is the settlement worker's health signal, and the one alarm a reconciler cannot
+// fool by running cleanly and booking nothing: if settlement stops for any reason — a
+// webhook that never arrived, a pass that matched nothing, a worker that is not running —
+// this age climbs and keeps climbing. Served as a one-row index scan by
+// idx_product_transactions_awaiting_settlement.
+func (r *PostgresProductTransactionRepository) OldestAwaitingSettlement(ctx context.Context) (time.Time, bool, error) {
+	query := `
+		SELECT MIN(completed_at)
+		FROM product_transactions
+		WHERE status = 'COMPLETED'
+	`
+
+	var oldest sql.NullTime
+	if err := r.db.QueryRowContext(ctx, query).Scan(&oldest); err != nil {
+		return time.Time{}, false, ErrFailedQuerySQL.WithError(err)
+	}
+	if !oldest.Valid {
+		return time.Time{}, false, nil
+	}
+
+	return oldest.Time, true, nil
 }

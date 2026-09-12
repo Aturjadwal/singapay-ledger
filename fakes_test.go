@@ -359,6 +359,138 @@ func (f *FakeProductTransactionRepository) GetSettledWithoutPlatformFeeTransfer(
 	return nil, nil
 }
 
+func (f *FakeProductTransactionRepository) SaveSettledFees(ctx context.Context, id string, platformFee, gatewayFee int64) error {
+	tx, ok := f.transactions[id]
+	if !ok {
+		return repo.ErrNotFound
+	}
+	tx.SettledPlatformFee = &platformFee
+	tx.SettledGatewayFee = &gatewayFee
+	return nil
+}
+
+func (f *FakeProductTransactionRepository) OldestAwaitingSettlement(ctx context.Context) (time.Time, bool, error) {
+	var oldest time.Time
+	found := false
+	for _, tx := range f.transactions {
+		if tx.Status != domain.TransactionStatusCompleted || tx.CompletedAt == nil {
+			continue
+		}
+		if !found || tx.CompletedAt.Before(oldest) {
+			oldest = *tx.CompletedAt
+			found = true
+		}
+	}
+	return oldest, found, nil
+}
+
+// FakeSettlementNotificationRepository provides in-memory settlement inbox storage.
+type FakeSettlementNotificationRepository struct {
+	notifications map[string]*domain.SettlementNotification
+}
+
+func NewFakeSettlementNotificationRepository() *FakeSettlementNotificationRepository {
+	return &FakeSettlementNotificationRepository{
+		notifications: make(map[string]*domain.SettlementNotification),
+	}
+}
+
+// Save mirrors the real ON CONFLICT DO NOTHING: a repeat delivery of the same
+// (settlement_id, event) stores nothing and is reported as not stored, never as an error.
+func (f *FakeSettlementNotificationRepository) Save(ctx context.Context, n *domain.SettlementNotification) (bool, error) {
+	for _, existing := range f.notifications {
+		if existing.SettlementID == n.SettlementID && existing.Event == n.Event {
+			return false, nil
+		}
+	}
+	f.notifications[n.UUID] = n
+	return true, nil
+}
+
+func (f *FakeSettlementNotificationRepository) GetByID(ctx context.Context, id string) (*domain.SettlementNotification, error) {
+	n, ok := f.notifications[id]
+	if !ok {
+		return nil, repo.ErrNotFound
+	}
+	return n, nil
+}
+
+func (f *FakeSettlementNotificationRepository) GetByIdentity(ctx context.Context, settlementID, event string) (*domain.SettlementNotification, error) {
+	for _, n := range f.notifications {
+		if n.SettlementID == settlementID && n.Event == event {
+			return n, nil
+		}
+	}
+	return nil, repo.ErrNotFound
+}
+
+func (f *FakeSettlementNotificationRepository) GetActionable(ctx context.Context, limit int) ([]*domain.SettlementNotification, error) {
+	var result []*domain.SettlementNotification
+	for _, n := range f.notifications {
+		if n.IsActionable() {
+			result = append(result, n)
+			if limit > 0 && len(result) >= limit {
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
+func (f *FakeSettlementNotificationRepository) CountActionable(ctx context.Context) (int, error) {
+	count := 0
+	for _, n := range f.notifications {
+		if n.IsActionable() {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (f *FakeSettlementNotificationRepository) ClaimIfActionable(ctx context.Context, id string) (bool, error) {
+	n, ok := f.notifications[id]
+	if !ok {
+		return false, repo.ErrNotFound
+	}
+	if !n.IsActionable() {
+		return false, nil
+	}
+	n.Status = domain.SettlementNotificationProcessing
+	return true, nil
+}
+
+func (f *FakeSettlementNotificationRepository) MarkProcessed(ctx context.Context, id string) error {
+	n, ok := f.notifications[id]
+	if !ok {
+		return repo.ErrNotFound
+	}
+	now := time.Now()
+	n.Status = domain.SettlementNotificationProcessed
+	n.ProcessedAt = &now
+	n.FailureReason = ""
+	return nil
+}
+
+func (f *FakeSettlementNotificationRepository) MarkFailed(ctx context.Context, id string, reason string) error {
+	n, ok := f.notifications[id]
+	if !ok {
+		return repo.ErrNotFound
+	}
+	n.Status = domain.SettlementNotificationFailed
+	n.FailureReason = reason
+	return nil
+}
+
+func (f *FakeSettlementNotificationRepository) MarkNeedsReview(ctx context.Context, id string, reason string) error {
+	n, ok := f.notifications[id]
+	if !ok {
+		return repo.ErrNotFound
+	}
+	n.Status = domain.SettlementNotificationNeedsReview
+	n.FailureReason = reason
+	return nil
+}
+
 // FakeSettlementBatchRepository provides in-memory settlement batch storage
 type FakeSettlementBatchRepository struct {
 	batches map[string]*domain.SettlementBatch
@@ -650,6 +782,7 @@ type FakeRepositoryProvider struct {
 	productTransactionRepo        *FakeProductTransactionRepository
 	settlementBatchRepo           *FakeSettlementBatchRepository
 	settlementItemRepo            *FakeSettlementItemRepository
+	settlementNotificationRepo    *FakeSettlementNotificationRepository
 	journalRepo                   *FakeJournalRepository
 	reconciliationDiscrepancyRepo *FakeReconciliationDiscrepancyRepository
 	disbursementRepo              *FakeDisbursementRepository
@@ -669,6 +802,7 @@ func NewFakeRepositoryProvider() *FakeRepositoryProvider {
 		productTransactionRepo:        NewFakeProductTransactionRepository(),
 		settlementBatchRepo:           NewFakeSettlementBatchRepository(),
 		settlementItemRepo:            NewFakeSettlementItemRepository(),
+		settlementNotificationRepo:    NewFakeSettlementNotificationRepository(),
 		journalRepo:                   NewFakeJournalRepository(),
 		reconciliationDiscrepancyRepo: NewFakeReconciliationDiscrepancyRepository(),
 		disbursementRepo:              NewFakeDisbursementRepository(),
@@ -694,6 +828,10 @@ func (f *FakeRepositoryProvider) SettlementBatch() domain.SettlementBatchReposit
 
 func (f *FakeRepositoryProvider) SettlementItem() domain.SettlementItemRepository {
 	return f.settlementItemRepo
+}
+
+func (f *FakeRepositoryProvider) SettlementNotification() domain.SettlementNotificationRepository {
+	return f.settlementNotificationRepo
 }
 
 func (f *FakeRepositoryProvider) Journal() domain.JournalRepository {

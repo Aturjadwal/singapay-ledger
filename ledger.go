@@ -1429,10 +1429,26 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 	)
 
 	for _, tx := range transactions {
-		if tx.Fee.PlatformFee <= 0 {
+		// The amount to move is what the platform actually earned, which is not always
+		// what was priced at checkout. Under GATEWAY_ON_CUSTOMER the platform absorbs any
+		// gateway overcharge, so settlement can book a smaller platform fee than the one
+		// quoted — and moving the quoted figure would take money out of the seller's
+		// sub-account that the ledger never credited the platform.
+		//
+		// SettledPlatformFee is nil for transactions that settled before it was recorded.
+		// Those were transferred under the old rule and their money has already moved, so
+		// the priced figure is the right fallback. nil means "not recorded", never zero.
+		platformFee := tx.Fee.PlatformFee
+		if tx.SettledPlatformFee != nil {
+			platformFee = *tx.SettledPlatformFee
+		}
+
+		if platformFee <= 0 {
 			c.logger.WarnContext(ctx, "Transaction has zero platform fee, skipping",
 				"transaction_id", tx.UUID,
 				"invoice_number", tx.InvoiceNumber,
+				"priced_platform_fee", tx.Fee.PlatformFee,
+				"settled_platform_fee_recorded", tx.SettledPlatformFee != nil,
 			)
 			continue
 		}
@@ -1476,7 +1492,7 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 		}
 
 		_, gwErr := c.gateway.TransferBetweenAccounts(ctx, sellerAccount.SingapayAccountID, singapay.TransferRequest{
-			Amount:                   tx.Fee.PlatformFee,
+			Amount:                   platformFee,
 			BeneficiaryAccountNumber: platformAccount.SingapayAccountNumber,
 			MerchantRefNo:            reference,
 		})
@@ -1485,7 +1501,7 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 			c.logger.ErrorContext(ctx, "Platform fee transfer failed - Singapay API error",
 				"transaction_id", tx.UUID,
 				"invoice_number", tx.InvoiceNumber,
-				"platform_fee", tx.Fee.PlatformFee,
+				"platform_fee", platformFee,
 				"from_account", sellerAccount.SingapayAccountID,
 				"to_account_number", platformAccount.SingapayAccountNumber,
 				"merchant_ref_no", reference,
@@ -1500,7 +1516,7 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 			c.logger.ErrorContext(ctx, "Singapay transfer succeeded but the DB update failed - the next run will re-present the same reference",
 				"transaction_id", tx.UUID,
 				"invoice_number", tx.InvoiceNumber,
-				"platform_fee", tx.Fee.PlatformFee,
+				"platform_fee", platformFee,
 				"merchant_ref_no", reference,
 				"db_error", err,
 			)
@@ -1511,7 +1527,7 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 		c.logger.InfoContext(ctx, "Platform fee transferred successfully",
 			"transaction_id", tx.UUID,
 			"invoice_number", tx.InvoiceNumber,
-			"platform_fee", tx.Fee.PlatformFee,
+			"platform_fee", platformFee,
 			"from_account", sellerAccount.SingapayAccountID,
 			"to_account_number", platformAccount.SingapayAccountNumber,
 		)
@@ -1519,7 +1535,7 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 		result.Transfers = append(result.Transfers, PlatformFeeTransferSuccess{
 			TransactionID:  tx.UUID,
 			InvoiceNumber:  tx.InvoiceNumber,
-			PlatformFee:    tx.Fee.PlatformFee,
+			PlatformFee:    platformFee,
 			FromSubAccount: sellerAccount.SingapayAccountID,
 			ToSubAccount:   platformAccount.SingapayAccountNumber,
 		})

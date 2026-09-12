@@ -28,6 +28,7 @@ type RepositoryProvider interface {
 	Disbursement() domain.DisbursementRepository
 	SettlementBatch() domain.SettlementBatchRepository
 	SettlementItem() domain.SettlementItemRepository
+	SettlementNotification() domain.SettlementNotificationRepository
 	ReconciliationDiscrepancy() domain.ReconciliationDiscrepancyRepository
 	Verification() domain.VerificationRepository
 }
@@ -75,6 +76,10 @@ func (p *PostgresRepositoryProvider) SettlementBatch() domain.SettlementBatchRep
 
 func (p *PostgresRepositoryProvider) SettlementItem() domain.SettlementItemRepository {
 	return NewPostgresSettlementItemRepository(p.db)
+}
+
+func (p *PostgresRepositoryProvider) SettlementNotification() domain.SettlementNotificationRepository {
+	return NewPostgresSettlementNotificationRepository(p.db)
 }
 
 func (p *PostgresRepositoryProvider) ReconciliationDiscrepancy() domain.ReconciliationDiscrepancyRepository {
