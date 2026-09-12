@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/Aturjadwal/singapay-ledger/domain"
@@ -250,6 +251,15 @@ func (c *LedgerClient) HandlePaymentSuccess(ctx context.Context, req singapay.We
 		if err := tx.Journal().Save(ctx, journal); err != nil {
 			return err
 		}
+
+		// The gateway's own identifiers for the PAYMENT, which this is the first moment
+		// to learn for every channel. They are what lets settlement read this transaction
+		// back as a point lookup later: the instrument id recorded at creation is a
+		// different entity for VA and payment link. See PaymentRequest.GatewayTransactionID.
+		paymentReq.SetGatewayTransaction(
+			strconv.FormatInt(notification.Data.Transaction.ID, 10),
+			notification.Data.Transaction.TransactionID,
+		)
 
 		if err := paymentReq.MarkCompleted(); err != nil {
 			return err

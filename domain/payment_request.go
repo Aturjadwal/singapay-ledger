@@ -25,14 +25,30 @@ type PaymentRequest struct {
 	ProductTransactionUUID string
 	RequestID              string // Singapay's own id for the payment instrument (VA ULID, QRIS/link id, e-wallet id)
 	PaymentCode            string // VA number, QRIS code, etc.
-	PaymentChannel         string // Payment method (QRIS, VA_BCA, etc.)
-	PaymentURL             string // URL for user to complete payment
-	Amount                 int64  // Total charged to buyer
-	Currency               Currency
-	Status                 PaymentStatus
-	FailureReason          string
-	CompletedAt            *time.Time // When the money-in webhook confirmed payment
-	ExpiresAt              time.Time  // Payment link expiration
+
+	// GatewayTransactionID and GatewayTransactionRef identify the PAYMENT, not the
+	// instrument, and are filled in from the money-in webhook rather than at creation.
+	//
+	// RequestID above is the instrument's id, which for VA and payment link is a
+	// different entity from the transaction: a VA is a container and the payment that
+	// arrives in it has its own business id; a payment link can carry several attempts,
+	// each with its own. So neither can be used to read a settled transaction back.
+	//
+	// Two fields because the four detail endpoints disagree about which identifier they
+	// take — the numeric id for QRIS, e-wallet and payment link, the business id for VA.
+	// Both arrive in the same webhook, so storing both removes a per-channel guess from
+	// the settlement read path. Empty on rows that predate the columns, which the reader
+	// treats as "fall back to a per-channel lookup", not as an error.
+	GatewayTransactionID  string // MoneyInTransaction.ID — numeric primary key
+	GatewayTransactionRef string // MoneyInTransaction.TransactionID — business id
+	PaymentChannel        string // Payment method (QRIS, VA_BCA, etc.)
+	PaymentURL            string // URL for user to complete payment
+	Amount                int64  // Total charged to buyer
+	Currency              Currency
+	Status                PaymentStatus
+	FailureReason         string
+	CompletedAt           *time.Time // When the money-in webhook confirmed payment
+	ExpiresAt             time.Time  // Payment link expiration
 }
 
 // PaymentRequestRepository defines data access for payment requests
@@ -75,6 +91,22 @@ func NewPaymentRequest(
 // SetPaymentCode sets the payment code (VA number, QRIS code, etc.)
 func (pr *PaymentRequest) SetPaymentCode(code string) {
 	pr.PaymentCode = code
+	pr.UpdatedAt = time.Now()
+}
+
+// SetGatewayTransaction records the gateway's identifiers for the payment itself.
+//
+// Called when the money-in webhook is booked, which is the first moment the transaction
+// exists at Singapay for every channel. Both values are stored as sent; neither is
+// validated, because an identifier we do not recognise is still the identifier Singapay
+// will quote back in a dispute.
+func (pr *PaymentRequest) SetGatewayTransaction(id, ref string) {
+	if id != "" {
+		pr.GatewayTransactionID = id
+	}
+	if ref != "" {
+		pr.GatewayTransactionRef = ref
+	}
 	pr.UpdatedAt = time.Now()
 }
 
