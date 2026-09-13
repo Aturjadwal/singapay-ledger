@@ -1,5 +1,16 @@
 # Migrasi DOKU → Singapay: Peta Endpoint & Model Operasi
 
+> **DOKUMEN RISET, BUKAN REFERENSI KEADAAN SEKARANG.** Ditulis 2026-09-09 sebagai bahan
+> migrasi; tidak diperbarui mengikuti kode. Isinya tentang **cara kerja Singapay**, yang tetap
+> berlaku; yang tidak lagi berlaku adalah kesimpulan desain di dalamnya.
+>
+> Khususnya: pertanyaan terbuka soal settlement yang dirumuskan di sini — timezone window dan
+> `settle_at` vs `settled_to_merchant_at` — **tidak dijawab, melainkan dihindari.** Jalur
+> settlement yang jadi dibangun tidak pernah memakai window sama sekali. Lihat
+> [102](./102-settlement-reconciliation.md).
+>
+> Untuk keadaan sekarang: [`../AGENTS.md`](../AGENTS.md), [`ENTITIES.md`](./ENTITIES.md).
+
 Dokumen ini merangkum **cara kerja payment gateway Singapay** dan memetakan setiap
 pemakaian DOKU di repo ini ke endpoint Singapay yang setara. Sumbernya adalah
 dokumentasi publik Singapay ditambah OpenAPI spec resminya

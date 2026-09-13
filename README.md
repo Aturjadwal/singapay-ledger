@@ -20,17 +20,20 @@
 Accept payments via QRIS, Virtual Account and e-wallet — with built-in balance tracking,
 double-entry bookkeeping and bank disbursement. No manual ledger wiring required.
 
-> ### Settlement reconciliation is not implemented yet
+> ### Settlement runs per transaction, not per batch
 >
-> Everything else runs on Singapay: account provisioning, payments, webhooks, balance
-> inquiry, bank account validation, payouts and platform-fee transfers.
+> The whole money cycle runs on Singapay: account provisioning, payments, webhooks, balance
+> inquiry, bank account validation, settlement, payouts and platform-fee transfers.
 >
-> **`ProcessReconciliation` refuses to run.** It is the step that converts `PENDING` into
-> `AVAILABLE`, so until it lands, money can arrive and be booked but **nothing new becomes
-> withdrawable**. Four questions have to be answered against a live sandbox first — see
-> [Reconciliation](#reconciliation--not-implemented-yet) — and ledger entries are
-> insert-only, so a settlement booked on a wrong assumption cannot be undone, only
-> compensated with an audit.
+> Singapay's settlement webhook announces totals and a date window but **no list of the
+> transactions it covered**. Rather than reconstruct that list from the window — which
+> depends on two facts Singapay does not document — this ledger treats the webhook as a
+> doorbell and asks Singapay about each of its own open invoices directly. See
+> [Settlement](#settlement).
+>
+> **Still open: the refund policy.** `settlement.refunded` is stored for review and never
+> acted on automatically, because pulling back funds that may already have been withdrawn
+> needs a negative-balance decision this ledger does not have.
 
 ---
 
@@ -39,13 +42,14 @@ double-entry bookkeeping and bank disbursement. No manual ledger wiring required
 - Records product sales as immutable double-entry ledger entries
 - Tracks seller balances across two buckets: `PENDING` (captured, not yet settled) and `AVAILABLE` (settled, withdrawable)
 - Handles seller withdrawals via Singapay bank disbursement, reserving the transfer fee along with the amount
+- Settles those balances by asking Singapay about each open invoice in turn, and reconciles the fee it actually took
 - Transfers platform fees to the platform sub-account after settlement
 - Verifies and books Singapay's money-in and money-out webhooks
 
 ## What it does NOT do
 
 - **No top-up / balance loading** — seller balances only grow through settled product transactions. There is no API to credit a seller's balance directly.
-- **No settlement reconciliation** — see the callout above.
+- **No refund handling** — `settlement.refunded` is stored as `NEEDS_REVIEW` and never booked automatically. See the callout above.
 - **No payment gateway abstraction** — every gateway call goes to Singapay. `PaymentGateway` is an interface so the money paths can be tested, not so a second gateway can be plugged in.
 
 ---
@@ -57,7 +61,7 @@ ledger/
 ├── ledger.go              # LedgerClient — accounts, balances, withdrawal, platform-fee transfer
 ├── payment.go             # Payment creation and channel routing
 ├── webhook.go             # Inbound webhook verification and booking
-├── reconciliation.go      # Settlement types + the not-implemented explanation
+├── settlement.go          # Settlement inbox + the per-transaction settling pass
 ├── gateway.go             # PaymentGateway interface and channel mapping
 ├── singapay/              # Singapay API client — HTTP only, knows nothing about the ledger
 ├── domain/                # Pure domain types and business rules
@@ -65,8 +69,8 @@ ledger/
 │   ├── product_transaction.go  # ProductTransaction + FeeBreakdown
 │   ├── ledger_entry.go    # LedgerEntry (immutable), factory functions
 │   ├── fee_config.go      # FeeConfig, FeeCalculator
-│   ├── settlement_batch.go
-│   └── settlement_item.go
+│   ├── settlement_notification.go  # The settlement webhook inbox
+│   └── settled_transaction.go      # One settled row, normalised across four channels
 ├── repo/                  # Repository interfaces + PostgreSQL implementations
 ├── cmd/singapay-smoke/    # Verifies a Singapay connection end to end
 ├── docs/                  # Architecture docs and flow diagrams
@@ -229,7 +233,7 @@ transfer call answers `SP000` to say the instruction was accepted, and the money
 be hours from moving or may never move. Without this webhook a seller's balance stays
 reserved against a payout that failed until somebody runs the pending sweep by hand.
 
-`settlement_notif_url` has no handler yet — see [Reconciliation](#reconciliation--not-implemented-yet).
+`settlement_notif_url` is handled by `HandleSettlementNotification`, which stores the delivery and books nothing — see [Settlement](#settlement).
 
 Duplicate deliveries are ordinary traffic, not incidents: Singapay retries, and both
 handlers no-op on a transaction or disbursement that is already past the state they book.
@@ -250,8 +254,8 @@ configs, err := client.GetPaymentChannelFeeConfigs(ctx)
 
 | Bucket | When it grows | When it shrinks |
 |---|---|---|
-| `PENDING` | After `HandlePaymentSuccess` | After reconciliation *(not implemented)* |
-| `AVAILABLE` | After reconciliation *(not implemented)* | After `Withdraw` |
+| `PENDING` | After `HandlePaymentSuccess` | After a settlement pass books the transaction |
+| `AVAILABLE` | After a settlement pass books the transaction | After `Withdraw` |
 
 > **There is no top-up.** The only way to increase a seller's balance is through a completed
 > and settled product sale.
@@ -337,45 +341,47 @@ exists and may hold rows. Nothing writes to it.
 
 ---
 
-## Reconciliation — not implemented yet
+## Settlement
 
-Reconciliation moves a seller's balance from `PENDING` to `AVAILABLE`. `ProcessReconciliation`
-returns `ErrReconciliationNotImplemented` and books nothing.
+Settlement converts a seller's `PENDING` balance into `AVAILABLE`. It runs as a worker pass,
+`ProcessSettlementNotifications`, which is safe to call on a schedule forever: on a quiet tick
+it does two cheap reads and returns.
 
-**Why it is absent rather than approximated.** Ledger entries are insert-only. A settlement
-booked on a wrong assumption cannot be undone, only compensated with a second set of entries
-and an audit — so an approximation is more expensive than an absence. The absence is loud; a
-wrong `PENDING` → `AVAILABLE` conversion is silent, and it decides what a seller is allowed
-to withdraw.
+**The webhook is a doorbell.** Singapay announces a batch on `settlement_notif_url` with
+totals, a settlement method and a date window — and no list of the transactions it covered.
+`HandleSettlementNotification` verifies the signature and stores the delivery verbatim in
+`settlement_notifications`. It books nothing, because nothing in that payload could justify a
+ledger entry.
 
-**The mechanism is clear.** Singapay announces a batch on `settlement_notif_url` with totals,
-a settlement method and a date window — and no list of the transactions it covered. The rows
-are reconstructed by replaying that window against the per-product transaction lists
-(`ListVATransactions` and its three siblings) filtered on `SettlementWindow`.
+**The ledger asks about its own invoices.** A pass takes what is still `COMPLETED`, oldest
+first, and asks Singapay about each one directly: the channel decides the endpoint, the
+payment request decides the key. No window is ever used to select rows, so no window can be
+misread.
 
-**Four questions have to be answered against a live sandbox first.** Each has a wrong answer
-that produces a plausible-looking result:
+That matters, because reconstructing a batch from its window would depend on two things
+Singapay does not document, each with a wrong answer that looks plausible: what timezone its
+offsetless window text is in (`"26 Dec 2025 13:35:45"`), and which of a QRIS transaction's two
+settlement timestamps the window keys on. The per-transaction path does not ask either.
 
-1. **Timezone and boundary of the settlement window.** Singapay writes settlement timestamps
-   as text with no offset — `"26 Dec 2025 13:35:45"` — and Asia/Jakarta is an assumption, not
-   a documented fact. Seven hours in either direction moves rows between batches: some settle
-   twice, others never.
-2. **Which settlement event the window keys on.** A QRIS transaction carries both `settle_at`
-   and `settled_to_merchant_at`, and they are different moments.
-3. **Whether a batch's rows can be enumerated at acceptable cost.** The reconstruction is
-   N accounts × up to 4 product lists × pagination, per settlement. Rate limits and page
-   behaviour are unmeasured.
-4. **What `settlement.refunded` should do.** It can pull back funds that have already become
-   `AVAILABLE` and may already have been withdrawn. This ledger has no negative-balance
-   policy. That is a business decision, not a coding gap.
+**A pass also triggers on age.** If no notification arrives — a lost delivery, an allowlist
+change, retries exhausted — a pass runs anyway once the oldest unsettled transaction has been
+waiting longer than `SettlementFloorAge` (24 hours). Without that, one dropped webhook would
+strand money silently. The number to alarm on is `OldestAwaitingAge`, which climbs whenever
+settlement stops working even if every pass reports success.
 
-`cmd/singapay-smoke` is where (1) and (2) get answered. (3) needs a sandbox with volume.
-(4) needs a person.
+**Booking is guarded by a compare-and-set.** Each settlement happens in one database
+transaction whose first statement moves the row `COMPLETED → SETTLED` conditionally. Two
+passes racing on one transaction produce one settlement, not two sets of insert-only entries.
+Where the fee Singapay actually took differs from the one priced, the difference is absorbed
+per the rules in [`docs/104`](./docs/104-fee-mismatch-reconciliation.md); where it cannot be
+absorbed the transaction is left `COMPLETED` for a person.
 
-The domain types (`SettlementBatch`, `SettlementItem`, `SettledTransaction`), the schema, and
-the ledger-entry side — `PENDING` → `AVAILABLE` conversion, fee adjustment write-offs and
-credits, gateway fee clearance — are all in place and unchanged from a model that survives
-the migration intact, because Singapay's pending/available split matches this ledger's.
+Full detail: [`docs/102-settlement-reconciliation.md`](./docs/102-settlement-reconciliation.md).
+
+**Still open: `settlement.refunded`.** It can pull back funds that have already become
+`AVAILABLE` and may already have been withdrawn. This ledger has no negative-balance policy,
+so refund deliveries are stored as `NEEDS_REVIEW` and left for a person. That is a business
+decision, not a coding gap.
 
 ---
 
@@ -384,8 +390,13 @@ the migration intact, because Singapay's pending/available split matches this le
 Requires PostgreSQL. Schema is in [`database/schemas/schema.sql`](database/schemas/schema.sql);
 migrations are in [`database/migrations/`](database/migrations/).
 
-Key tables: `ledger_accounts`, `product_transactions`, `ledger_entries`, `journals`,
-`settlement_batches`, `settlement_items`, `fee_configs`, `disbursements`.
+Key tables: `ledger_accounts`, `product_transactions`, `payment_requests`, `ledger_entries`,
+`journals`, `settlement_notifications`, `fee_configs`, `disbursements`.
+
+[`025_drop_legacy_settlement_tables.sql`](database/migrations/025_drop_legacy_settlement_tables.sql)
+removes `settlement_batches`, `settlement_items` and `reconciliation_discrepancies`, which
+belonged to the batch reconciler the per-transaction path replaced. **It is irreversible** —
+read its first section before applying it.
 
 ### Migrating an existing database
 

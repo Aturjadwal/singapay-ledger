@@ -2,7 +2,20 @@
 
 ## Overview
 
-This document describes the reconciliation mechanism when a discrepancy exists between `ExpectedGatewayFee` (recorded at payment time) and `ActualGatewayFee` (from the Singapay settlement).
+This document describes what happens when `ExpectedGatewayFee` (recorded at payment time)
+and `ActualGatewayFee` (what Singapay actually took) disagree.
+
+> **Where the actual fee comes from.** The settling pass reads each open invoice back from
+> Singapay directly and takes the fee off that record — see
+> [102](./102-settlement-reconciliation.md). There is no settlement file: an earlier version of
+> this document described the figures as columns of a settlement CSV, which was the previous
+> gateway's format. The arithmetic below is unchanged and is what `resolveFeeAdjustment` in
+> [`settlement.go`](../settlement.go) implements.
+>
+> **Virtual account, QRIS and e-wallet report their own fee. Payment link reports none.** For
+> a payment link the actual fee is copied from the expected one, which makes `feeDelta` zero
+> by construction — that is the absence of a reconciliation, not a perfect one, and
+> `FeeReported` is what keeps the two distinguishable.
 
 ---
 
@@ -11,11 +24,12 @@ This document describes the reconciliation mechanism when a discrepancy exists b
 | Term | Definition |
 |---|---|
 | `ExpectedGatewayFee` | gateway fee predicted at payment time (stored in `ProductTransaction.Fee.GatewayFee`) |
-| `ActualGatewayFee` | Actual gateway fee from the `FEE` column in the settlement CSV |
+| `ActualGatewayFee` | Gateway fee Singapay actually took, from the per-transaction read (`SettledTransaction.Fee`) |
 | `feeDelta` | `ActualGatewayFee - ExpectedGatewayFee` |
-| `PayToMerchant` | `PAY TO MERCHANT` column in CSV — amount Singapay sends to the merchant SAC |
+| `PayToMerchant` | Net credited to the seller's sub-account (`SettledTransaction.NetAmount`) |
 | `ExpectedNetAmount` | Amount we expect in `PayToMerchant` based on the fee model |
 | `AmountDiscrepancy` | `PayToMerchant - ExpectedNetAmount` |
+| `FeeReported` | Whether `ActualGatewayFee` is a fact or a copy of the expectation (false for payment link) |
 
 ---
 
@@ -83,7 +97,7 @@ PlatformFee     =   5,000
 ExpectedGatewayFee =   3,000
 TotalCharged    = 108,000
 
-ActualGatewayFee (from CSV) =  4,000
+ActualGatewayFee (reported) =  4,000
 feeDelta                 = +1,000
 adjustedPlatformFee      =  4,000
 ```
@@ -123,7 +137,7 @@ Singapay     AVAILABLE =                            =       0
 **PayToMerchant check:**
 ```
 Seller AVAILABLE + Platform AVAILABLE = 100,000 + 4,000 = 104,000
-PayToMerchant from CSV                = 108,000 - 4,000 = 104,000  ✓
+PayToMerchant reported                = 108,000 - 4,000 = 104,000  ✓
 ```
 
 ---
@@ -133,7 +147,7 @@ PayToMerchant from CSV                = 108,000 - 4,000 = 104,000  ✓
 ### Setup
 
 ```
-ActualGatewayFee (from CSV) =  2,000
+ActualGatewayFee (reported) =  2,000
 feeDelta                 = -1,000
 adjustedSellerNet        = 101,000
 ```
@@ -164,7 +178,7 @@ Singapay     PENDING   = +3,000 - 3,000             =       0  ✓
 **PayToMerchant check:**
 ```
 Seller AVAILABLE + Platform AVAILABLE = 101,000 + 5,000 = 106,000
-PayToMerchant from CSV                = 108,000 - 2,000 = 106,000  ✓
+PayToMerchant reported                = 108,000 - 2,000 = 106,000  ✓
 ```
 
 ---
@@ -180,7 +194,7 @@ ExpectedGatewayFee =   3,000
 TotalCharged    = 105,000    (= SellerPrice + PlatformFee; customer does NOT pay gateway fee)
 SellerNetAmount =  97,000    (= SellerPrice - ExpectedGatewayFee)
 
-ActualGatewayFee (from CSV) =  4,000
+ActualGatewayFee (reported) =  4,000
 feeDelta                 = +1,000
 adjustedSellerNet        =  96,000   (= 97,000 - 1,000)
 ```
@@ -222,7 +236,7 @@ Singapay     AVAILABLE =                            =       0
 **PayToMerchant check:**
 ```
 Seller AVAILABLE + Platform AVAILABLE = 96,000 + 5,000 = 101,000
-PayToMerchant from CSV                = 105,000 - 4,000 = 101,000  ✓
+PayToMerchant reported                = 105,000 - 4,000 = 101,000  ✓
 ```
 
 ---
@@ -232,7 +246,7 @@ PayToMerchant from CSV                = 105,000 - 4,000 = 101,000  ✓
 ### Setup
 
 ```
-ActualGatewayFee (from CSV) =  2,000
+ActualGatewayFee (reported) =  2,000
 feeDelta                 = -1,000
 adjustedSellerNet        =  98,000   (= 97,000 + 1,000)
 ```
@@ -263,7 +277,7 @@ Singapay     PENDING   = +3,000 - 3,000             =       0  ✓
 **PayToMerchant check:**
 ```
 Seller AVAILABLE + Platform AVAILABLE = 98,000 + 5,000 = 103,000
-PayToMerchant from CSV                = 105,000 - 2,000 = 103,000  ✓
+PayToMerchant reported                = 105,000 - 2,000 = 103,000  ✓
 ```
 
 ---
@@ -332,8 +346,8 @@ When a BLOCK condition is detected:
 | `PRODUCT_PAYMENT` | PENDING | + | Phase 2: payment success (Seller) |
 | `PLATFORM_COMMISSION` | PENDING | + | Phase 2: payment success (Platform) |
 | `PROCESSOR_FEE` | PENDING | + | Phase 2: payment success (Singapay) |
-| `SETTLEMENT_CLEAR` | PENDING | - | Phase 3: settlement CSV |
-| `SETTLEMENT_NET` | AVAILABLE | + | Phase 3: settlement CSV |
+| `SETTLEMENT_CLEAR` | PENDING | - | Phase 3: settlement |
+| `SETTLEMENT_NET` | AVAILABLE | + | Phase 3: settlement |
 | `SETTLEMENT` | PENDING | - | Phase 3: clear Singapay PENDING |
 | `FEE_ADJUSTMENT` | PENDING / AVAILABLE | - / + | Phase 3: fee mismatch adjustment |
 | `DISBURSEMENT` | AVAILABLE | - | Seller withdrawal |

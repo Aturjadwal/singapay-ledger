@@ -1,294 +1,111 @@
-# Testing Guide for Ledger Package
+# Testing guide
 
-## Testing Strategy Using Fakes
-
-This guide explains how to test `ProcessReconciliation` and other ledger operations using **fake repositories** (hand-written test doubles) instead of mockery or database tests.
-
-## Key Concepts
-
-### 1. Fake Repositories (`ledger_test.go`)
-
-Hand-written in-memory implementations of repository interfaces:
-
-- `FakeAccountRepository`
-- `FakeLedgerEntryRepository`
-- `FakeProductTransactionRepository`
-- `FakeSettlement BatchRepository`
-- `FakeSettlementItemRepository`
-- `FakeJournalRepository`
-- `FakeReconciliationDiscrepancyRepository`
-
-Each fake stores data in memory (maps/slices) and implements the full domain repository interface.
-
-### 2. Testing Individual Process
-
-es
-
-Instead of testing the entire `ProcessReconciliation` flow (which is coupled to `LedgerClient`), test**individual sub-processes**:
-
-#### A. CSV Parsing (No Database Needed)
-
-```go
-func TestCSVParsingAlone(t *testing.T) {
-    csv := `Report Type,Transaction Report
-Batch ID,BATCH-001
-...`
-
-    parser := domain.(removed — Singapay publishes no settlement file)("test.csv", 1)
-    err := parser.Parse(strings.NewReader(csv))
-
-    // Assert metadata and rows
-}
-```
-
-#### B.Fee Calculation (Pure Domain Logic)
-
-```go
-func TestFeeCalculationAlone(t *testing.T) {
-    fee, err := domain.NewFeeBreakdown(
-        50000,  // seller price
-        1000,   // platform fee
-        4995,   // singapay fee
-        domain.CurrencyIDR,
-        domain.FeeModelGatewayOnSeller,
-    )
-
-    assert.Equal(t, int64(46005), fee.SellerNetAmount)
-}
-```
-
-#### C. Transaction Matching (Using Fakes)
-
-```go
-func TestTransactionMatching(t *testing.T) {
-    fakeRepo := NewFakeProductTransactionRepository()
-
-    // Create transaction
-    tx := &domain.ProductTransaction{...}
-    _ = fakeRepo.Save(ctx, tx)
-
-    // Try to match by invoice
-    matched, err := fakeRepo.GetByInvoiceNumber(ctx, "INV-001")
-
-    assert.NoError(t, err)
-    assert.Equal(t, tx.UUID, matched.UUID)
-}
-```
-
-#### D. Amount Discrepancy Detection (Domain Logic)
-
-```go
-func TestAmountDiscrepancy(t *testing.T) {
-    fee, _ := domain.NewFeeBreakdown(...)
-
-    // Create settlement item
-    item, _ := domain.NewSettlementItem(
-        "batch-123",
-        "INV-001",
-        "SAC-001",
-        51000,      // amount
-        45000,      // payToMerchant (WRONG!)
-        4995,       // fee
-        1,          // row number
-        map[string]string{},
-    )
-
-    // Match to transaction
-    tx := createTestProductTransaction("INV-001", fee)
-    _ = item.MatchToTransaction(tx)
-
-    // Check for discrepancy
-    assert.True(t, item.HasAmountDiscrepancy())
-    assert.Equal(t, int64(-1005), item.AmountDiscrepancy)
-}
-```
-
-#### E. SAC Verification (Using Fakes)
-
-```go
-func TestSACVerification(t *testing.T) {
-    fakeAccounts := NewFakeAccountRepository()
-
-    // Seller with SAC-001
-    seller := createTestAccount(domain.OwnerTypeSeller, "seller-1", "SAC-001")
-    _ = fakeAccounts.Save(ctx, seller)
-
-    // CSV says SAC-999 (MISMATCH!)
-    csvSAC := "SAC-999"
-
-    // Retrieve and compare
-    dbAcc, _ := fakeAccounts.GetBySel lerID(ctx, "seller-1")
-    assert.NotEqual(t, csvSAC, dbAcc.SingapayAccountID)
-}
-```
-
-#### F. Balance Movement (Using Fakes)
-
-```go
-func TestBalanceMovement(t *testing.T) {
-    fakeEntries := NewFakeLedgerEntryRepository()
-ctx := context.Background()
-
-    sellerAccountID := "seller-123"
-
-    // Initial: 46005 in PENDING
-    pendingEntry := &domain.LedgerEntry{
-        AccountUUID:   sellerAccountID,
-        Amount:        46005,
-        BalanceBucket: domain.BalanceBucketPending,
-        // ... other fields
-    }
-    _ = fakeEntries.Save(ctx, pendingEntry)
-
-    // Check initial balance
-    pending, available, _ := fakeEntries.GetAllBalances(ctx, sellerAccountID)
-    assert.Equal(t, int64(46005), pending)
-    assert.Equal(t, int64(0), available)
-
-    // Settlement: DEBIT pending, CREDIT available
-    debitEntry := &domain.LedgerEntry{
-        AccountUUID:   sellerAccountID,
-        Amount:        -46005,
-        BalanceBucket: domain.BalanceBucketPending,
-    }
-    creditEntry := &domain.LedgerEntry{
-        AccountUUID:   sellerAccountID,
-        Amount:        46005,
-        BalanceBucket: domain.BalanceBucketAvailable,
-    }
-    _ = fakeEntries.SaveBatch(ctx, []*domain.LedgerEntry{debitEntry, creditEntry})
-
-    // Verify final balance
-    pending, available, _ = fakeEntries.GetAllBalances(ctx, sellerAccountID)
-    assert.Equal(t, int64(0), pending)
-    assert.Equal(t, int64(46005), available)
-}
-```
-
-### 3. Integration Test (All Fakes Together)
-
-```go
-func TestCompleteReconciliationScenario(t *testing.T) {
-    fakes := NewFakeRepositoryProvider()
-    ctx := context.Background()
-
-    // 1. Setup accounts
-    platform, _ := setupBasicReconciliationTest(t, fakes)
-    seller := createTestAccount(domain.OwnerTypeSeller, "seller-1", "SAC-001")
-    _ = fakes.Account().Save(ctx, seller)
-
-    // 2. Create completed transaction
-    fee, _ := domain.NewFeeBreakdown(50000, 1000, 4995, domain.CurrencyIDR, domain.FeeModelGatewayOnSeller)
-    tx := createTestProductTransaction("INV-001", seller.UUID, fee)
-    _ = fakes.ProductTransaction().Save(ctx, tx)
-
-    // 3. Add initial PENDING balance
-    journal := &domain.Journal{/* ... */}
-    _ = fakes.Journal().Save(ctx, journal)
-
-    pendingEntry := &domain.LedgerEntry{
-        AccountUUID:   seller.UUID,
-        Amount:        46005,
-        BalanceBucket: domain.BalanceBucketPending,
-        JournalUUID:   journal.UUID,
-    }
-    _ = fakes.LedgerEntry().Save(ctx, pendingEntry)
-
-    // 4. Create settlement batch
-    batch, _ := domain.NewSettlementBatch(platform.UUID, "test.csv", time.Now(), "admin")
-    _ = fakes.SettlementBatch().Save(ctx, batch)
-
-    // 5. Match settlement item to transaction
-    item, _ := domain.NewSettlementItem(batch.UUID, "INV-001", "SAC-001", 51000, 46005, 4995, 1, map[string]string{})
-    _ = item.MatchToTransaction(tx)
-    _ = fakes.SettlementItem().Save(ctx, item)
-
-    // 6. Process settlement (create ledger entries)
-    settlementJournal := &domain.Journal{/* ... */}
-    _ = fakes.Journal().Save(ctx, settlementJournal)
-
-    debitEntry := &domain.LedgerEntry{
-        AccountUUID:   seller.UUID,
-        Amount:        -46005,
-        BalanceBucket: domain.BalanceBucketPending,
-        JournalUUID:   settlementJournal.UUID,
-    }
-    creditEntry := &domain.LedgerEntry{
-        AccountUUID:   seller.UUID,
-        Amount:        46005,
-        BalanceBucket: domain.BalanceBucketAvailable,
-        JournalUUID:   settlementJournal.UUID,
-    }
-    _ = fakes.LedgerEntry().SaveBatch(ctx, []*domain.LedgerEntry{debitEntry, creditEntry})
-
-    // 7. Verify final state
-    pending, available, _ := fakes.LedgerEntry().GetAllBalances(ctx, seller.UUID)
-    assert.Equal(t, int64(0), pending)
-    assert.Equal(t, int64(46005), available)
-
-    // 8. Verify settlement item
-    retrievedItem, _ := fakes.SettlementItem().GetByProductTransactionID(ctx, tx.UUID)
-    assert.False(t, retrievedItem.HasAmountDiscrepancy())
-}
-```
-
-## Benefits of This Approach
-
-1. **No Database Required**: Tests run entirely in memory
-2. **Fast**: No I/O, no network calls
-3. **Isolated**: Test each process independently
-4. **Debuggable**: Easy to inspect fake repository state
-5. **Maintainable**: No mock code generation, just plain Go
-
-## Running Tests
+156 tests across five packages. No database and no network: every test runs with `go test ./...`.
 
 ```bash
-# Run all CSV parsing tests
-go test -v -run "TestCSVParsing"
-
-# Run fee calculation tests
-go test -v -run "TestFeeCalculation"
-
-# Run all fake repository tests
-go test -v -run "TestFake"
-
-# Run specific test
-go test -v -run "TestAmountDiscrepancy"
+GOTOOLCHAIN=go1.25.5 go test ./...
+GOTOOLCHAIN=go1.25.5 go test . -run TestLedgerEntries_PaymentThroughSettlement -v
+GOTOOLCHAIN=go1.25.5 go test ./repo/ -run TestInsertStatementsHaveMatchingArity
+gofmt -l .    # must print nothing
 ```
 
-## Current Limitations
+---
 
-The full `ProcessReconciliation` method cannot easily be tested with fakes because:
+## Where the tests are, and what each layer proves
 
-1. It's tightly coupled to `LedgerClient` struct
-2. `LedgerClient.repoProvider` is a concrete type (`repo.RepositoryProvider`), not an interface
-3. Need database transaction support (`txProvider`)
+| Package | Files | What it covers |
+|---|---|---|
+| `.` (root) | `ledger_test.go`, `settlement_fee_test.go`, `webhook_test.go`, `balance_reservation_test.go`, `payout_idempotency_test.go`, `payout_request_log_test.go` | The money paths, against in-memory fakes |
+| `domain/` | `disbursement_test.go`, `fee_config_test.go` | Pure rules: state transitions, fee arithmetic |
+| `repo/` | `insert_arity_test.go`, `postgres_account_test.go`, `postgres_disbursement_test.go` | SQL, against `go-sqlmock` |
+| `singapay/` | 8 files | The HTTP client: signatures, amounts, error classification, webhook parsing |
+| `ledgererr/` | `error_test.go` | Error wrapping and code matching |
 
-**Solution**: Test individual sub-processes as shown above, rather than the entire orchestration.
+---
 
-## Future Improvements
+## The fakes
 
-To make `ProcessReconciliation` fully testable:
-
-1. Extract reconciliation logic into a separate service with interface dependencies
-2. Create `RepositoryProvider` interface in domain layer
-3. Make `LedgerClient` accept interface instead of concrete `repo.RepositoryProvider`
-
-Example:
+`fakes_test.go` provides in-memory implementations of every repository, assembled by
+`NewFakeRepositoryProvider()`. Two compile-time assertions keep them honest:
 
 ```go
-// domain/repository_provider.go
-type RepositoryProvider interface {
-    Account() AccountRepository
-    LedgerEntry() LedgerEntryRepository
-    // ... etc
-}
-
-// ledger.go
-type LedgerClient struct {
-    repoProvider domain.RepositoryProvider  // interface, not concrete type!
-    // ...
-}
+var _ repo.RepositoryProvider = (*FakeRepositoryProvider)(nil)
+var _ repo.Tx                 = (*FakeRepositoryProvider)(nil)
 ```
 
-Then fakes can be injected directly into `LedgerClient` for full end-to-end testing.
+Add a method to a repository interface and the fakes stop compiling, which is the point.
+
+`NewFakeTransactionProvider(fakes)` satisfies `repo.TransactionProvider` by handing back the
+same fakes. **It provides no transaction semantics** — no rollback, no isolation. A test that
+needs to prove rollback behaviour cannot use it.
+
+`FakeProductTransactionRepository.UpdateStatusIf` is the fake's compare-and-set. It is not
+concurrency-safe, and it exposes a `beforeCAS` hook so a test can simulate another writer
+winning the race without needing real concurrency.
+
+---
+
+## Three tests worth knowing about
+
+### `TestInsertStatementsHaveMatchingArity` (`repo/`)
+
+The most valuable test in the repository, and the least obvious. It reads every `INSERT` in
+`repo/` **as text** and compares the column list against the placeholder list.
+
+It exists because `go-sqlmock` never parses the SQL it is handed — it regex-matches the query
+text and compares the argument list. An `INSERT` whose `VALUES` carries one more placeholder
+than its column list passes every other test and then fails in production with
+`INSERT has more expressions than target columns`. That is not hypothetical: dropping
+`doku_subaccount_id` in the Singapay migration left `VALUES` at `$14` against 13 columns, and
+the first seller to reach a paid booking hit it — after their Singapay sub-account had already
+been created.
+
+**Run it whenever you add or remove a column.**
+
+### `TestLedgerEntries_PaymentThroughSettlement` (root)
+
+Walks one sale end to end and asserts the invariant the whole ledger exists for: after
+settlement, what payment put into `PENDING` nets to zero, and `AVAILABLE` holds exactly the
+settled amount. It drives the real `bookSettlement`, so it also covers the
+`COMPLETED → SETTLED` compare-and-set and the settled fee figures the platform-fee transfer
+later reads.
+
+### `TestResolveFeeAdjustment` (root, `settlement_fee_test.go`)
+
+Eight cases over the fee rules in [`docs/104`](docs/104-fee-mismatch-reconciliation.md),
+including both conditions that must **block** rather than clamp: the platform would owe more
+than it ever charged, or the seller would receive less than nothing. A clamped answer there
+looks reasonable and quietly moves the wrong amount of money.
+
+---
+
+## Conventions
+
+- Assert on behaviour, not on how it was reached. `testify` `require` for preconditions
+  (stop the test), `assert` for the claims being made (report them all).
+- Money in tests is whole rupiah `int64`, like everywhere else.
+- Arithmetic is written out in the test — `50000 - 4995` rather than a bare `45005` — so a
+  failure says which rule broke rather than only that a number moved.
+- A test that needs a `LedgerClient` builds one directly with the fakes:
+
+  ```go
+  client := &LedgerClient{
+      txProvider:   NewFakeTransactionProvider(fakes),
+      repoProvider: fakes,
+      logger:       testLogger(),
+      gateway:      gw,   // only when the path calls Singapay
+  }
+  ```
+
+---
+
+## What is not covered
+
+- **No real database.** `repo/` uses `go-sqlmock`, which checks the SQL text and arguments,
+  not that PostgreSQL accepts them. Constraints, triggers and types are unproven here.
+- **No real transaction semantics.** See the fakes note above. Rollback and isolation are
+  reasoned about, not exercised.
+- **No real concurrency.** Races on `UpdateStatusIf` are simulated through the `beforeCAS`
+  hook, not run in parallel.
+- **No live gateway.** `cmd/singapay-smoke` is the only thing that talks to Singapay, and it
+  needs sandbox credentials.

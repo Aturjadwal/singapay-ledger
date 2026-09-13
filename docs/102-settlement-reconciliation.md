@@ -1,25 +1,31 @@
-# Settlement & Reconciliation
+# Settlement — the per-transaction path
 
-> **Not implemented.** `ProcessReconciliation` returns `ErrReconciliationNotImplemented` and
-> books nothing. This document describes the design and, more importantly, the four questions
-> that have to be answered before it can be built. See [`reconciliation.go`](../reconciliation.go).
+> **Implemented.** `ProcessSettlementNotifications` in [`settlement.go`](../settlement.go) is the
+> worker's entry point and is safe to call on a schedule forever. An earlier version of this
+> document described a window-replay design that was never built and said settlement was not
+> implemented; that approach and the reason it was abandoned are kept at the bottom, under
+> [The approach that was rejected](#the-approach-that-was-rejected).
 
-Reconciliation is the step that converts a seller's `PENDING` balance into `AVAILABLE`.
-Until it lands, money can arrive and be booked, and payouts can be made against whatever is
-already `AVAILABLE` — but nothing new becomes withdrawable, and
-`ProcessPlatformFeeTransfer` finds no work because nothing reaches `SETTLED`.
+Settlement is the step that converts a seller's `PENDING` balance into `AVAILABLE`. Until it
+runs, money can arrive and be booked, and payouts can be made against whatever is already
+`AVAILABLE` — but nothing new becomes withdrawable, and `ProcessPlatformFeeTransfer` finds no
+work because nothing reaches `SETTLED`.
 
-## Why it is absent rather than approximated
+## The idea in one line
 
-Ledger entries are insert-only. A settlement booked on a wrong assumption cannot be undone,
-only compensated with a second set of entries and an audit. So an approximation here is more
-expensive than an absence: the absence is loud, while a wrong `PENDING` → `AVAILABLE`
-conversion is silent — and it decides what a seller is allowed to withdraw.
+Singapay publishes no settlement file, and its settlement webhook carries totals and a date
+window but **no list of the transactions a batch covered**. There are two ways to close that
+gap: reconstruct the list, or never need it. This is the second.
 
-## What replaced the settlement file
+```
+the webhook says "something settled"      -> stored verbatim, nothing booked
+the ledger says "these invoices are open" -> GetAwaitingSettlement
+Singapay is asked about each one directly -> has_settle, and the fee it actually took
+```
 
-There isn't one. The previous gateway published a settlement CSV: a single artefact naming
-every transaction in the batch, its amount and its fee. Singapay publishes a webhook.
+No window is ever used to select rows, so no window can be misread.
+
+## Flow
 
 ```mermaid
 sequenceDiagram
@@ -28,84 +34,168 @@ sequenceDiagram
     participant LedgerStore
 
     Singapay->>LedgerAPI: POST settlement_notif_url (settlement.completed)
-    Note right of LedgerAPI: Carries totals, settlement_method,<br/>and a date window.<br/>NOT a list of transactions.
-
     LedgerAPI->>LedgerAPI: Verify signature
-    LedgerAPI->>LedgerAPI: settlement_method balance / auto-balance?
-    Note right of LedgerAPI: 'bank-account' pays out instead —<br/>a different event entirely
+    LedgerAPI->>LedgerStore: Store the delivery verbatim
+    Note right of LedgerStore: settlement_notifications, status PENDING.<br/>Nothing is booked here.
 
-    LedgerAPI->>LedgerStore: Which invoices are awaiting settlement?
-    Note right of LedgerStore: GetAwaitingSettlement bounds the work to<br/>accounts actually holding unsettled money
+    Note over LedgerAPI: --- worker tick, separately ---
 
-    loop per account, per channel used
-        LedgerAPI->>Singapay: List VA / QRIS / e-wallet / link transactions
-        Note right of Singapay: filtered on SettlementWindow<br/>(settle_from .. settle_to)
-        Singapay-->>LedgerAPI: settled rows + the fee each channel took
+    LedgerAPI->>LedgerStore: Any actionable notification?<br/>Oldest COMPLETED older than 24h?
+    Note right of LedgerStore: Neither? The tick ends. Two cheap reads.
+
+    LedgerAPI->>LedgerStore: GetAwaitingSettlement(limit)
+    Note right of LedgerStore: status = 'COMPLETED', oldest first
+
+    loop per open invoice
+        LedgerAPI->>Singapay: Read THIS transaction (channel decides the endpoint)
+        Singapay-->>LedgerAPI: has_settle + the fee actually taken
+        LedgerAPI->>LedgerStore: If settled: one DB transaction —<br/>CAS COMPLETED→SETTLED, settled fees,<br/>journal, ledger entries
     end
 
-    LedgerAPI->>LedgerAPI: Match rows to invoices by merchant reference
-    LedgerAPI->>LedgerStore: Write settlement entries (see 104 for the fee rules)
+    LedgerAPI->>LedgerStore: Mark the claimed notifications PROCESSED
 ```
 
-`domain.SettledTransaction` exists to flatten the four channel shapes into one, because the
-reconciler should not carry four branches for what is nearly the same row.
+## What the webhook is, and is not
 
-## The four open questions
+It is a **doorbell**. `HandleSettlementNotification` verifies the signature, parses the
+payload, stores it in `settlement_notifications` exactly as it arrived, and books nothing.
+The totals, the window and `total_transactions` are recorded for audit and for support
+conversations; not one of them decides which transactions settled.
 
-Each has a wrong answer that produces a plausible-looking result. That is why none of them
-can be guessed.
+That makes the webhook an optimisation for latency, not a correctness dependency. A delivery
+that never arrives delays settlement to the next floor-age tick rather than losing it.
 
-### 1. Timezone and boundary of the settlement window
+Two kinds of delivery are parked as `NEEDS_REVIEW` rather than acted on:
 
-Singapay writes settlement timestamps as human-readable text with no offset —
-`"26 Dec 2025 13:35:45"`. Asia/Jakarta is an assumption, documented as such in
-`singapay.TextTime`, not a fact Singapay states. Seven hours in either direction moves rows
-between batches: some settle twice, others never.
+- **Refund events.** `settlement.refunded` can pull back funds that are already `AVAILABLE`
+  and may already have been withdrawn. This ledger has no negative-balance policy, and a
+  webhook handler is the wrong place to invent one. Still open — see below.
+- **Settlements that pay out.** `settlement_method` of `bank-account` or `e-wallet` sends
+  money to a nominated account instead of moving `PENDING` into `AVAILABLE`, so a pass
+  triggered by one would look for work that is not there.
 
-Whether the window bounds are inclusive is equally unstated.
+A redelivery is ordinary traffic: the `UNIQUE (settlement_id, event)` identity absorbs it and
+the caller is told success either way.
 
-### 2. Which settlement event the window keys on
+## What triggers a pass
 
-A QRIS transaction carries `HasSettle`/`SettleAt` **and** `HasSettleToMerchant`/
-`SettledToMerchantAt`. Those are different moments. Filtering on the wrong one returns a set
-of rows that looks entirely reasonable and is wrong.
+`ProcessSettlementNotifications` runs when **either** is true:
 
-### 3. Whether the reconstruction scales
+1. There is a stored notification not yet acted on, or
+2. the oldest unsettled `COMPLETED` transaction has been waiting longer than
+   `SettlementFloorAge` (24 hours).
 
-N accounts × up to 4 product lists × pagination, per settlement. Rate limits and page
-behaviour are unmeasured. `GetAwaitingSettlement` bounds N to accounts actually holding
-unsettled money rather than every sub-account the merchant owns, which helps — but the
-ordering is still different from reading one file.
+The second condition is the one that matters most. "Only act on a notification" reintroduces
+exactly the failure this design removes: if a delivery is lost — an IP allowlist change, a
+deploy window, retries exhausted — nothing would ever run again and transactions would sit in
+`COMPLETED` indefinitely with no error anywhere. 24 hours clears the T+1 cycle with room to
+spare, so on a healthy system the floor never fires.
 
-This is a viability question, not a correctness one. It may be the one that changes the
-design.
+On a quiet tick the whole call is two cheap reads and a return.
 
-### 4. What `settlement.refunded` should do
+**The number to alarm on is `OldestAwaitingAge`.** It climbs monotonically whenever settlement
+stops working — including when the pass itself runs cleanly and books nothing, which is the
+failure mode a success/failure counter cannot see.
 
-It can pull back funds that have already become `AVAILABLE` and may already have been
-withdrawn. This ledger has no negative-balance policy, and inventing one inside a
-reconciliation routine is the wrong place to decide it. **This is a business decision, not a
-coding gap.**
+## Reading one transaction back
 
-## How to answer them
+The read is a point lookup, not a search: the channel says which endpoint, the payment request
+says which key.
 
-`cmd/singapay-smoke` is where (1) and (2) get settled: create a VA payment in sandbox, let it
-settle, then compare the settlement webhook's window against the timestamps on the
-transaction record. (3) needs a sandbox with enough volume to page. (4) needs a person.
+| Channel | Endpoint | Key, in order of preference |
+|---|---|---|
+| Virtual account | `GetVATransaction` | `GatewayTransactionRef`, else lookup by `PaymentCode` (the VA number) |
+| QRIS | QRIS detail | `GatewayTransactionID`, else `RequestID` |
+| E-wallet | E-wallet detail | `GatewayTransactionID`, else `RequestID` |
+| Payment link | `GetPaymentLinkHistory` | `GatewayTransactionID`, else `RequestID` |
 
-## What is already in place
+`GatewayTransactionID` and `GatewayTransactionRef` come from the money-in webhook
+([101](./101-payment-execution.md)) and are the direct keys. `RequestID` and `PaymentCode`, recorded at
+instrument creation, are the fallbacks for rows that predate those columns — and the fallback
+differs per channel because **the instrument and the transaction are the same entity for QRIS
+and e-wallet, and different entities for VA and payment link**. A VA is a container; the
+payment that arrives in it has its own business id. A payment link can carry several attempts,
+each with its own.
 
-- `domain.SettlementBatch` — carries `BatchID` (the idempotency key), `SettlementReference`,
-  and `SettleFrom`/`SettleTo`. The constructor **requires** the window, because a batch
-  without one can never be reprocessed or audited.
-- `domain.SettlementItem` — one settled gateway row, with `FeeReported` recording whether its
-  fee is a fact or a fallback. See [104](./104-fee-mismatch-reconciliation.md).
-- `domain.SettledTransaction` — the normalised shape across the four channels.
-- The ledger-entry side is unchanged and correct: `PENDING` → `AVAILABLE` conversion, fee
-  adjustment write-offs and credits, gateway fee clearance. Singapay's pending/available split
-  matches this ledger's, which is why the model survived the migration intact.
-- Schema: `settlement_batches` and `settlement_items` are migrated
-  ([018](../database/migrations/018_migrate_to_singapay.sql)).
+`domain.SettledTransaction` flattens the four channel shapes into one so the settling logic
+carries no per-channel branches beyond key selection. It is a value type: no table, no
+repository, built from a gateway response and discarded. What survives is the journal metadata
+written from it.
 
-What is missing is only the part that decides which rows belong to a batch — and that is
-exactly the part that is unverified.
+## Booking
+
+Everything happens in one database transaction whose **first statement is the conditional
+`COMPLETED → SETTLED` move**. That ordering is the point: the conditional update takes the row
+lock, and a caller that finds the row already moved rolls back having written nothing. Two
+passes racing on one transaction produce one settlement, not two sets of insert-only entries
+that would need an audit to unpick.
+
+In order:
+
+1. `UpdateStatusIf(COMPLETED → SETTLED)` — the brake.
+2. `SaveSettledFees` — what the fees turned out to be. Written inside the same transaction so
+   the platform fee transfer can never find a `SETTLED` row whose figures are still unset.
+3. The settlement journal, whose metadata is the permanent audit trail:
+   `actual_gateway_fee`, `expected_gateway_fee`, `fee_delta`, `fee_reported`,
+   `settled_platform_fee`, `settled_seller_net`, `raw_gateway_data`.
+4. The ledger entries: `PENDING` → `AVAILABLE` for seller and platform, the gateway expense
+   account cleared, and a `FEE_ADJUSTMENT` where the fee Singapay took differs from the one
+   priced. The rules are [104](./104-fee-mismatch-reconciliation.md).
+
+Where the delta cannot be absorbed — the platform would owe more than it ever charged, or the
+seller would receive less than nothing — the transaction is **left in `COMPLETED`** for a
+person. It keeps appearing in `GetAwaitingSettlement` and keeps pushing up the oldest-awaiting
+age, which is the loud failure rather than the silent one.
+
+## Cost
+
+One call per open invoice, instead of N accounts × up to 4 product lists × pagination per
+settlement. The work set is "what is still `COMPLETED`", which shrinks as the pass succeeds
+rather than growing with the size of the merchant. A pass is resumable by construction: what a
+truncated pass did not reach is simply still there on the next tick, oldest first.
+`defaultSettlementBatchSize` (200) bounds one pass.
+
+## What is still open
+
+**The refund policy.** `settlement.refunded` is stored as `NEEDS_REVIEW` and never acted on
+automatically. Deciding what it should do means deciding whether a seller's balance may go
+negative, and what happens when the money has already been withdrawn. That is a business
+decision, not a coding gap, and it is the only part of settlement that is deliberately absent.
+
+---
+
+## The approach that was rejected
+
+The first design reconstructed a batch's rows by replaying its date window against the
+per-product transaction lists (`ListVATransactions` and its three siblings, filtered on
+`SettlementWindow`). Those methods still exist on the `PaymentGateway` interface for operators
+and smoke tests; nothing in the settlement path calls them.
+
+It was abandoned because two of its assumptions could not be verified from Singapay's
+documentation, and **each has a wrong answer that produces a plausible-looking result**:
+
+1. **The timezone and boundary of the settlement window.** Singapay writes settlement
+   timestamps as text with no offset — `"26 Dec 2025 13:35:45"`. Asia/Jakarta is an
+   assumption, documented as such in `singapay.TextTime`, not a fact Singapay states. Seven
+   hours in either direction moves rows between batches: some settle twice, others never.
+   Whether the bounds are inclusive is equally unstated.
+
+2. **Which settlement event the window keys on.** A QRIS transaction carries
+   `HasSettle`/`SettleAt` *and* `HasSettleToMerchant`/`SettledToMerchantAt`. Those are
+   different moments, and filtering on the wrong one returns a set of rows that looks entirely
+   reasonable and is wrong.
+
+A third concern was viability rather than correctness — N accounts × 4 product lists ×
+pagination per settlement, against unmeasured rate limits.
+
+**The per-transaction path does not ask any of the three.** It never uses a window to select
+rows, so questions 1 and 2 became moot rather than answered; and its cost is bounded by work
+that is shrinking rather than by the size of the merchant. Question 4 of the original list, the
+refund policy, was the one question that did not depend on the mechanism — which is why it is
+still open above.
+
+`settlement_batches`, `settlement_items` and `reconciliation_discrepancies` were the storage
+for that design. They were never written by the path that shipped and were removed by
+[migration 025](../database/migrations/025_drop_legacy_settlement_tables.sql); `settlement_notifications`
+took over the "have I seen this settlement?" role, and the journal metadata took over the fee
+audit trail.

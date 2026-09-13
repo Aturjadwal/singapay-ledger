@@ -57,6 +57,11 @@ sequenceDiagram
   - **Seller entry**: `+SellerNetAmount` into **PENDING**
   - **Platform entry**: `+PlatformFee` into **PENDING**
   - **Gateway entry**: `+GatewayFee` into **PENDING**
+- **Gateway identifiers recorded**: the webhook is the first moment the PAYMENT exists at
+  Singapay for every channel, so `SetGatewayTransaction` stores both
+  `gateway_transaction_id` (numeric) and `gateway_transaction_ref` (business id) on the
+  payment request, in the same database transaction as the status move. Settlement reads the
+  transaction back with them — see [102](./102-settlement-reconciliation.md).
 - **Why pending?** Singapay holds the funds until settlement. Nothing is withdrawable yet.
 
 ## Three things about Singapay that shape this
@@ -72,6 +77,13 @@ method.
 link object, because its transaction's own `reff_no` is the id of one payment *attempt*.
 `MoneyInNotification.MerchantReference` resolves that. Reading the fields directly would
 never match a payment link to its invoice.
+
+**The instrument id is not the payment id.** `request_id`, recorded when the instrument was
+created, names the instrument — and for VA and payment link that is a different entity from
+the transaction: a VA is a container, and the payment arriving in it has its own business id;
+a payment link can carry several attempts. So the webhook's identifiers are stored separately,
+and settlement uses those. Two of them, because the four detail endpoints disagree about which
+one they take.
 
 **The amounts booked come from the transaction as priced, not from the webhook.** The fee
 Singapay actually took is not final until settlement. If the webhook reports a charged amount

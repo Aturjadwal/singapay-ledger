@@ -1,6 +1,6 @@
 # Ledger — Entity Reference
 
-Singapaymen ini menjelaskan seluruh tabel/entitas yang terlibat dalam operasional ledger: struktur field, relasi antar entitas, lifecycle status, dan peran masing-masing dalam alur bisnis.
+Dokumen ini menjelaskan seluruh tabel/entitas yang terlibat dalam operasional ledger: struktur field, relasi antar entitas, lifecycle status, dan peran masing-masing dalam alur bisnis.
 
 ---
 
@@ -14,11 +14,16 @@ Singapaymen ini menjelaskan seluruh tabel/entitas yang terlibat dalam operasiona
 | [Journal](#4-journal) | `journals` | Pengelompokan event akuntansi |
 | [LedgerEntry](#5-ledgerentry) | `ledger_entries` | Entri double-entry yang immutable |
 | [FeeConfig](#6-feeconfig) | `fee_configs` | Konfigurasi fee platform dan Singapay |
-| [SettlementBatch](#7-settlementbatch) | `settlement_batches` | Batch upload CSV settlement Singapay |
-| [SettlementItem](#8-settlementitem) | `settlement_items` | Baris individual dari CSV settlement |
-| [Disbursement](#9-disbursement) | `disbursements` | Penarikan saldo seller ke rekening bank |
-| [ReconciliationDiscrepancy](#10-reconciliationdiscrepancy) | `reconciliation_discrepancies` | Selisih saldo yang terdeteksi saat rekonsiliasi |
-| [Verification](#11-verification) | `ledger_verifications` | Verifikasi KYC seller |
+| [SettlementNotification](#7-settlementnotification) | `settlement_notifications` | Inbox webhook settlement Singapay |
+| [Disbursement](#8-disbursement) | `disbursements` | Penarikan saldo seller ke rekening bank |
+| [Verification](#9-verification) | `ledger_verifications` | Verifikasi KYC seller |
+
+> **Dihapus pada 2026-09-13** oleh [migrasi 025](../database/migrations/025_drop_legacy_settlement_tables.sql):
+> `settlement_batches`, `settlement_items`, `reconciliation_discrepancies`. Ketiganya adalah
+> penyimpanan untuk reconciler batch DOKU, yang tidak pernah berjalan di Singapay dan
+> digantikan mekanisme settlement per-transaksi — lihat
+> [102](./102-settlement-reconciliation.md). Nilai `source_type = 'SETTLEMENT_BATCH'` masih ada
+> di `journals` dan `ledger_entries` untuk baris historis, dan tidak boleh dihapus.
 
 ---
 
@@ -61,10 +66,8 @@ Entitas inti yang merepresentasikan akun keuangan dalam sistem. Setiap seller me
 
 - `1:N` ke `product_transactions` (sebagai buyer maupun seller)
 - `1:N` ke `disbursements`
-- `1:N` ke `settlement_batches`
 - `1:N` ke `ledger_entries`
 - `1:1` ke `ledger_verifications`
-- `1:N` ke `reconciliation_discrepancies`
 
 ---
 
@@ -84,7 +87,7 @@ Entitas pusat yang merepresentasikan penjualan produk antara buyer dan seller. I
 | `seller_account_id` | VARCHAR(255) | UUID akun seller |
 | `product_id` | VARCHAR(255) | Identifier produk eksternal |
 | `product_type` | VARCHAR(50) | `PHOTO`, `FOLDER`, `SUBSCRIPTION`, dsb. |
-| `invoice_number` | VARCHAR(50) UNIQUE | Nomor invoice untuk pencocokan CSV settlement |
+| `invoice_number` | VARCHAR(50) UNIQUE | Nomor invoice; dikirim sebagai `merchant_reff_no` dan dipakai untuk mencocokkan pembayaran |
 | `seller_price` | BIGINT | Harga yang ditetapkan seller |
 | `platform_fee` | BIGINT | Markup platform di atas harga seller |
 | `gateway_fee` | BIGINT | Fee payment gateway Singapay |
@@ -97,7 +100,9 @@ Entitas pusat yang merepresentasikan penjualan produk antara buyer dan seller. I
 | `platform_fee_transferred_at` | TIMESTAMP | Waktu transfer platform fee |
 | `transfer_request_id` | TEXT | Singapay request-id untuk transfer platform fee (dipakai ulang saat retry untuk idempotency) |
 | `completed_at` | TIMESTAMP | Waktu pembayaran dikonfirmasi webhook Singapay |
-| `settled_at` | TIMESTAMP | Waktu muncul dalam CSV settlement |
+| `settled_at` | TIMESTAMP | Waktu Singapay mengkonfirmasi dana sudah settle |
+| `settled_platform_fee` | BIGINT NULL | Platform fee setelah fee gateway sebenarnya diketahui. `NULL` = settle sebelum kolom ini ada, pakai `platform_fee`. **Bukan nol.** |
+| `settled_gateway_fee` | BIGINT NULL | Fee yang benar-benar diambil Singapay. `NULL` berarti sama |
 | `metadata` | JSONB | Detail produk (photo_id, title, resolution, dll.) |
 | `created_at` | TIMESTAMP | Waktu pembuatan |
 | `updated_at` | TIMESTAMP | Waktu update terakhir |
@@ -121,7 +126,7 @@ SETTLED ──► REFUNDED
 
 - **`PENDING`** — Invoice dibuat, menunggu pembayaran.
 - **`COMPLETED`** — money-in webhook mengkonfirmasi pembayaran. Ledger entry dibuat di sini.
-- **`SETTLED`** — Transaksi muncul di CSV settlement Singapay.
+- **`SETTLED`** — Singapay mengkonfirmasi dana sudah settle saat ditanya per transaksi. Saldo `PENDING` berpindah ke `AVAILABLE` di sini.
 - **`FAILED`** — Transaksi gagal di titik mana pun.
 - **`REFUNDED`** — Dana dikembalikan ke buyer.
 
@@ -129,8 +134,13 @@ SETTLED ──► REFUNDED
 
 - `N:1` ke `ledger_accounts` (buyer dan seller)
 - `1:1` ke `payment_requests`
-- `1:N` ke `settlement_items`
 - Direferensikan oleh `journals` (sebagai `source_type='PRODUCT_TRANSACTION'`)
+
+> `status` di tabel ini adalah **satu-satunya sumber kebenaran** untuk status transaksi.
+> Kedua perpindahan yang menggerakkan uang — `PENDING → COMPLETED` di money-in webhook dan
+> `COMPLETED → SETTLED` di settling pass — dilakukan lewat `UpdateStatusIf`, sebuah
+> compare-and-set yang memegang row lock. Pemanggil yang kalah balapan rollback tanpa menulis
+> apa pun.
 
 ---
 
@@ -138,7 +148,16 @@ SETTLED ──► REFUNDED
 
 **Tabel:** `payment_requests`
 
-Melacak lifecycle integrasi dengan Singapay payment gateway. Satu `PaymentRequest` per `ProductTransaction`.
+Mencatat **instrumen pembayaran** apa yang diterbitkan untuk sebuah transaksi, dan kunci apa
+yang dipakai untuk membaca pembayaran itu kembali dari Singapay. Satu `PaymentRequest` per
+`ProductTransaction`, dibuat bersamaan dalam satu DB transaction.
+
+> **Tidak punya status sendiri, dan itu disengaja.** Karena dibuat 1:1 dan tidak pernah
+> berdiri sendiri, pertanyaan "sudah dibayar belum?" adalah pertanyaan tentang transaksinya —
+> dan jawabannya diputuskan di `product_transactions.status` di bawah compare-and-set. Salinan
+> kedua di sini hanya bisa setuju dengan yang itu, atau salah tentangnya. Kolom `status`,
+> `failure_reason` dan `completed_at` dihapus oleh
+> [migrasi 025](../database/migrations/025_drop_legacy_settlement_tables.sql).
 
 ### Fields
 
@@ -147,34 +166,39 @@ Melacak lifecycle integrasi dengan Singapay payment gateway. Satu `PaymentReques
 | `uuid` | VARCHAR(255) PK | Identifier request |
 | `randid` | VARCHAR(255) UNIQUE | ID acak untuk referensi publik |
 | `product_transaction_uuid` | VARCHAR(255) FK | Transaksi yang ditautkan |
-| `request_id` | VARCHAR(100) UNIQUE | ID payment request dari Singapay |
-| `payment_code` | TEXT | Nomor VA, atau payload EMVCo QRIS lengkap yang di-scan pembeli. |
-| `payment_channel` | VARCHAR(50) | `QRIS`, `VA_BCA`, `VA_BRI`, `VA_MANDIRI`, `VA_BNI`, `CREDIT_CARD`, `E_WALLET` |
+| `request_id` | VARCHAR(100) UNIQUE | ID **instrumen** dari Singapay (ULID VA, id QRIS/link, id e-wallet) |
+| `payment_code` | TEXT | Nomor VA, atau payload EMVCo QRIS lengkap yang di-scan pembeli |
+| `payment_channel` | VARCHAR(50) | `QRIS`, `VA_BCA`, `VA_BRI`, `VA_MANDIRI`, `VA_BNI`, `EWALLET_*`, `PAYMENT_LINK` |
 | `payment_url` | TEXT | URL bagi buyer untuk menyelesaikan pembayaran |
 | `amount` | BIGINT | Total yang dibebankan ke buyer |
 | `currency` | VARCHAR(3) | `IDR` atau `USD` |
-| `status` | VARCHAR(20) | Lihat lifecycle di bawah |
-| `failure_reason` | TEXT | Detail error jika gagal |
-| `completed_at` | TIMESTAMP | Waktu konfirmasi dari money-in webhook |
-| `expires_at` | TIMESTAMP | Batas waktu kadaluarsa link pembayaran |
+| `gateway_transaction_id` | VARCHAR(100) | Id numerik **pembayaran** dari money-in webhook |
+| `gateway_transaction_ref` | VARCHAR(100) | Id bisnis **pembayaran** dari money-in webhook |
+| `expires_at` | TIMESTAMP | Kadaluarsa yang diminta ke Singapay saat instrumen dibuat |
 | `created_at` | TIMESTAMP | Waktu pembuatan |
 | `updated_at` | TIMESTAMP | Waktu update terakhir |
 
-### Lifecycle Status
+### Instrumen vs. pembayaran
 
-```
-PENDING ──► COMPLETED
-   │
-   ├──► FAILED
-   └──► EXPIRED
-```
+`request_id` menamai **instrumen**. Untuk VA dan payment link itu entitas yang berbeda dari
+transaksinya: VA adalah wadah, dan pembayaran yang masuk ke dalamnya punya id bisnis sendiri;
+satu payment link bisa menampung beberapa percobaan, masing-masing dengan id sendiri. Jadi
+`request_id` tidak bisa dipakai membaca transaksi yang sudah settle.
 
-- **`PENDING`** — Menunggu pembayaran dari buyer.
-- **`COMPLETED`** — Singapay mengkonfirmasi pembayaran berhasil.
-- **`FAILED`** — Pembayaran gagal.
-- **`EXPIRED`** — Link pembayaran melewati `expires_at` (biasanya 24 jam).
+`gateway_transaction_id` dan `gateway_transaction_ref` diisi dari money-in webhook — momen
+pertama transaksinya benar-benar ada di Singapay untuk semua channel. Dua kolom karena keempat
+endpoint detail tidak sepakat: id numerik untuk QRIS, e-wallet dan payment link; id bisnis
+untuk VA. Keduanya datang di webhook yang sama, jadi menyimpan dua-duanya menghilangkan
+tebakan per-channel dari jalur baca settlement. Kosong pada baris yang lebih tua dari kolom
+ini, dan pembacanya memperlakukan itu sebagai "pakai lookup per-channel", bukan error.
 
-`COMPLETED`, `FAILED`, dan `EXPIRED` adalah terminal state — tidak ada transisi lebih lanjut.
+### Tentang `expires_at`
+
+Catatan tentang apa yang diminta ke Singapay, **bukan** lifecycle yang dijalankan ledger ini.
+Tidak ada penyapu yang berjalan di atasnya. Instrumen yang lewat masa berlakunya kadaluarsa di
+sisi gateway, dan transaksinya cukup tetap `PENDING`. Kalau kadaluarsa pembayaran suatu saat
+benar-benar mau diimplementasikan, tempatnya di `product_transactions`, bersebelahan dengan
+compare-and-set yang sudah menjaga pembukuan.
 
 ### Relasi
 
@@ -206,9 +230,9 @@ Event akuntansi atomik yang mengelompokkan satu atau lebih `ledger_entries`. Set
 | Event | Pemicu | Entri yang Dihasilkan |
 |---|---|---|
 | `PAYMENT_SUCCESS` | money-in webhook konfirmasi pembayaran | 3 entri: seller (PENDING), platform (PENDING), Singapay (PENDING) |
-| `SETTLEMENT` | Rekonsiliasi CSV settlement | 2 entri per akun: debit PENDING, kredit AVAILABLE |
+| `SETTLEMENT` | Singapay mengkonfirmasi dana settle (per transaksi) | 2 entri per akun: debit PENDING, kredit AVAILABLE; plus pembersihan akun gateway |
 | `DISBURSEMENT` | Seller membuat permintaan penarikan | 1 entri: debit AVAILABLE seller |
-| `RECONCILIATION` | Penyesuaian selisih rekonsiliasi | Bervariasi |
+| `RECONCILIATION` | Penyesuaian saldo manual. Tidak ditulis kode mana pun saat ini; nilainya dipertahankan di CHECK constraint untuk baris historis | Bervariasi |
 | `MANUAL_ADJUSTMENT` | Koreksi manual oleh admin | Bervariasi |
 
 ### Catatan Penting
@@ -266,7 +290,7 @@ Catatan double-entry yang immutable. Setiap entri merepresentasikan debit atau k
 PENDING ──[settlement]──► AVAILABLE ──[disbursement]──► (rekening bank seller)
 ```
 
-- **`PENDING`** — Dana yang sudah di-capture dari buyer tetapi belum dikonfirmasi dalam CSV settlement Singapay.
+- **`PENDING`** — Dana yang sudah di-capture dari buyer tetapi belum dikonfirmasi settle oleh Singapay.
 - **`AVAILABLE`** — Dana yang sudah dikonfirmasi settlement dan siap ditarik oleh seller.
 
 ### Set Entri per Event
@@ -335,103 +359,71 @@ Konfigurasi fee platform dan Singapay per payment channel. Digunakan oleh `FeeCa
 
 ---
 
-## 7. SettlementBatch
+## 7. SettlementNotification
 
-**Tabel:** `settlement_batches`
+**Tabel:** `settlement_notifications`
 
-Merepresentasikan satu file CSV settlement dari Singapay. Mengelompokkan `settlement_items` dan melacak progress rekonsiliasi.
+Inbox webhook settlement. Menyimpan setiap kiriman **apa adanya** setelah verifikasi tanda
+tangan, dan melacak apakah sebuah settling pass sudah bertindak atasnya.
+
+> Webhook-nya adalah **bel pintu, bukan sumber kebenaran.** Payload-nya membawa total dan
+> rentang tanggal tanpa daftar transaksi yang dicakup, jadi tidak ada di dalamnya yang bisa
+> membenarkan sebuah ledger entry. Yang dilakukannya adalah memberi tahu settling pass bahwa
+> layak bertanya ke Singapay tentang invoice yang masih terbuka. Detail di
+> [102](./102-settlement-reconciliation.md).
 
 ### Fields
 
 | Field | Tipe | Keterangan |
 |---|---|---|
-| `uuid` | VARCHAR(255) PK | Identifier batch |
-| `randid` | VARCHAR(255) UNIQUE | ID acak untuk referensi publik |
-| `account_uuid` | VARCHAR(255) FK | Akun seller pemilik batch ini |
-| `report_file_name` | VARCHAR(255) | Nama file CSV |
-| `settlement_date` | DATE | Tanggal settlement dari Singapay |
-| `batch_id` | VARCHAR(255) | Batch ID dari metadata CSV Singapay |
-| `gross_amount` | BIGINT | Total amount sebelum fee |
-| `net_amount` | BIGINT | Total PAY TO MERCHANT (setelah gateway fee) |
-| `gateway_fee` | BIGINT | Total gateway fee dari semua transaksi |
-| `currency` | VARCHAR(3) | `IDR` atau `USD` |
-| `uploaded_by` | VARCHAR(255) | ID user yang mengupload |
-| `uploaded_at` | TIMESTAMP | Waktu upload |
-| `processed_at` | TIMESTAMP | Waktu rekonsiliasi selesai |
-| `processing_status` | VARCHAR(20) | Lihat lifecycle di bawah |
-| `matched_count` | INT | Jumlah baris CSV yang berhasil dicocokkan |
-| `unmatched_count` | INT | Jumlah baris CSV yang tidak cocok |
-| `failure_reason` | TEXT | Detail error jika gagal |
-| `metadata` | JSONB | Data tambahan dari CSV |
-| `created_at` | TIMESTAMP | Waktu pembuatan |
-| `updated_at` | TIMESTAMP | Waktu update terakhir |
+| `uuid` / `randid` | VARCHAR(255) | Identifier |
+| `settlement_id` | VARCHAR(255) | Id settlement milik Singapay |
+| `settlement_reference` | VARCHAR(255) | `reference_no`, label yang dikutip saat support |
+| `event` | VARCHAR(50) | `settlement.completed`, `settlement.refunded`, `settlement.refund_cancelled` |
+| `settlement_method` | VARCHAR(30) | `balance`, `auto-balance`, `bank-account`, `e-wallet`. Hanya dua pertama yang memindahkan `PENDING` ke `AVAILABLE` |
+| `settlement_type` | VARCHAR(20) | `ALL`, `VA`, `QRIS`, `EWALLET` |
+| `start_date` / `end_date` | TIMESTAMP | Rentang yang dicakup. **Audit saja** — settling pass tidak pernah memfilter dengannya |
+| `total_transactions`, `amount`, `total_fee`, `currency` | | Total sebagaimana diumumkan. Dicatat, tidak pernah dipercaya sebagai dasar entry |
+| `raw_payload` | JSONB | Kiriman persis seperti datangnya |
+| `status` | VARCHAR(20) | Lihat lifecycle di bawah |
+| `failure_reason` | TEXT | Alasan `NEEDS_REVIEW` atau `FAILED` |
+| `received_at` / `processed_at` | TIMESTAMP | |
 
 ### Lifecycle Status
 
 ```
-PENDING ──► PROCESSING ──► COMPLETED
-   │              │
-   └──────────────┴──► FAILED
+PENDING ──► PROCESSING ──► PROCESSED
+   │             │
+   │             └──► FAILED (klaim dilepas, akan dicoba lagi)
+   │
+   └──► NEEDS_REVIEW
 ```
 
-### Batasan
+- **`PENDING`** — Tersimpan, menunggu settling pass.
+- **`PROCESSING`** — Sudah diklaim satu worker. Klaim yang kalah berarti worker lain sedang
+  menanganinya, dan yang benar adalah membiarkannya.
+- **`PROCESSED`** — Sebuah pass sudah berjalan setelah melihatnya. **Itu saja klaimnya** —
+  apakah suatu transaksi ikut settle dicatat di transaksinya, bukan di sini. Memisahkan
+  keduanya disengaja: pass yang tidak tuntas tidak boleh bisa mencatat dirinya tuntas.
+- **`NEEDS_REVIEW`** — Diparkir untuk manusia. Event refund (butuh kebijakan saldo negatif yang
+  belum ada), atau `settlement_method` yang membayarkan ke rekening alih-alih memindahkan
+  `PENDING` ke `AVAILABLE`.
 
-- Hanya boleh ada **satu batch per seller per tanggal settlement** (unique constraint pada `account_uuid` + `settlement_date`).
+### Idempotensi
 
-### Relasi
-
-- `N:1` ke `ledger_accounts`
-- `1:N` ke `settlement_items`
-- `1:1` ke `reconciliation_discrepancies`
-- Direferensikan oleh `journals` (sebagai `source_type='SETTLEMENT_BATCH'`)
-
----
-
-## 8. SettlementItem
-
-**Tabel:** `settlement_items`
-
-Merepresentasikan satu baris dari CSV settlement Singapay. Dicocokkan ke `product_transactions` berdasarkan `invoice_number`.
-
-### Fields
-
-| Field | Tipe | Keterangan |
-|---|---|---|
-| `uuid` | VARCHAR(255) PK | Identifier item |
-| `randid` | VARCHAR(255) UNIQUE | ID acak untuk referensi publik |
-| `settlement_batch_uuid` | VARCHAR(255) FK | Batch induk |
-| `product_transaction_uuid` | VARCHAR(255) FK | Transaksi yang dicocokkan (null jika belum cocok) |
-| `seller_account_id` | VARCHAR(255) | ID akun seller (cache untuk grouping) |
-| `invoice_number` | VARCHAR(100) | INVOICE NUMBER dari CSV (kunci pencocokan) |
-| `sub_account` | VARCHAR(100) | SUB ACCOUNT dari CSV (ID sub-account Singapay) |
-| `transaction_amount` | BIGINT | AMOUNT dari CSV |
-| `pay_to_merchant` | BIGINT | PAY TO MERCHANT dari CSV (net setelah gateway fee) |
-| `allocated_fee` | BIGINT | FEE dari CSV (gateway fee) |
-| `is_matched` | BOOLEAN | Apakah sudah cocok dengan `product_transaction` |
-| `csv_row_number` | INT | Nomor baris asli di CSV (untuk debugging) |
-| `raw_csv_data` | JSONB | Data baris CSV asli |
-| `expected_net_amount` | BIGINT | Jumlah yang seharusnya diterima (kalkulasi sistem) |
-| `amount_discrepancy` | BIGINT | `pay_to_merchant - expected_net_amount` |
-| `created_at` | TIMESTAMP | Waktu pembuatan |
-| `updated_at` | TIMESTAMP | Waktu update terakhir |
-
-### Alur Pencocokan
-
-1. Parse CSV → buat `SettlementItem` per baris
-2. Cari `product_transaction` berdasarkan `invoice_number`
-3. Hitung `expected_net_amount` berdasarkan fee model transaksi
-4. Bandingkan dengan `pay_to_merchant` dari CSV
-5. Jika ada selisih → catat di `amount_discrepancy` dan `fee_adjustment`
-6. Jika selisih signifikan → buat `ReconciliationDiscrepancy`
+`UNIQUE (settlement_id, event)`. Singapay melakukan retry, jadi kiriman ulang adalah lalu
+lintas biasa: identitas ini menyerapnya lewat `ON CONFLICT DO NOTHING`, dan pemanggil tetap
+dijawab sukses. Menjawab selain itu mengajari Singapay untuk terus mengulang kiriman yang
+sudah diterima.
 
 ### Relasi
 
-- `N:1` ke `settlement_batches`
-- `N:1` ke `product_transactions` (via `invoice_number`)
+Tidak ada FK. Sengaja: sebuah notifikasi tidak memiliki transaksi mana pun, dan tidak ada
+transaksi yang menunggu notifikasi tertentu.
 
 ---
 
-## 9. Disbursement
+## 8. Disbursement
 
 **Tabel:** `disbursements`
 
@@ -488,65 +480,7 @@ PENDING ──► PROCESSING ──► COMPLETED
 
 ---
 
-## 10. ReconciliationDiscrepancy
-
-**Tabel:** `reconciliation_discrepancies`
-
-Mencatat ketidaksesuaian saldo yang terdeteksi saat rekonsiliasi settlement. Satu record per seller per batch.
-
-### Fields
-
-| Field | Tipe | Keterangan |
-|---|---|---|
-| `uuid` | VARCHAR(255) PK | Identifier discrepancy |
-| `randid` | VARCHAR(255) UNIQUE | ID acak untuk referensi publik |
-| `account_uuid` | VARCHAR(255) FK | Akun seller yang terpengaruh |
-| `settlement_batch_uuid` | VARCHAR(255) FK | Batch yang memicu deteksi |
-| `discrepancy_type` | VARCHAR(50) | Lihat tipe di bawah |
-| `expected_pending` | BIGINT | Saldo PENDING yang dihitung sistem |
-| `actual_pending` | BIGINT | Saldo PENDING dari Singapay GetBalance API |
-| `expected_available` | BIGINT | Saldo AVAILABLE yang dihitung sistem |
-| `actual_available` | BIGINT | Saldo AVAILABLE dari Singapay GetBalance API |
-| `pending_diff` | BIGINT | `actual_pending - expected_pending` |
-| `available_diff` | BIGINT | `actual_available - expected_available` |
-| `item_discrepancy_count` | INT | Jumlah `settlement_items` dengan selisih |
-| `total_item_discrepancy` | BIGINT | Total selisih dari semua item |
-| `status` | VARCHAR(20) | `PENDING`, `RESOLVED`, `AUTO_RESOLVED` |
-| `detected_at` | TIMESTAMP | Waktu selisih terdeteksi |
-| `resolved_at` | TIMESTAMP | Waktu selisih diselesaikan |
-| `resolution_notes` | TEXT | Catatan penyelesaian |
-| `created_at` | TIMESTAMP | Waktu pembuatan |
-| `updated_at` | TIMESTAMP | Waktu update terakhir |
-
-### Tipe Discrepancy (`discrepancy_type`)
-
-| Tipe | Keterangan |
-|---|---|
-| `PENDING_MISMATCH` | Selisih hanya di bucket PENDING |
-| `AVAILABLE_MISMATCH` | Selisih hanya di bucket AVAILABLE |
-| `BOTH_MISMATCH` | Selisih di kedua bucket |
-| `UNEXPECTED_CREDIT` | Ada kredit yang tidak terduga |
-| `UNEXPECTED_DEBIT` | Ada debit yang tidak terduga |
-
-### Lifecycle Status
-
-```
-PENDING ──► RESOLVED (manual oleh admin)
-   └──► AUTO_RESOLVED (diselesaikan otomatis oleh sistem)
-```
-
-### Batasan
-
-- Hanya boleh ada **satu discrepancy per seller per batch** (unique constraint pada `account_uuid` + `settlement_batch_uuid`).
-
-### Relasi
-
-- `N:1` ke `ledger_accounts`
-- `N:1` ke `settlement_batches`
-
----
-
-## 11. Verification
+## 9. Verification
 
 **Tabel:** `ledger_verifications`
 
@@ -606,30 +540,29 @@ PENDING ──► APPROVED
 ## Diagram Relasi
 
 ```
-                          fee_configs
-                         (config table,
-                          no FK relations)
+      fee_configs                 settlement_notifications
+   (tabel konfigurasi,          (inbox webhook, tanpa FK ke
+    tanpa relasi FK)             entitas mana pun)
 
- ledger_accounts ◄────────────────────────────────────┐
-      │                                                │
-      ├──► product_transactions ◄── payment_requests  │
-      │         │                                      │
-      │         ▼                                      │
-      │    settlement_items ◄── settlement_batches ───►│
-      │                               │                │
-      │                               ▼                │
-      │                  reconciliation_discrepancies  │
-      │                                                │
-      ├──► disbursements                               │
-      │                                                │
-      ├──► ledger_verifications                        │
-      │                                                │
-      └──► ledger_entries ◄── journals                │
-                                   │                   │
-                                   └───────────────────┘
+ ledger_accounts ◄──────────────────────────────┐
+      │                                          │
+      ├──► product_transactions ◄── payment_requests
+      │                                          │
+      ├──► disbursements                         │
+      │                                          │
+      ├──► ledger_verifications                  │
+      │                                          │
+      └──► ledger_entries ◄── journals          │
+                                   │             │
+                                   └─────────────┘
                              (source: product_transactions,
-                              settlement_batches, disbursements)
+                              disbursements, manual_adjustment)
 ```
+
+`settlement_notifications` sengaja berdiri sendiri tanpa FK: sebuah notifikasi tidak memiliki
+transaksi mana pun, dan tidak ada transaksi yang menunggu notifikasi tertentu. Itu justru yang
+membuat webhook bisa hilang tanpa mengakibatkan uang tertahan — lihat floor age di
+[102](./102-settlement-reconciliation.md).
 
 ---
 
@@ -642,11 +575,11 @@ Buyer membayar
     │
     ▼
 ProductTransaction (PENDING)
-    + PaymentRequest (PENDING)
+    + PaymentRequest (instrumen diterbitkan)
     │
     ▼ [money-in webhook]
-ProductTransaction (COMPLETED)
-    + PaymentRequest (COMPLETED)
+ProductTransaction (COMPLETED)      ← compare-and-set, memegang row lock
+    + PaymentRequest: id transaksi gateway disimpan
     + Journal (PAYMENT_SUCCESS)
     + 3x LedgerEntry:
         seller  → PENDING +seller_net_amount
@@ -654,26 +587,44 @@ ProductTransaction (COMPLETED)
         Singapay    → PENDING +gateway_fee
 ```
 
-### 2. Rekonsiliasi Settlement
+### 2. Settlement (per transaksi)
 
 ```
-Admin upload CSV settlement Singapay
-    │
-    ▼
-SettlementBatch (PENDING)
-    + N x SettlementItem (per baris CSV)
-    │
-    ▼ [proses matching]
-SettlementItem dicocokkan ke ProductTransaction (via invoice_number)
-    │
-    ├─[cocok, jumlah sesuai]──► ProductTransaction (SETTLED)
-    │                           + Journal (SETTLEMENT)
-    │                           + 2x LedgerEntry per seller:
-    │                               seller PENDING -seller_net_amount
-    │                               seller AVAILABLE +seller_net_amount
-    │
-    └─[selisih terdeteksi]──► ReconciliationDiscrepancy (PENDING)
+Webhook settlement masuk           ATAU   transaksi COMPLETED tertua > 24 jam
+    │                                          │
+    ▼                                          │
+SettlementNotification (PENDING)               │
+    │                                          │
+    └──────────────► [worker tick] ◄───────────┘
+                          │
+                          ▼
+            GetAwaitingSettlement(limit)   ← status = 'COMPLETED', tertua dulu
+                          │
+            ┌─────────────┴──────────────┐
+            │  per invoice yang terbuka: │
+            │  1 call ke Singapay        │  ← channel menentukan endpoint,
+            │  has_settle == true ?      │    payment_request menentukan kunci
+            └─────────────┬──────────────┘
+                          │ ya
+                          ▼
+        satu DB transaction per ProductTransaction:
+          ProductTransaction (SETTLED)        ← compare-and-set, statement pertama
+            + settled_platform_fee / settled_gateway_fee
+            + Journal (SETTLEMENT)            ← metadata = jejak audit fee aktual
+            + LedgerEntry:
+                seller   PENDING -net,  AVAILABLE +net
+                platform PENDING -fee,  AVAILABLE +fee
+                gateway  PENDING -gateway_fee   (dibersihkan, tanpa AVAILABLE)
+                FEE_ADJUSTMENT bila fee aktual ≠ fee ekspektasi (lihat 104)
+                          │
+                          ▼
+            SettlementNotification (PROCESSED)
 ```
+
+Bila selisih fee tidak bisa diserap — platform akan menanggung lebih dari yang pernah
+ditagihnya, atau seller menerima kurang dari nol — transaksi **dibiarkan `COMPLETED`** untuk
+ditangani manusia. Ia tetap muncul di `GetAwaitingSettlement` dan terus menaikkan umur
+tertua-yang-menunggu, yang justru kegagalan yang berisik alih-alih yang senyap.
 
 ### 3. Penarikan Saldo (Disbursement)
 
