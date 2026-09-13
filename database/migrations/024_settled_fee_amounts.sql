@@ -59,39 +59,17 @@
 -- of one row.
 --
 -- ---------------------------------------------------------------------------------------
--- 3. idx_settlement_items_product_tx_unique  — the emergency brake
+-- Removed before this was ever applied: idx_settlement_items_product_tx_unique
 -- ---------------------------------------------------------------------------------------
--- Settlement idempotency currently lives at BATCH level: migration 013's unique index on
--- settlement_batches.batch_id. That was right when one DOKU CSV was one batch was one
--- authoritative list.
+-- An earlier draft added a unique index on settlement_items(product_transaction_uuid) as
+-- an emergency brake under the per-transaction design. settlement_items is dropped by
+-- migration 025 and nothing writes it, so the index would have guarded an empty table on
+-- its way to being deleted.
 --
--- It does not protect the per-transaction design. Two paths can now settle the same
--- transaction — a notification-driven pass and a later sweep — and they do not share a
--- batch id, so nothing at batch level is violated. The grain of the guarantee has to match
--- the grain of the work.
---
--- The normal brake is the conditional UPDATE in UpdateStatusIf(COMPLETED -> SETTLED),
--- which takes the row lock and reports whether the row actually moved; a caller that gets
--- false rolls back having written nothing. This index is the emergency brake underneath
--- it: it makes a second settlement item for one transaction impossible regardless of which
--- caller inserts, whether the status check was skipped, or whether two workers run at once.
---
--- NULLs are distinct in a Postgres unique index, so unmatched items — which carry no
--- product_transaction_uuid and are exactly the rows we want many of — coexist freely. The
--- partial predicate makes that explicit.
---
--- CREATING THIS INDEX FAILS IF THE TABLE ALREADY HOLDS TWO ITEMS FOR ONE TRANSACTION.
--- Check first:
---
---   SELECT product_transaction_uuid, COUNT(*), array_agg(uuid)
---   FROM settlement_items
---   WHERE product_transaction_uuid IS NOT NULL
---   GROUP BY product_transaction_uuid
---   HAVING COUNT(*) > 1;
---
--- If that returns rows, do not "fix" it with this migration. Duplicate items mean
--- duplicate ledger entries, which are insert-only and must be corrected with compensating
--- entries and an audit. Resolve that first.
+-- The brake itself is not lost. It was always the conditional UPDATE in
+-- UpdateStatusIf(COMPLETED -> SETTLED): that takes the row lock and reports whether the
+-- row actually moved, and a caller that gets false rolls back having written nothing.
+-- That guard is on product_transactions, which is the grain the work is done at.
 
 ALTER TABLE product_transactions
     ADD COLUMN IF NOT EXISTS settled_platform_fee BIGINT;
@@ -102,7 +80,3 @@ ALTER TABLE product_transactions
 CREATE INDEX IF NOT EXISTS idx_product_transactions_awaiting_settlement
     ON product_transactions (completed_at)
     WHERE status = 'COMPLETED';
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_settlement_items_product_tx_unique
-    ON settlement_items (product_transaction_uuid)
-    WHERE product_transaction_uuid IS NOT NULL;

@@ -64,6 +64,9 @@ CREATE TABLE journals (
         )
     ),
     -- What business entity triggered this journal
+    -- 'SETTLEMENT_BATCH' is never written any more — settlement_batches was dropped by
+    -- migration 025 — but rows the old batch reconciler booked still carry it, and
+    -- journals are insert-only. It stays so that history remains readable.
     source_type VARCHAR(50) NOT NULL CHECK (
         source_type IN (
             'PRODUCT_TRANSACTION',
@@ -111,7 +114,8 @@ CREATE TABLE ledger_entries (
             'RECONCILIATION'
         )
     ),
-    -- Business origin (what table generated this)
+    -- Business origin (what table generated this). 'SETTLEMENT_BATCH' is historical
+    -- only — see the note on journals.source_type.
     source_type VARCHAR(50) NOT NULL CHECK (
         source_type IN (
             'PRODUCT_TRANSACTION',
@@ -204,6 +208,11 @@ CREATE TABLE IF NOT EXISTS product_transactions (
     -- replays its original answer instead of transferring twice. Added by migration 011;
     -- it was missing here, which would have made the next Atlas diff drop it.
     transfer_request_id TEXT,
+    -- What the fees turned out to be once Singapay reported what it actually took
+    -- (migration 024). NULLABLE ON PURPOSE: NULL means "this settled before we recorded
+    -- it", i.e. use the priced figure. A DEFAULT 0 here would silently transfer nothing.
+    settled_platform_fee BIGINT,
+    settled_gateway_fee BIGINT,
     -- Product details (what was purchased)
     metadata JSONB -- Buyer name, product title, resolution, license type, etc.
 );
@@ -228,15 +237,21 @@ WHERE
     status = 'SETTLED'
     AND platform_fee_transferred = false;
 
+-- Serves GetAwaitingSettlement and the worker's oldest-awaiting health check, which run on
+-- every settlement tick. Partial on the backlog rather than the history (migration 024).
+CREATE INDEX idx_product_transactions_awaiting_settlement ON product_transactions (completed_at)
+WHERE
+    status = 'COMPLETED';
+
 -- payment_requests: PAYMENT GATEWAY INTEGRATION
--- Purpose: Tracks the gateway payment lifecycle for each transaction
--- Status lifecycle: PENDING → COMPLETED/FAILED/EXPIRED
--- PENDING: Payment created, waiting for user to pay
--- COMPLETED: the money-in webhook confirms payment received
--- FAILED: Payment failed (insufficient funds, declined, etc.)
--- EXPIRED: Payment link expired (typically 24 hours)
+-- Purpose: records which payment instrument was issued for a transaction, and the keys
+--          that read the payment back from Singapay later.
 --
--- This table records the payment instrument and the status updates against it
+-- It carries NO status of its own. A payment request is created 1:1 with its product
+-- transaction, in the same database transaction, so "has this been paid?" is a question
+-- about product_transactions.status — which is also where it is decided, under a
+-- compare-and-set. A second copy here could only agree with that one or be wrong about it.
+-- The columns were dropped by migration 025.
 CREATE TABLE IF NOT EXISTS payment_requests (
     uuid VARCHAR(255) PRIMARY KEY,
     randid VARCHAR(255) NOT NULL UNIQUE,
@@ -251,22 +266,23 @@ CREATE TABLE IF NOT EXISTS payment_requests (
     -- QRIS, VA_BCA, VA_BRI, etc.
     payment_url TEXT,
     -- URL for user to complete payment
-    -- Payment amount and status
     amount BIGINT NOT NULL,
     -- Total charged to buyer
     currency VARCHAR(3) NOT NULL CHECK (currency IN ('IDR', 'USD')),
-    status VARCHAR(20) NOT NULL CHECK (
-        status IN ('PENDING', 'COMPLETED', 'FAILED', 'EXPIRED')
-    ),
-    -- Lifecycle timestamps
+    -- Singapay's identifiers for the PAYMENT, not the instrument. Filled in from the
+    -- money-in webhook (migration 023): request_id above names the instrument, which for
+    -- VA and payment link is a different entity from the transaction, so neither can read
+    -- a settled transaction back. Two columns because the detail endpoints disagree about
+    -- which one they take -- the numeric id for QRIS, e-wallet and payment link, the
+    -- business id for VA.
+    gateway_transaction_id VARCHAR(100),
+    gateway_transaction_ref VARCHAR(100),
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL,
-    completed_at TIMESTAMP,
-    -- When the money-in webhook confirmed payment
     expires_at TIMESTAMP NOT NULL,
-    -- Payment link expiration
-    -- Error handling
-    failure_reason TEXT,
+    -- The expiry the instrument was issued with. A record of what was asked of Singapay,
+    -- not a lifecycle this ledger drives: nothing sweeps on it, and an instrument that
+    -- lapses leaves its transaction in PENDING.
     FOREIGN KEY (product_transaction_uuid) REFERENCES product_transactions(uuid)
 );
 
@@ -276,9 +292,11 @@ CREATE INDEX idx_payment_requests_request_id ON payment_requests(request_id);
 
 CREATE INDEX idx_payment_requests_payment_code ON payment_requests(payment_code);
 
-CREATE INDEX idx_payment_requests_status ON payment_requests(status);
-
 CREATE INDEX idx_payment_requests_expires ON payment_requests(expires_at);
+
+CREATE INDEX idx_payment_requests_gateway_transaction ON payment_requests (gateway_transaction_id)
+WHERE
+    gateway_transaction_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS disbursements (
     uuid VARCHAR(255) PRIMARY KEY,
@@ -405,138 +423,68 @@ VALUES
         NOW()
     ) ON CONFLICT (config_type, payment_channel) DO NOTHING;
 
--- Settlement batch tracking (settlement webhooks from Singapay)
-CREATE TABLE IF NOT EXISTS settlement_batches (
+-- settlement_notifications: THE SETTLEMENT INBOX
+-- Purpose: store each settlement webhook exactly as it arrived, and track whether a
+--          settling pass has acted on it.
+--
+-- The webhook is a doorbell, not a source of truth. It announces a batch with totals and a
+-- date window and no list of what it covered, so nothing here justifies a ledger entry.
+-- What it does is tell the settling pass it is worth asking Singapay about the open
+-- invoices, and record what Singapay said for when an amount is argued about later.
+--
+-- Status lifecycle: PENDING -> PROCESSING -> PROCESSED, or NEEDS_REVIEW / FAILED.
+-- NEEDS_REVIEW parks anything that is not a completed balance settlement: refunds need a
+-- negative-balance policy that does not exist, and a bank-account settlement pays out
+-- rather than moving PENDING into AVAILABLE.
+CREATE TABLE IF NOT EXISTS settlement_notifications (
     uuid VARCHAR(255) PRIMARY KEY,
     randid VARCHAR(255) NOT NULL UNIQUE,
-    account_uuid VARCHAR(255) NOT NULL,
+    -- Singapay's own identifiers for the settlement batch.
+    settlement_id VARCHAR(255) NOT NULL,
     settlement_reference VARCHAR(255) NOT NULL,
-    settlement_date DATE NOT NULL,
-    -- The window the settlement covered. Singapay sends no list of the transactions in a
-    -- batch, so this range is the only way to find them.
-    settle_from TIMESTAMP,
-    settle_to TIMESTAMP,
-    batch_id VARCHAR(255),
-    gross_amount BIGINT NOT NULL DEFAULT 0,
-    net_amount BIGINT NOT NULL DEFAULT 0,
-    gateway_fee BIGINT NOT NULL DEFAULT 0,
-    currency VARCHAR(3) NOT NULL,
-    initiated_by VARCHAR(255) NOT NULL,
-    initiated_at TIMESTAMP NOT NULL,
-    processed_at TIMESTAMP,
-    processing_status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (
-        processing_status IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED')
-    ),
-    matched_count INT DEFAULT 0,
-    unmatched_count INT DEFAULT 0,
-    failure_reason TEXT,
-    metadata JSONB,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    FOREIGN KEY (account_uuid) REFERENCES ledger_accounts(uuid)
-);
-
-CREATE INDEX idx_settlement_batches_account_id ON settlement_batches(account_uuid);
-
-CREATE INDEX idx_settlement_batches_status ON settlement_batches(processing_status);
-
--- (account_uuid, settlement_date) is a plain index, NOT a unique constraint.
---
--- This file previously declared UNIQUE(account_uuid, settlement_date), which no deployed
--- database has ever had. Uniqueness there would be wrong as well as absent: settlement is
--- tracked at the platform account, and more than one settlement can carry the same date,
--- so a unique constraint would reject the second one as a schema violation instead of
--- ingesting it. Identity for a batch comes from batch_id (see below), not date.
-CREATE INDEX idx_settlement_batches_date ON settlement_batches(account_uuid, settlement_date DESC);
-
--- Settlement ingestion is idempotent, and these two indexes are what make it so.
--- Full reasoning in database/migrations/013_settlement_batches_idempotency.sql.
---
--- settlement_reference: Singapay's human-facing reference_no. Not unique — it is a label,
--- not an identity.
-CREATE INDEX idx_settlement_batches_settlement_reference ON settlement_batches(settlement_reference);
-
--- batch_id: Singapay's own identifier for the settlement, and therefore the idempotency
--- key. Unique because a second row means a second set of immutable ledger entries. Partial
--- because rows predating migration 005 have no batch_id, and Postgres treats NULLs as
--- distinct anyway.
-CREATE UNIQUE INDEX idx_settlement_batches_batch_id_unique ON settlement_batches(batch_id)
-    WHERE batch_id IS NOT NULL;
-
--- Settlement item linking (individual CSV rows matched to transactions)
-CREATE TABLE IF NOT EXISTS settlement_items (
-    uuid VARCHAR(255) PRIMARY KEY,
-    randid VARCHAR(255) NOT NULL UNIQUE,
-    settlement_batch_uuid VARCHAR(255) NOT NULL,
-    product_transaction_uuid VARCHAR(255),
-    seller_account_id VARCHAR(255),
-    invoice_number VARCHAR(100),
-    gateway_account_id VARCHAR(100),
-    gateway_transaction_id VARCHAR(100),
-    payment_channel VARCHAR(50),
-    transaction_amount BIGINT NOT NULL,
-    pay_to_merchant BIGINT NOT NULL,
-    allocated_fee BIGINT NOT NULL,
-    -- FALSE means allocated_fee was copied from the expected fee because the channel
-    -- reports none (payment link). See migration 018.
-    fee_reported BOOLEAN NOT NULL DEFAULT FALSE,
-    is_matched BOOLEAN NOT NULL DEFAULT FALSE,
-    expected_net_amount BIGINT NOT NULL DEFAULT 0,
-    amount_discrepancy BIGINT NOT NULL DEFAULT 0,
-    raw_gateway_data JSONB,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    FOREIGN KEY (settlement_batch_uuid) REFERENCES settlement_batches(uuid),
-    FOREIGN KEY (product_transaction_uuid) REFERENCES product_transactions(uuid)
-);
-
-CREATE INDEX idx_settlement_items_batch_id ON settlement_items(settlement_batch_uuid);
-
-CREATE INDEX idx_settlement_items_product_tx_id ON settlement_items(product_transaction_uuid);
-
-CREATE INDEX idx_settlement_items_seller_account ON settlement_items(seller_account_id);
-
-CREATE INDEX idx_settlement_items_invoice ON settlement_items(invoice_number);
-
-CREATE INDEX idx_settlement_items_unmatched ON settlement_items(settlement_batch_uuid)
-WHERE
-    is_matched = false;
-
--- Table to track balance discrepancies found during settlement reconciliation
--- Linked to SettlementBatch - each batch can have at most one discrepancy record
--- Per-transaction discrepancies are tracked in settlement_items.amount_discrepancy
-CREATE TABLE IF NOT EXISTS reconciliation_discrepancies (
-    uuid VARCHAR(255) PRIMARY KEY,
-    randid VARCHAR(255) NOT NULL UNIQUE,
-    account_uuid VARCHAR(255) NOT NULL,
-    settlement_batch_uuid VARCHAR(255) NOT NULL,
-    discrepancy_type VARCHAR(50) NOT NULL,
-    expected_pending BIGINT NOT NULL,
-    actual_pending BIGINT NOT NULL,
-    expected_available BIGINT NOT NULL,
-    actual_available BIGINT NOT NULL,
-    pending_diff BIGINT NOT NULL,
-    available_diff BIGINT NOT NULL,
-    item_discrepancy_count INT NOT NULL DEFAULT 0,
-    total_item_discrepancy BIGINT NOT NULL DEFAULT 0,
+    -- settlement.completed | settlement.refunded | settlement.refund_cancelled
+    event VARCHAR(50) NOT NULL,
+    -- balance | auto-balance | bank-account | e-wallet.
+    -- Only balance and auto-balance move PENDING into AVAILABLE.
+    settlement_method VARCHAR(30),
+    -- ALL | VA | QRIS | EWALLET. Scopes the batch by product, not by account.
+    settlement_type VARCHAR(20),
+    -- The window the batch covered. Stored for audit only: Singapay writes these as text
+    -- with no offset, so the settling pass never filters on them.
+    start_date TIMESTAMP,
+    end_date TIMESTAMP,
+    -- Totals as announced. Reported, never trusted as the basis for a ledger entry.
+    total_transactions INT,
+    amount BIGINT,
+    total_fee BIGINT,
+    currency VARCHAR(3),
+    -- The delivery exactly as it arrived, after signature verification.
+    raw_payload JSONB NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (
-        status IN ('PENDING', 'RESOLVED', 'AUTO_RESOLVED')
+        status IN (
+            'PENDING',
+            'PROCESSING',
+            'PROCESSED',
+            'NEEDS_REVIEW',
+            'FAILED'
+        )
     ),
-    detected_at TIMESTAMP NOT NULL,
-    resolved_at TIMESTAMP,
-    resolution_notes TEXT,
+    failure_reason TEXT,
+    received_at TIMESTAMP NOT NULL,
+    processed_at TIMESTAMP,
     created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    FOREIGN KEY (account_uuid) REFERENCES ledger_accounts(uuid),
-    FOREIGN KEY (settlement_batch_uuid) REFERENCES settlement_batches(uuid),
-    UNIQUE (account_uuid, settlement_batch_uuid) -- One discrepancy per seller per batch
+    updated_at TIMESTAMP NOT NULL
 );
 
-CREATE INDEX idx_reconciliation_discrepancies_account_id ON reconciliation_discrepancies(account_uuid);
+-- The identity of a delivery. Singapay retries, so a redelivery must be absorbed rather
+-- than stored twice; this is what ON CONFLICT DO NOTHING keys on.
+CREATE UNIQUE INDEX idx_settlement_notifications_identity ON settlement_notifications (settlement_id, event);
 
-CREATE INDEX idx_reconciliation_discrepancies_detected ON reconciliation_discrepancies(detected_at DESC);
+CREATE INDEX idx_settlement_notifications_pending ON settlement_notifications (received_at)
+WHERE
+    status IN ('PENDING', 'FAILED');
 
-CREATE INDEX idx_reconciliation_discrepancies_batch ON reconciliation_discrepancies(settlement_batch_uuid);
+CREATE INDEX idx_settlement_notifications_reference ON settlement_notifications (settlement_reference);
 
 -- Ledger verifications for KYC (Know Your Customer)
 -- Purpose: Track seller identity verification using Indonesian KTP (ID card)
