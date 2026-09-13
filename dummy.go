@@ -175,7 +175,7 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 		},
 	}
 
-	// Transactions with SETTLED status (settled via CSV, money in available_balance)
+	// Transactions with SETTLED status (money already in available_balance)
 	dummySettledTransactions := []map[string]any{
 		{
 			"buyer_id":       dummyBuyerUUID,
@@ -354,7 +354,7 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 			c.logger.InfoContext(context.Background(), "Generated dummy transaction and ledger entries", "transaction_id", productTx.Record.UUID, "seller_amount", productTx.Fee.SellerPrice, "platform_fee", productTx.Fee.PlatformFee, "gateway_fee", productTx.Fee.GatewayFee)
 		}
 
-		// SETTLED Transactions (settled via CSV, in available_balance)
+		// SETTLED Transactions (in available_balance)
 		for _, txData := range dummySettledTransactions {
 			feeBreakdown := feeCalc.GetFeeBreakdown(int64(txData["price"].(int)), "QRIS", domain.CurrencyIDR)
 			productTx := domain.NewProductTransaction(
@@ -410,12 +410,13 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 				productTx.Fee.GatewayFee,
 			)
 
-			// 2. Create settlement journal and entries (move from PENDING to AVAILABLE)
-			batchID := uuid.New().String()
+			// 2. Create settlement journal and entries (move from PENDING to AVAILABLE).
+			// Sourced on the transaction, the way the per-transaction settling pass
+			// books it — there is no settlement batch to point at.
 			settlementJournal := domain.NewJournal(
 				domain.EventTypeSettlement,
-				domain.SourceTypeSettlementBatch,
-				batchID,
+				domain.SourceTypeProductTransaction,
+				productTx.UUID,
 				map[string]any{
 					"invoice_number": invoiceNum,
 				},
@@ -423,7 +424,7 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 
 			sellerEntry := domain.NewSettlementEntriesForAccount(
 				settlementJournal.UUID,
-				batchID,
+				productTx.UUID,
 				sellerAccount.Record.UUID,
 				feeBreakdown.SellerPrice,
 			)
@@ -431,7 +432,7 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 			// Platform Fee Entry
 			platformEntry := domain.NewSettlementEntriesForAccount(
 				settlementJournal.UUID,
-				batchID,
+				productTx.UUID,
 				platformAccount.Record.UUID,
 				feeBreakdown.PlatformFee,
 			)
@@ -439,7 +440,7 @@ func (c *LedgerClient) SetupDummyData(platformEmail string, sellerEmail string) 
 			// Gateway fee entry
 			gatewayEntry := domain.NewGatewayFeeSettlementEntry(
 				settlementJournal.UUID,
-				batchID,
+				productTx.UUID,
 				gatewayAccount.Record.UUID,
 				feeBreakdown.GatewayFee,
 			)

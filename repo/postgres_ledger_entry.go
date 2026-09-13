@@ -94,7 +94,7 @@ func (r *PostgresLedgerEntryRepository) Save(ctx context.Context, entry *domain.
 
 	// NOTE: total_deposit_amount and total_withdrawal_amount are NOT updated here
 	// They should only be updated when:
-	// - Product transaction is marked SETTLED (in ProcessReconciliation)
+	// - Product transaction is marked SETTLED (by the settling pass in settlement.go)
 	// - Disbursement is marked COMPLETED (in ProcessDisbursement)
 	// This ensures these totals reflect actual settled money, not intermediate ledger movements
 
@@ -212,7 +212,7 @@ func (r *PostgresLedgerEntryRepository) SaveBatch(ctx context.Context, entries [
 
 	// NOTE: total_deposit_amount and total_withdrawal_amount are NOT updated here
 	// They should only be updated when:
-	// - Product transaction is marked SETTLED (in ProcessReconciliation)
+	// - Product transaction is marked SETTLED (by the settling pass in settlement.go)
 	// - Disbursement is marked COMPLETED (in ProcessDisbursement)
 	// This ensures these totals reflect actual settled money, not intermediate ledger movements
 

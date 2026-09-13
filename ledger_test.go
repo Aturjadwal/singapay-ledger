@@ -3,11 +3,8 @@ package ledger
 import (
 	"context"
 	"testing"
-	"time"
 
-	"github.com/21strive/redifu"
 	"github.com/Aturjadwal/singapay-ledger/domain"
-	"github.com/Aturjadwal/singapay-ledger/ledgererr"
 	"github.com/Aturjadwal/singapay-ledger/singapay"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,15 +30,20 @@ func createTestProductTransaction(invoiceNumber, sellerAccountID string, fee *do
 }
 
 // The double-entry model is what survives the gateway change untouched, so it is worth a
-// test that walks a whole sale through it without a gateway in sight: payment credits
-// PENDING, settlement moves PENDING to AVAILABLE, and the two must net to zero on the
-// pending side.
+// test that walks a whole sale through it: payment credits PENDING, settlement moves
+// PENDING to AVAILABLE, and the two must net to zero on the pending side.
+//
+// The settlement half runs through bookSettlement rather than hand-built entries, so the
+// invariant is asserted against the code that actually writes them — including the
+// COMPLETED -> SETTLED compare-and-set and the settled fee figures it records.
 func TestLedgerEntries_PaymentThroughSettlement(t *testing.T) {
 	fakes := NewFakeRepositoryProvider()
 	ctx := context.Background()
 
-	platformAcc := createTestAccount(domain.OwnerTypePlatform, domain.OWNER_TYPE_PLATFORM, "01PLATFORMACCOUNTULID")
+	platformAcc := createTestAccount(domain.OwnerTypePlatform, "platform", "01PLATFORMACCOUNTULID")
 	require.NoError(t, fakes.Account().Save(ctx, platformAcc))
+	gatewayAcc := createTestAccount(domain.OwnerTypePaymentGateway, "SINGAPAY", "01GATEWAYACCOUNTULID")
+	require.NoError(t, fakes.Account().Save(ctx, gatewayAcc))
 	sellerAcc := createTestAccount(domain.OwnerTypeSeller, "seller-1", "01SELLERACCOUNTULID")
 	require.NoError(t, fakes.Account().Save(ctx, sellerAcc))
 
@@ -50,39 +52,28 @@ func TestLedgerEntries_PaymentThroughSettlement(t *testing.T) {
 	tx := createTestProductTransaction("INV-001", sellerAcc.UUID, fee)
 	require.NoError(t, fakes.ProductTransaction().Save(ctx, tx))
 
-	// Payment: the seller's share lands in PENDING.
+	// Payment: every party's share lands in PENDING, exactly as the money-in webhook
+	// books it.
 	journal := domain.NewJournal(domain.EventTypePaymentSuccess, domain.SourceTypeProductTransaction, tx.UUID, nil)
 	require.NoError(t, fakes.Journal().Save(ctx, journal))
+	require.NoError(t, fakes.LedgerEntry().SaveBatch(ctx, domain.NewPaymentEntries(
+		journal.UUID,
+		tx.UUID,
+		sellerAcc.UUID, fee.SellerNetAmount,
+		platformAcc.UUID, fee.PlatformFee,
+		gatewayAcc.UUID, fee.GatewayFee,
+	)))
 
-	pendingEntry := &domain.LedgerEntry{
-		JournalUUID:   journal.UUID,
-		AccountUUID:   sellerAcc.UUID,
-		Amount:        46005,
-		BalanceBucket: domain.BalanceBucketPending,
-		EntryType:     domain.EntryTypeProductPayment,
-		SourceType:    domain.SourceTypeProductTransaction,
-		SourceID:      tx.UUID,
+	client := &LedgerClient{
+		txProvider:   NewFakeTransactionProvider(fakes),
+		repoProvider: fakes,
+		logger:       testLogger(),
 	}
-	redifu.InitRecord(pendingEntry)
-	require.NoError(t, fakes.LedgerEntry().Save(ctx, pendingEntry))
 
-	// Settlement: a batch covering a window, and the item that matched inside it.
-	batch, err := domain.NewSettlementBatch(
-		platformAcc.UUID,
-		"SP-SETTLE-1",
-		"SETTLE/2026/001",
-		time.Now().Add(-24*time.Hour),
-		time.Now(),
-		time.Now(),
-		"settlement-webhook",
-		domain.CurrencyIDR,
-	)
-	require.NoError(t, err)
-	require.NoError(t, fakes.SettlementBatch().Save(ctx, batch))
-
-	// Net credited to the sub-account is total_charged - gateway_fee = 51000 - 4995,
-	// which is exactly seller_net + platform_fee.
-	item, err := domain.NewSettlementItem(batch.UUID, domain.SettledTransaction{
+	// Settlement: Singapay reports the transaction settled, and the fee it really took
+	// matches the one priced, so there is no adjustment to absorb. Net credited to the
+	// sub-account is total_charged - gateway_fee = 51000 - 4995 = seller_net + platform_fee.
+	outcome, err := client.bookSettlement(ctx, tx, domain.SettledTransaction{
 		MerchantReference:    "INV-001",
 		GatewayTransactionID: "SP-TX-1",
 		GatewayAccountID:     "01SELLERACCOUNTULID",
@@ -93,41 +84,67 @@ func TestLedgerEntries_PaymentThroughSettlement(t *testing.T) {
 		FeeReported:          true,
 	})
 	require.NoError(t, err)
-	require.NoError(t, item.MatchToTransaction(tx))
-	require.NoError(t, fakes.SettlementItem().Save(ctx, item))
+	assert.Equal(t, settleOutcomeSettled, outcome)
 
-	settlementJournal := domain.NewJournal(domain.EventTypeSettlement, domain.SourceTypeSettlementBatch, batch.UUID, nil)
-	require.NoError(t, fakes.Journal().Save(ctx, settlementJournal))
-	require.NoError(t, fakes.LedgerEntry().SaveBatch(ctx,
-		domain.NewSettlementEntriesForAccount(settlementJournal.UUID, tx.UUID, sellerAcc.UUID, 46005)))
-
-	pending, available, err := fakes.LedgerEntry().GetAllBalances(ctx, sellerAcc.UUID)
+	sellerPending, sellerAvailable, err := fakes.LedgerEntry().GetAllBalances(ctx, sellerAcc.UUID)
 	require.NoError(t, err)
-	assert.Equal(t, int64(0), pending, "settlement must clear what payment put in PENDING")
-	assert.Equal(t, int64(46005), available, "the settled net is seller_price + platform_fee")
+	assert.Equal(t, int64(0), sellerPending, "settlement must clear what payment put in PENDING")
+	assert.Equal(t, int64(45005), sellerAvailable, "the seller's share is price minus the gateway fee they absorb")
 
-	retrievedItems, err := fakes.SettlementItem().GetByProductTransactionID(ctx, tx.UUID)
+	platformPending, platformAvailable, err := fakes.LedgerEntry().GetAllBalances(ctx, platformAcc.UUID)
 	require.NoError(t, err)
-	require.Len(t, retrievedItems, 1)
-	assert.False(t, retrievedItems[0].HasAmountDiscrepancy())
-	assert.True(t, retrievedItems[0].FeeReported,
-		"a VA row reports its own fee, so the delta against the expected fee is meaningful")
+	assert.Equal(t, int64(0), platformPending)
+	assert.Equal(t, int64(1000), platformAvailable, "the platform fee settles alongside the seller's share")
+
+	// The gateway expense account is cleared, not credited: that money left for Singapay.
+	gatewayPending, gatewayAvailable, err := fakes.LedgerEntry().GetAllBalances(ctx, gatewayAcc.UUID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), gatewayPending, "the gateway fee booked at payment time must be cleared")
+	assert.Equal(t, int64(0), gatewayAvailable)
+
+	settled, err := fakes.ProductTransaction().GetByID(ctx, tx.UUID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.TransactionStatusSettled, settled.Status)
+	require.NotNil(t, settled.SettledGatewayFee)
+	assert.Equal(t, int64(4995), *settled.SettledGatewayFee,
+		"the fee Singapay actually took is what the transfer step must read")
 }
 
-// A payment-link row carries no fee anywhere in Singapay's API, so its AllocatedFee is a
-// fallback rather than a fact. FeeReported is what stops that being mistaken for a perfect
-// reconciliation.
-func TestSettlementItem_PaymentLinkFeeIsNotReported(t *testing.T) {
-	item, err := domain.NewSettlementItem("batch-1", domain.SettledTransaction{
+// A payment-link row carries no fee anywhere in Singapay's API, so its Fee is a fallback
+// copied from what was expected rather than a fact. That makes the delta zero by
+// construction — a perfect reconciliation that reconciled nothing. FeeReported is the only
+// thing that tells the two apart, so it has to survive into the journal the settlement
+// writes.
+func TestResolveFeeAdjustment_PaymentLinkFeeIsNotReported(t *testing.T) {
+	tx := &domain.ProductTransaction{
+		SellerAccountID: "seller-account",
+		Fee: domain.FeeBreakdown{
+			SellerPrice:     50000,
+			SellerNetAmount: 45005,
+			PlatformFee:     1000,
+			GatewayFee:      4995,
+			FeeModel:        domain.FeeModelGatewayOnSeller,
+		},
+	}
+
+	settled := domain.SettledTransaction{
 		MerchantReference: "INV-002",
 		PaymentChannel:    ChannelPaymentLink,
 		GrossAmount:       51000,
 		NetAmount:         46005,
 		Fee:               4995, // copied from what was expected, not observed
 		FeeReported:       false,
-	})
-	require.NoError(t, err)
-	assert.False(t, item.FeeReported)
+	}
+
+	adj, blocked := resolveFeeAdjustment(tx, settled)
+
+	assert.Empty(t, blocked)
+	assert.Equal(t, int64(0), adj.FeeDelta,
+		"a copied fee can only ever produce a zero delta")
+	assert.Equal(t, tx.Fee.SellerNetAmount, adj.SellerNet)
+	assert.Equal(t, tx.Fee.PlatformFee, adj.PlatformFee)
+	assert.False(t, settled.FeeReported,
+		"the zero delta above must stay distinguishable from a real reconciliation")
 }
 
 func TestFeeBreakdown_FeeModels(t *testing.T) {
@@ -171,50 +188,6 @@ func TestFeeBreakdown_FeeModels(t *testing.T) {
 			assert.Equal(t, tt.gatewayFee, fee.GatewayFee)
 		})
 	}
-}
-
-// A batch with no window can never be reconciled or audited later — Singapay sends no list
-// of the transactions it covered, so the window is the only handle on them.
-func TestNewSettlementBatch_RequiresAWindow(t *testing.T) {
-	from := time.Now().Add(-24 * time.Hour)
-	to := time.Now()
-
-	_, err := domain.NewSettlementBatch("ledger-1", "SP-1", "ref", time.Time{}, to, to, "webhook", domain.CurrencyIDR)
-	assert.Error(t, err, "a batch without settle_from must be refused")
-
-	_, err = domain.NewSettlementBatch("ledger-1", "SP-1", "ref", from, time.Time{}, to, "webhook", domain.CurrencyIDR)
-	assert.Error(t, err, "a batch without settle_to must be refused")
-
-	_, err = domain.NewSettlementBatch("ledger-1", "SP-1", "ref", to, from, to, "webhook", domain.CurrencyIDR)
-	assert.Error(t, err, "an inverted window must be refused")
-
-	_, err = domain.NewSettlementBatch("ledger-1", "", "ref", from, to, to, "webhook", domain.CurrencyIDR)
-	assert.Error(t, err, "a batch without a gateway settlement id has no idempotency key")
-
-	batch, err := domain.NewSettlementBatch("ledger-1", "SP-1", "ref", from, to, to, "webhook", domain.CurrencyIDR)
-	require.NoError(t, err)
-	assert.Equal(t, "SP-1", batch.BatchID)
-	assert.Equal(t, domain.SettlementBatchStatusPending, batch.ProcessingStatus)
-}
-
-// Reconciliation is deliberately unimplemented. It must say so loudly rather than quietly
-// booking nothing, because a settlement that silently moves no balances is indistinguishable
-// from one with nothing in it.
-func TestProcessReconciliation_RefusesUntilImplemented(t *testing.T) {
-	gw := &fakeGateway{}
-	client, _, _ := newPayoutTestClient(t, gw, 0)
-
-	resp, err := client.ProcessReconciliation(context.Background(), &ReconciliationRequest{
-		SettlementID: "SP-SETTLE-1",
-		SettleFrom:   time.Now().Add(-24 * time.Hour),
-		SettleTo:     time.Now(),
-		InitiatedBy:  "settlement-webhook",
-	})
-
-	assert.Nil(t, resp)
-	require.Error(t, err)
-	assert.True(t, ledgererr.IsAppError(err, ErrReconciliationNotImplemented),
-		"expected the not-implemented answer, got: %v", err)
 }
 
 // The channel code decides which Singapay product issues the payment, and getting it wrong

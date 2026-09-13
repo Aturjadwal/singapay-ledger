@@ -42,8 +42,16 @@ type SourceType string
 const (
 	SourceTypeProductTransaction SourceType = "PRODUCT_TRANSACTION"
 	SourceTypeDisbursement       SourceType = "DISBURSEMENT"
-	SourceTypeSettlementBatch    SourceType = "SETTLEMENT_BATCH"
 	SourceTypeManualAdjustment   SourceType = "MANUAL_ADJUSTMENT"
+
+	// SourceTypeSettlementBatch is never written any more: the settlement_batches table
+	// is gone and the settling pass sources its entries on the product transaction.
+	//
+	// It stays because entries are insert-only. Rows booked by the old batch reconciler
+	// carry this source_type with a settlement_batches.uuid in source_id, the value is
+	// still in the CHECK constraint on both journals and ledger_entries, and a reader
+	// that cannot name it cannot read its own history. Do not remove it.
+	SourceTypeSettlementBatch SourceType = "SETTLEMENT_BATCH"
 )
 
 // LedgerEntry is an immutable financial record.

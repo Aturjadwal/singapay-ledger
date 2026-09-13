@@ -10,13 +10,10 @@ type Tx interface {
 	Account() domain.AccountRepository
 	LedgerEntry() domain.LedgerEntryRepository
 	Journal() domain.JournalRepository
-	ReconciliationDiscrepancy() domain.ReconciliationDiscrepancyRepository
 	ProductTransaction() domain.ProductTransactionRepository
 	PaymentRequest() domain.PaymentRequestRepository
 	FeeConfig() domain.FeeConfigRepository
 	Disbursement() domain.DisbursementRepository
-	SettlementBatch() domain.SettlementBatchRepository
-	SettlementItem() domain.SettlementItemRepository
 	SettlementNotification() domain.SettlementNotificationRepository
 }
 
@@ -52,18 +49,6 @@ func (p *postgresTx) Disbursement() domain.DisbursementRepository {
 	return NewPostgresDisbursementRepository(p.tx)
 }
 
-func (p *postgresTx) SettlementBatch() domain.SettlementBatchRepository {
-	return NewPostgresSettlementBatchRepository(p.tx)
-}
-
-func (p *postgresTx) SettlementItem() domain.SettlementItemRepository {
-	return NewPostgresSettlementItemRepository(p.tx)
-}
-
 func (p *postgresTx) SettlementNotification() domain.SettlementNotificationRepository {
 	return NewPostgresSettlementNotificationRepository(p.tx)
-}
-
-func (p *postgresTx) ReconciliationDiscrepancy() domain.ReconciliationDiscrepancyRepository {
-	return NewPostgresReconciliationDiscrepancyRepository(p.tx)
 }

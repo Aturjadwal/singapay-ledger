@@ -98,15 +98,8 @@ const (
 	CodeSubaccountAlreadyExists ErrorCode = 409001
 
 	// Ledger error codes
-	CodeLedgerNotFound                 ErrorCode = 404001
-	CodeLedgerAlreadyExists            ErrorCode = 409002
-	CodeReconciliationDiscrepancyFound ErrorCode = 409003
-
-	// CodeReconciliationNotImplemented reports that settlement reconciliation has no
-	// Singapay implementation yet. It is a state of the system, not a transient fault:
-	// retrying never helps, and a caller must not treat it as a reason to hold a
-	// webhook unacknowledged.
-	CodeReconciliationNotImplemented ErrorCode = 501001
+	CodeLedgerNotFound      ErrorCode = 404001
+	CodeLedgerAlreadyExists ErrorCode = 409002
 
 	// ProductTransaction error codes
 	CodeProductTransactionNotFound      ErrorCode = 404002
@@ -131,14 +124,6 @@ const (
 	CodeInvalidBankAccount        ErrorCode = 400008
 	CodeInsufficientBalance       ErrorCode = 400009
 
-	// Settlement error codes
-	CodeSettlementBatchNotFound      ErrorCode = 404006
-	CodeSettlementBatchAlreadyExists ErrorCode = 409007
-	CodeInvalidSettlementBatchStatus ErrorCode = 400010
-	CodeInvalidSettlementItem        ErrorCode = 400011
-	CodeInvalidSettlementWindow      ErrorCode = 400012
-	CodeSettlementItemNotFound       ErrorCode = 404007
-
 	// Analytics error codes
 	CodeAnalyticsDataNotFound ErrorCode = 404008
 	CodeAnalyticsQueryError   ErrorCode = 500003
@@ -155,9 +140,8 @@ const (
 
 // Ledger errors
 var (
-	ErrLedgerNotFound                 = NewError(CodeLedgerNotFound, "ledger not found", nil)
-	ErrLedgerAlreadyExists            = NewError(CodeLedgerAlreadyExists, "ledger already exists", nil)
-	ErrReconciliationDiscrepancyFound = NewError(CodeReconciliationDiscrepancyFound, "reconciliation discrepancy found", nil)
+	ErrLedgerNotFound      = NewError(CodeLedgerNotFound, "ledger not found", nil)
+	ErrLedgerAlreadyExists = NewError(CodeLedgerAlreadyExists, "ledger already exists", nil)
 )
 
 // ProductTransaction errors
@@ -191,15 +175,7 @@ var (
 	ErrInsufficientBalance       = NewError(CodeInsufficientBalance, "insufficient balance for disbursement", nil)
 )
 
-// Settlement errors
 var (
-	ErrSettlementBatchNotFound      = NewError(CodeSettlementBatchNotFound, "settlement batch not found", nil)
-	ErrSettlementBatchAlreadyExists = NewError(CodeSettlementBatchAlreadyExists, "settlement batch already exists for this date", nil)
-	ErrInvalidSettlementBatchStatus = NewError(CodeInvalidSettlementBatchStatus, "invalid settlement batch status transition", nil)
-	ErrInvalidSettlementItem        = NewError(CodeInvalidSettlementItem, "invalid settlement item data", nil)
-	ErrInvalidSettlementWindow      = NewError(CodeInvalidSettlementWindow, "invalid settlement window", nil)
-	ErrSettlementItemNotFound       = NewError(CodeSettlementItemNotFound, "settlement item not found", nil)
-
 	ErrInvalidRequest = NewError(CodeInvalidRequest, "invalid request", nil)
 )
 

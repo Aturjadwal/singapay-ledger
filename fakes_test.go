@@ -491,139 +491,6 @@ func (f *FakeSettlementNotificationRepository) MarkNeedsReview(ctx context.Conte
 	return nil
 }
 
-// FakeSettlementBatchRepository provides in-memory settlement batch storage
-type FakeSettlementBatchRepository struct {
-	batches map[string]*domain.SettlementBatch
-}
-
-func NewFakeSettlementBatchRepository() *FakeSettlementBatchRepository {
-	return &FakeSettlementBatchRepository{
-		batches: make(map[string]*domain.SettlementBatch),
-	}
-}
-
-func (f *FakeSettlementBatchRepository) Save(ctx context.Context, batch *domain.SettlementBatch) error {
-	f.batches[batch.UUID] = batch
-	return nil
-}
-
-func (f *FakeSettlementBatchRepository) GetByID(ctx context.Context, id string) (*domain.SettlementBatch, error) {
-	if batch, ok := f.batches[id]; ok {
-		return batch, nil
-	}
-	return nil, repo.ErrNotFound
-}
-
-func (f *FakeSettlementBatchRepository) GetByAccountID(ctx context.Context, accountID string, page, pageSize int) ([]*domain.SettlementBatch, error) {
-	return nil, nil
-}
-
-func (f *FakeSettlementBatchRepository) GetBySettlementDate(ctx context.Context, accountID string, settlementDate time.Time) (*domain.SettlementBatch, error) {
-	return nil, nil
-}
-
-func (f *FakeSettlementBatchRepository) GetByLedgerID(ctx context.Context, ledgerID string, page, pageSize int) ([]*domain.SettlementBatch, error) {
-	return nil, nil
-}
-
-func (f *FakeSettlementBatchRepository) GetByLedgerIDAndDate(ctx context.Context, ledgerID string, settlementDate time.Time) (*domain.SettlementBatch, error) {
-	return nil, nil
-}
-
-func (f *FakeSettlementBatchRepository) GetByBatchID(ctx context.Context, batchID string) (*domain.SettlementBatch, error) {
-	if batchID == "" {
-		return nil, repo.ErrNotFound
-	}
-	for _, batch := range f.batches {
-		if batch.BatchID == batchID {
-			return batch, nil
-		}
-	}
-	return nil, repo.ErrNotFound
-}
-
-func (f *FakeSettlementBatchRepository) FilterIngestedBatchIDs(ctx context.Context, batchIDs []string) (map[string]struct{}, error) {
-	ingested := make(map[string]struct{}, len(batchIDs))
-	for _, id := range batchIDs {
-		for _, batch := range f.batches {
-			if batch.BatchID == id {
-				ingested[id] = struct{}{}
-				break
-			}
-		}
-	}
-	return ingested, nil
-}
-
-func (f *FakeSettlementBatchRepository) UpdateStatus(ctx context.Context, id string, status domain.SettlementBatchStatus, processedAt *time.Time, failureReason string) error {
-	if batch, ok := f.batches[id]; ok {
-		batch.ProcessingStatus = status
-		batch.ProcessedAt = processedAt
-		return nil
-	}
-	return repo.ErrNotFound
-}
-
-// FakeSettlementItemRepository provides in-memory settlement item storage
-type FakeSettlementItemRepository struct {
-	items map[string]*domain.SettlementItem
-}
-
-func NewFakeSettlementItemRepository() *FakeSettlementItemRepository {
-	return &FakeSettlementItemRepository{
-		items: make(map[string]*domain.SettlementItem),
-	}
-}
-
-func (f *FakeSettlementItemRepository) Save(ctx context.Context, item *domain.SettlementItem) error {
-	f.items[item.UUID] = item
-	return nil
-}
-
-func (f *FakeSettlementItemRepository) SaveBatch(ctx context.Context, items []*domain.SettlementItem) error {
-	for _, item := range items {
-		f.items[item.UUID] = item
-	}
-	return nil
-}
-
-func (f *FakeSettlementItemRepository) GetByID(ctx context.Context, id string) (*domain.SettlementItem, error) {
-	if item, ok := f.items[id]; ok {
-		return item, nil
-	}
-	return nil, repo.ErrNotFound
-}
-
-func (f *FakeSettlementItemRepository) GetBySettlementBatchID(ctx context.Context, batchID string) ([]*domain.SettlementItem, error) {
-	var result []*domain.SettlementItem
-	for _, item := range f.items {
-		if item.SettlementBatchUUID == batchID {
-			result = append(result, item)
-		}
-	}
-	return result, nil
-}
-
-func (f *FakeSettlementItemRepository) GetByProductTransactionID(ctx context.Context, txID string) ([]*domain.SettlementItem, error) {
-	var result []*domain.SettlementItem
-	for _, item := range f.items {
-		if item.ProductTransactionUUID == txID {
-			result = append(result, item)
-		}
-	}
-	return result, nil
-}
-
-func (f *FakeSettlementItemRepository) GetUnmatchedByBatchID(ctx context.Context, batchID string) ([]*domain.SettlementItem, error) {
-	var result []*domain.SettlementItem
-	for _, item := range f.items {
-		if item.SettlementBatchUUID == batchID && !item.IsMatched {
-			result = append(result, item)
-		}
-	}
-	return result, nil
-}
-
 // FakeJournalRepository provides in-memory journal storage
 type FakeJournalRepository struct {
 	journals map[string]*domain.Journal
@@ -653,58 +520,6 @@ func (f *FakeJournalRepository) GetBySourceID(ctx context.Context, sourceType do
 
 func (f *FakeJournalRepository) GetByEventType(ctx context.Context, eventType domain.EventType, page, pageSize int) ([]*domain.Journal, error) {
 	return nil, nil
-}
-
-// FakeReconciliationDiscrepancyRepository provides in-memory discrepancy storage
-type FakeReconciliationDiscrepancyRepository struct {
-	discrepancies map[string]*domain.ReconciliationDiscrepancy
-}
-
-func NewFakeReconciliationDiscrepancyRepository() *FakeReconciliationDiscrepancyRepository {
-	return &FakeReconciliationDiscrepancyRepository{
-		discrepancies: make(map[string]*domain.ReconciliationDiscrepancy),
-	}
-}
-
-func (f *FakeReconciliationDiscrepancyRepository) Save(ctx context.Context, discrepancy *domain.ReconciliationDiscrepancy) error {
-	f.discrepancies[discrepancy.UUID] = discrepancy
-	return nil
-}
-
-func (f *FakeReconciliationDiscrepancyRepository) GetByID(ctx context.Context, id string) (*domain.ReconciliationDiscrepancy, error) {
-	if d, ok := f.discrepancies[id]; ok {
-		return d, nil
-	}
-	return nil, repo.ErrNotFound
-}
-
-func (f *FakeReconciliationDiscrepancyRepository) GetByAccountIDAndBatchID(ctx context.Context, accountID, batchID string) (*domain.ReconciliationDiscrepancy, error) {
-	return nil, nil
-}
-
-func (f *FakeReconciliationDiscrepancyRepository) GetByStatus(ctx context.Context, status domain.DiscrepancyStatus, page, pageSize int) ([]*domain.ReconciliationDiscrepancy, error) {
-	return nil, nil
-}
-
-func (f *FakeReconciliationDiscrepancyRepository) GetByLedgerID(ctx context.Context, ledgerID string, limit, offset int) ([]domain.ReconciliationDiscrepancy, error) {
-	return nil, nil
-}
-
-func (f *FakeReconciliationDiscrepancyRepository) GetBySettlementBatchID(ctx context.Context, batchID string) (*domain.ReconciliationDiscrepancy, error) {
-	for _, disc := range f.discrepancies {
-		if disc.SettlementBatchUUID == batchID {
-			return disc, nil
-		}
-	}
-	return nil, repo.ErrNotFound
-}
-
-func (f *FakeReconciliationDiscrepancyRepository) GetPendingDiscrepancies(ctx context.Context, limit int) ([]domain.ReconciliationDiscrepancy, error) {
-	return nil, nil // Stub - implement if needed
-}
-
-func (f *FakeReconciliationDiscrepancyRepository) MarkResolved(ctx context.Context, id string, notes string) error {
-	return nil // Stub - implement if needed
 }
 
 // FakePaymentRequestRepository provides in-memory payment-request storage, keyed the two
@@ -773,16 +588,13 @@ func (f *FakePaymentRequestRepository) Update(ctx context.Context, pr *domain.Pa
 // FakeRepositoryProvider implements repo.RepositoryProvider interface
 // This allows us to inject fakes into LedgerClient
 type FakeRepositoryProvider struct {
-	accountRepo                   *FakeAccountRepository
-	ledgerEntryRepo               *FakeLedgerEntryRepository
-	productTransactionRepo        *FakeProductTransactionRepository
-	settlementBatchRepo           *FakeSettlementBatchRepository
-	settlementItemRepo            *FakeSettlementItemRepository
-	settlementNotificationRepo    *FakeSettlementNotificationRepository
-	journalRepo                   *FakeJournalRepository
-	reconciliationDiscrepancyRepo *FakeReconciliationDiscrepancyRepository
-	disbursementRepo              *FakeDisbursementRepository
-	paymentRequestRepo            *FakePaymentRequestRepository
+	accountRepo                *FakeAccountRepository
+	ledgerEntryRepo            *FakeLedgerEntryRepository
+	productTransactionRepo     *FakeProductTransactionRepository
+	settlementNotificationRepo *FakeSettlementNotificationRepository
+	journalRepo                *FakeJournalRepository
+	disbursementRepo           *FakeDisbursementRepository
+	paymentRequestRepo         *FakePaymentRequestRepository
 }
 
 // Ensure FakeRepositoryProvider implements repo.RepositoryProvider at compile time
@@ -793,16 +605,13 @@ var _ repo.Tx = (*FakeRepositoryProvider)(nil)
 
 func NewFakeRepositoryProvider() *FakeRepositoryProvider {
 	return &FakeRepositoryProvider{
-		accountRepo:                   NewFakeAccountRepository(),
-		ledgerEntryRepo:               NewFakeLedgerEntryRepository(),
-		productTransactionRepo:        NewFakeProductTransactionRepository(),
-		settlementBatchRepo:           NewFakeSettlementBatchRepository(),
-		settlementItemRepo:            NewFakeSettlementItemRepository(),
-		settlementNotificationRepo:    NewFakeSettlementNotificationRepository(),
-		journalRepo:                   NewFakeJournalRepository(),
-		reconciliationDiscrepancyRepo: NewFakeReconciliationDiscrepancyRepository(),
-		disbursementRepo:              NewFakeDisbursementRepository(),
-		paymentRequestRepo:            NewFakePaymentRequestRepository(),
+		accountRepo:                NewFakeAccountRepository(),
+		ledgerEntryRepo:            NewFakeLedgerEntryRepository(),
+		productTransactionRepo:     NewFakeProductTransactionRepository(),
+		settlementNotificationRepo: NewFakeSettlementNotificationRepository(),
+		journalRepo:                NewFakeJournalRepository(),
+		disbursementRepo:           NewFakeDisbursementRepository(),
+		paymentRequestRepo:         NewFakePaymentRequestRepository(),
 	}
 }
 
@@ -818,24 +627,12 @@ func (f *FakeRepositoryProvider) ProductTransaction() domain.ProductTransactionR
 	return f.productTransactionRepo
 }
 
-func (f *FakeRepositoryProvider) SettlementBatch() domain.SettlementBatchRepository {
-	return f.settlementBatchRepo
-}
-
-func (f *FakeRepositoryProvider) SettlementItem() domain.SettlementItemRepository {
-	return f.settlementItemRepo
-}
-
 func (f *FakeRepositoryProvider) SettlementNotification() domain.SettlementNotificationRepository {
 	return f.settlementNotificationRepo
 }
 
 func (f *FakeRepositoryProvider) Journal() domain.JournalRepository {
 	return f.journalRepo
-}
-
-func (f *FakeRepositoryProvider) ReconciliationDiscrepancy() domain.ReconciliationDiscrepancyRepository {
-	return f.reconciliationDiscrepancyRepo
 }
 
 func (f *FakeRepositoryProvider) PaymentRequest() domain.PaymentRequestRepository {

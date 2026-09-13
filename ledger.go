@@ -1361,13 +1361,12 @@ type PlatformFeeTransferSuccess struct {
 // ProcessPlatformFeeTransfer moves the platform's share out of seller sub-accounts and
 // into the platform sub-account, for settled transactions that have not had it moved yet.
 //
-// It finds nothing today. Its input is transactions in SETTLED status, and nothing reaches
-// SETTLED while reconciliation is unimplemented — see reconciliation.go. The routine is
-// correct and wired to Singapay's account transfer; it is simply waiting for work. Running
-// it on a schedule now is harmless and means nothing has to be remembered later.
+// Its input is transactions in SETTLED status, which the settling pass produces — see
+// settlement.go. Nothing transfers a fee inline any more, so every settled transaction's
+// platform fee waits for this sweep and for nothing else.
 //
 // This should be called:
-//   - After reconciliation completes successfully
+//   - After a settlement pass, which is what creates the work
 //   - As a periodic background job (e.g. every 5 minutes)
 //
 // Two Singapay facts shape it.

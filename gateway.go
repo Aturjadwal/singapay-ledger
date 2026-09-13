@@ -30,9 +30,10 @@ type PaymentGateway interface {
 	CreateEwalletOrder(ctx context.Context, req singapay.CreateEwalletOrderRequest) (*singapay.EwalletTransaction, error)
 	CreatePaymentLink(ctx context.Context, accountID string, req singapay.CreatePaymentLinkRequest) (*singapay.PaymentLink, error)
 
-	// Settlement reconstruction. Singapay ships no settlement file, so the rows a
-	// settlement batch covered are read back from these, filtered on the batch's
-	// window.
+	// Window listings. These predate the per-transaction settling pass, which reads one
+	// invoice at a time instead (see the per-transaction reads below) and never filters
+	// on a settlement window. Kept for operators and smoke tests that need to sweep a
+	// period; nothing in the settlement path calls them.
 	ListVATransactions(ctx context.Context, accountID string, w singapay.SettlementWindow) ([]singapay.VATransaction, singapay.Pagination, error)
 
 	// The per-transaction reads. These are what the settlement pass actually uses: it
@@ -82,7 +83,7 @@ const (
 	// channelPaymentLink is the fallback when no channel was requested: the payer picks
 	// one on Singapay's hosted page. It is a deliberate last resort — a payment link
 	// reports no per-transaction fee anywhere, so anything paid through one cannot have
-	// its fee reconciled. See domain.SettlementItem.FeeReported.
+	// its fee reconciled. See domain.SettledTransaction.FeeReported.
 	channelPaymentLink
 )
 

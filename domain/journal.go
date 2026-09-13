@@ -12,7 +12,7 @@ type EventType string
 
 const (
 	EventTypePaymentSuccess   EventType = "PAYMENT_SUCCESS"   // Payment webhook received
-	EventTypeSettlement       EventType = "SETTLEMENT"        // Settlement batch processing
+	EventTypeSettlement       EventType = "SETTLEMENT"        // Funds settled: PENDING becomes AVAILABLE
 	EventTypeDisbursement     EventType = "DISBURSEMENT"      // Withdrawal to bank account
 	EventTypeReconciliation   EventType = "RECONCILIATION"    // Balance adjustment/correction
 	EventTypeManualAdjustment EventType = "MANUAL_ADJUSTMENT" // Manual admin correction
