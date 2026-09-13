@@ -393,10 +393,16 @@ migrations are in [`database/migrations/`](database/migrations/).
 Key tables: `ledger_accounts`, `product_transactions`, `payment_requests`, `ledger_entries`,
 `journals`, `settlement_notifications`, `fee_configs`, `disbursements`.
 
-[`025_drop_legacy_settlement_tables.sql`](database/migrations/025_drop_legacy_settlement_tables.sql)
-removes `settlement_batches`, `settlement_items` and `reconciliation_discrepancies`, which
-belonged to the batch reconciler the per-transaction path replaced. **It is irreversible** —
-read its first section before applying it.
+Removing the batch reconciler's tables is a **two-phase migration**, because
+`payment_requests.status` is `NOT NULL` and the new code no longer supplies it:
+
+1. [`025_settlement_cleanup_expand.sql`](database/migrations/025_settlement_cleanup_expand.sql)
+   — makes `status` nullable. Apply it **before** deploying. Reversible, drops nothing, and
+   lets old and new code run side by side through a rolling deploy.
+2. [`026_settlement_cleanup_contract.sql`](database/migrations/026_settlement_cleanup_contract.sql)
+   — drops `settlement_batches`, `settlement_items`, `reconciliation_discrepancies` and the
+   three `payment_requests` columns. Apply it **after** the rollout is complete and settled.
+   **Irreversible** — read its first section first.
 
 ### Migrating an existing database
 

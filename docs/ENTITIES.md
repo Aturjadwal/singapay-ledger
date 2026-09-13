@@ -18,7 +18,7 @@ Dokumen ini menjelaskan seluruh tabel/entitas yang terlibat dalam operasional le
 | [Disbursement](#8-disbursement) | `disbursements` | Penarikan saldo seller ke rekening bank |
 | [Verification](#9-verification) | `ledger_verifications` | Verifikasi KYC seller |
 
-> **Dihapus pada 2026-09-13** oleh [migrasi 025](../database/migrations/025_drop_legacy_settlement_tables.sql):
+> **Dihapus pada 2026-09-13** oleh [migrasi 026](../database/migrations/026_settlement_cleanup_contract.sql):
 > `settlement_batches`, `settlement_items`, `reconciliation_discrepancies`. Ketiganya adalah
 > penyimpanan untuk reconciler batch DOKU, yang tidak pernah berjalan di Singapay dan
 > digantikan mekanisme settlement per-transaksi — lihat
@@ -157,7 +157,7 @@ yang dipakai untuk membaca pembayaran itu kembali dari Singapay. Satu `PaymentRe
 > dan jawabannya diputuskan di `product_transactions.status` di bawah compare-and-set. Salinan
 > kedua di sini hanya bisa setuju dengan yang itu, atau salah tentangnya. Kolom `status`,
 > `failure_reason` dan `completed_at` dihapus oleh
-> [migrasi 025](../database/migrations/025_drop_legacy_settlement_tables.sql).
+> [migrasi 026](../database/migrations/026_settlement_cleanup_contract.sql).
 
 ### Fields
 

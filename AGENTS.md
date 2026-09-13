@@ -87,7 +87,7 @@ wrong when a concurrent delivery gets there first.
 
 **`product_transactions.status` is the only source of truth for transaction state.** Nothing
 else keeps a parallel copy. `payment_requests` deliberately has no status of its own
-(migration 025 removed it) for exactly this reason.
+(migration 026 removes it) for exactly this reason.
 
 **Underpayment is refused; overpayment is booked and warned about.** A money-in webhook proves
 the delivery came from Singapay, not that the payer paid what was asked. Booking a short
@@ -138,6 +138,13 @@ because go-sqlmock never parses SQL and will happily pass a statement that fails
 production. Dropping a column and forgetting its `$n` is the natural way to make that mistake.
 
 **Never run a migration against a live database.** Write the file; a person applies it.
+
+**Schema changes that a running deploy can straddle need two phases.** During a rolling
+deploy both code versions run at once, so a migration must leave the database acceptable to
+both. Migrations 025 and 026 are the worked example: `payment_requests.status` is `NOT NULL`
+and the new code stopped supplying it, so 025 makes the column nullable (both versions work),
+the code rolls out, and only then does 026 drop it. A single migration doing both would break
+every payment creation in whichever direction it was applied.
 
 ---
 

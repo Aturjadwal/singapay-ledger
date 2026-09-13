@@ -196,6 +196,6 @@ still open above.
 
 `settlement_batches`, `settlement_items` and `reconciliation_discrepancies` were the storage
 for that design. They were never written by the path that shipped and were removed by
-[migration 025](../database/migrations/025_drop_legacy_settlement_tables.sql); `settlement_notifications`
+[migration 026](../database/migrations/026_settlement_cleanup_contract.sql); `settlement_notifications`
 took over the "have I seen this settlement?" role, and the journal metadata took over the fee
 audit trail.

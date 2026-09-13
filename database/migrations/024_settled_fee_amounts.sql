@@ -63,7 +63,7 @@
 -- ---------------------------------------------------------------------------------------
 -- An earlier draft added a unique index on settlement_items(product_transaction_uuid) as
 -- an emergency brake under the per-transaction design. settlement_items is dropped by
--- migration 025 and nothing writes it, so the index would have guarded an empty table on
+-- migration 026 and nothing writes it, so the index would have guarded an empty table on
 -- its way to being deleted.
 --
 -- The brake itself is not lost. It was always the conditional UPDATE in

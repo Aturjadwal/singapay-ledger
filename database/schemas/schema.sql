@@ -65,7 +65,7 @@ CREATE TABLE journals (
     ),
     -- What business entity triggered this journal
     -- 'SETTLEMENT_BATCH' is never written any more — settlement_batches was dropped by
-    -- migration 025 — but rows the old batch reconciler booked still carry it, and
+    -- migration 026 — but rows the old batch reconciler booked still carry it, and
     -- journals are insert-only. It stays so that history remains readable.
     source_type VARCHAR(50) NOT NULL CHECK (
         source_type IN (
@@ -251,7 +251,7 @@ WHERE
 -- transaction, in the same database transaction, so "has this been paid?" is a question
 -- about product_transactions.status — which is also where it is decided, under a
 -- compare-and-set. A second copy here could only agree with that one or be wrong about it.
--- The columns were dropped by migration 025.
+-- The columns were dropped by migration 026.
 CREATE TABLE IF NOT EXISTS payment_requests (
     uuid VARCHAR(255) PRIMARY KEY,
     randid VARCHAR(255) NOT NULL UNIQUE,
