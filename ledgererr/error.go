@@ -117,7 +117,6 @@ const (
 	// PaymentRequest error codes
 	CodePaymentRequestNotFound      ErrorCode = 404003
 	CodePaymentRequestAlreadyExists ErrorCode = 409005
-	CodeInvalidPaymentStatus        ErrorCode = 400003
 	CodePaymentExpired              ErrorCode = 400004
 
 	// FeeConfig error codes
@@ -173,7 +172,6 @@ var (
 var (
 	ErrPaymentRequestNotFound      = NewError(CodePaymentRequestNotFound, "payment request not found", nil)
 	ErrPaymentRequestAlreadyExists = NewError(CodePaymentRequestAlreadyExists, "payment request already exists", nil)
-	ErrInvalidPaymentStatus        = NewError(CodeInvalidPaymentStatus, "invalid payment status transition", nil)
 	ErrPaymentExpired              = NewError(CodePaymentExpired, "payment request has expired", nil)
 )
 

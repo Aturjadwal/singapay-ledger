@@ -20,7 +20,7 @@ func NewPostgresPaymentRequestRepository(db DBTX) *PostgresPaymentRequestReposit
 func (r *PostgresPaymentRequestRepository) GetByID(ctx context.Context, id string) (*domain.PaymentRequest, error) {
 	query := `
 		SELECT uuid, randid, product_transaction_uuid, request_id, payment_code, payment_channel, payment_url,
-		       amount, currency, status, failure_reason, created_at, updated_at, completed_at, expires_at,
+		       amount, currency, created_at, updated_at, expires_at,
 		       gateway_transaction_id, gateway_transaction_ref
 		FROM payment_requests
 		WHERE uuid = $1
@@ -32,7 +32,7 @@ func (r *PostgresPaymentRequestRepository) GetByID(ctx context.Context, id strin
 func (r *PostgresPaymentRequestRepository) GetByRequestID(ctx context.Context, requestID string) (*domain.PaymentRequest, error) {
 	query := `
 		SELECT uuid, randid, product_transaction_uuid, request_id, payment_code, payment_channel, payment_url,
-		       amount, currency, status, failure_reason, created_at, updated_at, completed_at, expires_at,
+		       amount, currency, created_at, updated_at, expires_at,
 		       gateway_transaction_id, gateway_transaction_ref
 		FROM payment_requests
 		WHERE request_id = $1
@@ -44,7 +44,7 @@ func (r *PostgresPaymentRequestRepository) GetByRequestID(ctx context.Context, r
 func (r *PostgresPaymentRequestRepository) GetByPaymentCode(ctx context.Context, paymentCode string) (*domain.PaymentRequest, error) {
 	query := `
 		SELECT uuid, randid, product_transaction_uuid, request_id, payment_code, payment_channel, payment_url,
-		       amount, currency, status, failure_reason, created_at, updated_at, completed_at, expires_at,
+		       amount, currency, created_at, updated_at, expires_at,
 		       gateway_transaction_id, gateway_transaction_ref
 		FROM payment_requests
 		WHERE payment_code = $1
@@ -56,7 +56,7 @@ func (r *PostgresPaymentRequestRepository) GetByPaymentCode(ctx context.Context,
 func (r *PostgresPaymentRequestRepository) GetByProductTransactionID(ctx context.Context, productTransactionID string) (*domain.PaymentRequest, error) {
 	query := `
 		SELECT uuid, randid, product_transaction_uuid, request_id, payment_code, payment_channel, payment_url,
-		       amount, currency, status, failure_reason, created_at, updated_at, completed_at, expires_at,
+		       amount, currency, created_at, updated_at, expires_at,
 		       gateway_transaction_id, gateway_transaction_ref
 		FROM payment_requests
 		WHERE product_transaction_uuid = $1
@@ -65,25 +65,12 @@ func (r *PostgresPaymentRequestRepository) GetByProductTransactionID(ctx context
 	return r.scanOne(ctx, query, productTransactionID)
 }
 
-func (r *PostgresPaymentRequestRepository) GetPendingExpired(ctx context.Context, before time.Time) ([]*domain.PaymentRequest, error) {
-	query := `
-		SELECT uuid, randid, product_transaction_uuid, request_id, payment_code, payment_channel, payment_url,
-		       amount, currency, status, failure_reason, created_at, updated_at, completed_at, expires_at,
-		       gateway_transaction_id, gateway_transaction_ref
-		FROM payment_requests
-		WHERE status = 'PENDING' AND expires_at < $1
-		ORDER BY expires_at ASC
-	`
-
-	return r.scanMany(ctx, query, before)
-}
-
 func (r *PostgresPaymentRequestRepository) Save(ctx context.Context, pr *domain.PaymentRequest) error {
 	query := `
 		INSERT INTO payment_requests (
 			uuid, randid, product_transaction_uuid, request_id, payment_code, payment_channel, payment_url,
-			amount, currency, status, failure_reason, created_at, updated_at, completed_at, expires_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+			amount, currency, created_at, updated_at, expires_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 	`
 
 	_, err := r.db.ExecContext(
@@ -98,11 +85,8 @@ func (r *PostgresPaymentRequestRepository) Save(ctx context.Context, pr *domain.
 		toNullString(pr.PaymentURL),
 		pr.Amount,
 		pr.Currency,
-		pr.Status,
-		toNullString(pr.FailureReason),
 		pr.CreatedAt,
 		pr.UpdatedAt,
-		toNullTime(pr.CompletedAt),
 		pr.ExpiresAt,
 	)
 	if err != nil {
@@ -117,13 +101,10 @@ func (r *PostgresPaymentRequestRepository) Update(ctx context.Context, pr *domai
 		UPDATE payment_requests SET
 			payment_code = $1,
 			payment_url = $2,
-			status = $3,
-			failure_reason = $4,
-			updated_at = $5,
-			completed_at = $6,
-			gateway_transaction_id = $7,
-			gateway_transaction_ref = $8
-		WHERE uuid = $9
+			updated_at = $3,
+			gateway_transaction_id = $4,
+			gateway_transaction_ref = $5
+		WHERE uuid = $6
 	`
 
 	result, err := r.db.ExecContext(
@@ -131,10 +112,7 @@ func (r *PostgresPaymentRequestRepository) Update(ctx context.Context, pr *domai
 		query,
 		toNullString(pr.PaymentCode),
 		toNullString(pr.PaymentURL),
-		pr.Status,
-		toNullString(pr.FailureReason),
 		pr.UpdatedAt,
-		toNullTime(pr.CompletedAt),
 		toNullString(pr.GatewayTransactionID),
 		toNullString(pr.GatewayTransactionRef),
 		pr.UUID,
@@ -206,11 +184,8 @@ func (r *PostgresPaymentRequestRepository) scanRow(rows *sql.Rows) (*domain.Paym
 		PaymentURL             sql.NullString
 		Amount                 int64
 		Currency               string
-		Status                 string
-		FailureReason          sql.NullString
 		CreatedAt              time.Time
 		UpdatedAt              time.Time
-		CompletedAt            sql.NullTime
 		ExpiresAt              time.Time
 		GatewayTransactionID   sql.NullString
 		GatewayTransactionRef  sql.NullString
@@ -226,22 +201,14 @@ func (r *PostgresPaymentRequestRepository) scanRow(rows *sql.Rows) (*domain.Paym
 		&row.PaymentURL,
 		&row.Amount,
 		&row.Currency,
-		&row.Status,
-		&row.FailureReason,
 		&row.CreatedAt,
 		&row.UpdatedAt,
-		&row.CompletedAt,
 		&row.ExpiresAt,
 		&row.GatewayTransactionID,
 		&row.GatewayTransactionRef,
 	)
 	if err != nil {
 		return nil, ErrFailedScanSQL.WithError(err)
-	}
-
-	var completedAt *time.Time
-	if row.CompletedAt.Valid {
-		completedAt = &row.CompletedAt.Time
 	}
 
 	pr := &domain.PaymentRequest{
@@ -252,9 +219,6 @@ func (r *PostgresPaymentRequestRepository) scanRow(rows *sql.Rows) (*domain.Paym
 		PaymentURL:             row.PaymentURL.String,
 		Amount:                 row.Amount,
 		Currency:               domain.Currency(row.Currency),
-		Status:                 domain.PaymentStatus(row.Status),
-		FailureReason:          row.FailureReason.String,
-		CompletedAt:            completedAt,
 		ExpiresAt:              row.ExpiresAt,
 		GatewayTransactionID:   row.GatewayTransactionID.String,
 		GatewayTransactionRef:  row.GatewayTransactionRef.String,

@@ -261,9 +261,6 @@ func (c *LedgerClient) HandlePaymentSuccess(ctx context.Context, req singapay.We
 			notification.Data.Transaction.TransactionID,
 		)
 
-		if err := paymentReq.MarkCompleted(); err != nil {
-			return err
-		}
 		if err := tx.PaymentRequest().Update(ctx, paymentReq); err != nil {
 			return err
 		}

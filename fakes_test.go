@@ -757,10 +757,6 @@ func (f *FakePaymentRequestRepository) GetByProductTransactionID(ctx context.Con
 	return nil, repo.ErrNotFound
 }
 
-func (f *FakePaymentRequestRepository) GetPendingExpired(ctx context.Context, before time.Time) ([]*domain.PaymentRequest, error) {
-	return nil, nil
-}
-
 func (f *FakePaymentRequestRepository) Save(ctx context.Context, pr *domain.PaymentRequest) error {
 	f.byID[pr.UUID] = pr
 	f.byProduct[pr.ProductTransactionUUID] = pr
