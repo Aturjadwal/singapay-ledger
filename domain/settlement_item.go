@@ -71,29 +71,6 @@ type SettlementItemRepository interface {
 	SaveBatch(ctx context.Context, items []*SettlementItem) error
 }
 
-// SettledTransaction is one settled row as a gateway product endpoint describes it,
-// normalised across the four channels that can produce one.
-//
-// It exists so the reconciler works in one shape. The four Singapay list endpoints return
-// four different structs, and only three of them carry a fee; flattening them here keeps
-// that difference in one place — the FeeReported flag — instead of spreading four
-// channel-specific branches through the settlement logic.
-type SettledTransaction struct {
-	MerchantReference    string
-	GatewayTransactionID string
-	GatewayAccountID     string
-	PaymentChannel       string
-
-	// GrossAmount is what the payer was charged; NetAmount is what reached the
-	// sub-account. Where the channel reports a fee, Gross - Fee == Net.
-	GrossAmount int64
-	NetAmount   int64
-	Fee         int64
-	FeeReported bool
-
-	Raw map[string]string
-}
-
 // NewSettlementItem creates an unmatched settlement item from a settled gateway record.
 func NewSettlementItem(settlementBatchID string, settled SettledTransaction) (*SettlementItem, error) {
 	if settlementBatchID == "" {
