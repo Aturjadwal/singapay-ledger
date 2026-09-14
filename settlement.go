@@ -414,9 +414,9 @@ func (c *LedgerClient) readSettledTransaction(
 			GatewayTransactionID: va.TransactionID,
 			GatewayAccountID:     gatewayAccountID,
 			PaymentChannel:       paymentReq.PaymentChannel,
-			GrossAmount:          gross,
-			NetAmount:            gross - fee,
-			Fee:                  fee,
+			GrossMinor:           gross,
+			NetMinor:             gross - fee,
+			FeeMinor:             fee,
 			FeeReported:          true,
 			Raw: map[string]string{
 				"transaction_id": va.TransactionID,
@@ -449,9 +449,9 @@ func (c *LedgerClient) readSettledTransaction(
 			GatewayTransactionID: strconv.FormatInt(qr.ID, 10),
 			GatewayAccountID:     gatewayAccountID,
 			PaymentChannel:       paymentReq.PaymentChannel,
-			GrossAmount:          gross,
-			NetAmount:            net,
-			Fee:                  gross - net,
+			GrossMinor:           gross,
+			NetMinor:             net,
+			FeeMinor:             gross - net,
 			FeeReported:          true,
 			Raw: map[string]string{
 				"reff_no":    qr.ReffNo,
@@ -482,9 +482,9 @@ func (c *LedgerClient) readSettledTransaction(
 			GatewayTransactionID: strconv.FormatInt(ew.ID, 10),
 			GatewayAccountID:     gatewayAccountID,
 			PaymentChannel:       paymentReq.PaymentChannel,
-			GrossAmount:          ew.TotalAmount.Minor(),
-			NetAmount:            ew.NetAmount.Minor(),
-			Fee:                  ew.MerchantFee.Minor(),
+			GrossMinor:           ew.TotalAmount.Minor(),
+			NetMinor:             ew.NetAmount.Minor(),
+			FeeMinor:             ew.MerchantFee.Minor(),
 			FeeReported:          true,
 			Raw: map[string]string{
 				"reff_no": ew.ReffNo,
@@ -504,15 +504,20 @@ func (c *LedgerClient) readSettledTransaction(
 		// A payment link reports no fee anywhere — not in the list, not in the detail.
 		// The expected fee is used so the delta is zero by construction, and FeeReported
 		// records that this is the absence of a reconciliation rather than a clean one.
+		//
+		// The expected fee is whole rupiah and this struct is sen, so it is converted here
+		// like every other figure crossing that boundary — a delta that is zero by
+		// construction is only zero if both sides are counted in the same unit.
 		gross := history.Amount.Minor()
+		feeMinor := domain.RupiahToMinor(tx.Fee.GatewayFee)
 		return &domain.SettledTransaction{
 			MerchantReference:    tx.InvoiceNumber,
 			GatewayTransactionID: strconv.FormatInt(history.ID, 10),
 			GatewayAccountID:     gatewayAccountID,
 			PaymentChannel:       ChannelPaymentLink,
-			GrossAmount:          gross,
-			NetAmount:            gross - tx.Fee.GatewayFee,
-			Fee:                  tx.Fee.GatewayFee,
+			GrossMinor:           gross,
+			NetMinor:             gross - feeMinor,
+			FeeMinor:             feeMinor,
 			FeeReported:          false,
 			Raw: map[string]string{
 				"reff_no":              history.ReffNo,
@@ -636,10 +641,11 @@ func gatewayNumericID(paymentReq *domain.PaymentRequest) (int64, error) {
 // written nothing. Two passes racing on one transaction therefore produce one settlement,
 // not two sets of insert-only entries that would need an audit to unpick.
 //
-// The fee rules are docs/104-fee-mismatch-reconciliation.md. In short: the delta between
-// what Singapay actually took and what was priced is absorbed by the platform under
-// GATEWAY_ON_CUSTOMER and by the seller under GATEWAY_ON_SELLER, and when absorbing it
-// would drive either party negative the transaction is left alone for a person to look at.
+// The fee rules are docs/104-fee-mismatch-reconciliation.md and resolveFeeAdjustment. In
+// short: the seller is paid what they were priced, the platform sub-account balances the
+// difference between the quoted gateway fee and the real one in both directions, and when
+// absorbing it would drive the platform negative the transaction is left alone for a person
+// to look at.
 func (c *LedgerClient) bookSettlement(
 	ctx context.Context,
 	tx *domain.ProductTransaction,
@@ -661,8 +667,9 @@ func (c *LedgerClient) bookSettlement(
 			"product_transaction_uuid", tx.UUID,
 			"invoice_number", tx.InvoiceNumber,
 			"fee_model", string(tx.Fee.FeeModel),
-			"expected_gateway_fee", tx.Fee.GatewayFee,
-			"actual_gateway_fee", settled.Fee,
+			"estimated_gateway_fee", tx.Fee.GatewayFee,
+			"actual_gateway_fee", formatMinor(settled.FeeMinor),
+			"fee_delta", formatMinor(adjustment.FeeDeltaMinor),
 			"reason", blocked,
 		)
 		// Deliberately left in COMPLETED. It stays visible in GetAwaitingSettlement and
@@ -680,42 +687,42 @@ func (c *LedgerClient) bookSettlement(
 			"payment_channel":        settled.PaymentChannel,
 			"gateway_transaction_id": settled.GatewayTransactionID,
 			"gateway_account_id":     settled.GatewayAccountID,
-			"gross_amount":           settled.GrossAmount,
-			"net_amount":             settled.NetAmount,
-			"expected_gateway_fee":   tx.Fee.GatewayFee,
-			"actual_gateway_fee":     settled.Fee,
-			"fee_reported":           settled.FeeReported,
-			"fee_delta":              adjustment.FeeDelta,
-			"fee_model":              string(tx.Fee.FeeModel),
-			"priced_platform_fee":    tx.Fee.PlatformFee,
-			"settled_platform_fee":   adjustment.PlatformFee,
-			"priced_seller_net":      tx.Fee.SellerNetAmount,
-			"settled_seller_net":     adjustment.SellerNet,
-			"raw_gateway_data":       settled.Raw,
+			// The _minor figures are sen and are the authoritative ones; their rupiah
+			// siblings are what the ledger entries could express. Where they disagree the
+			// difference is platform_residual_minor, and it is the platform's, never the
+			// seller's.
+			"gross_amount_minor":         settled.GrossMinor,
+			"net_amount_minor":           settled.NetMinor,
+			"estimated_gateway_fee":      tx.Fee.GatewayFee,
+			"actual_gateway_fee_minor":   settled.FeeMinor,
+			"fee_reported":               settled.FeeReported,
+			"fee_delta_minor":            adjustment.FeeDeltaMinor,
+			"fee_model":                  string(tx.Fee.FeeModel),
+			"priced_platform_fee":        tx.Fee.PlatformFee,
+			"settled_platform_fee_minor": adjustment.PlatformFeeMinor,
+			"platform_residual_minor":    adjustment.PlatformResidualMinor(),
+			"priced_seller_net":          tx.Fee.SellerNetAmount,
+			"settled_seller_net":         adjustment.SellerNet,
+			"raw_gateway_data":           settled.Raw,
 		},
 	)
 
+	// The seller's two legs are equal, and that equality is the rule: a seller clears the
+	// PENDING they were priced and receives exactly that amount, whatever Singapay charged.
 	entries := domain.NewSettlementEntriesForAccount(journal.UUID, tx.UUID, tx.SellerAccountID, adjustment.SellerNet)
-	entries = append(entries, domain.NewSettlementEntriesForAccount(journal.UUID, tx.UUID, platformAccount.UUID, adjustment.PlatformFee)...)
+
+	// The platform's are not. Its PENDING was credited the priced fee at payment time and
+	// clears by precisely that; what it receives is the balanced figure. The gap between
+	// the two legs IS the fee delta — there is no separate write-off or surplus entry any
+	// more, because booking the delta twice was what made the old pair of entries need one.
+	entries = append(entries, domain.NewSettlementEntriesForAccountSplit(
+		journal.UUID, tx.UUID, platformAccount.UUID, tx.Fee.PlatformFee, adjustment.PlatformFeeRupiah())...)
 
 	// The gateway expense account clears the fee it was credited at payment time. The
-	// difference between that and what Singapay really took is carried by the adjustment
-	// entries below, not by varying this one — otherwise the same delta would be counted
+	// difference between that and what Singapay really took is carried by the platform's
+	// two legs above, not by varying this one — otherwise the same delta would be counted
 	// in two places.
 	entries = append(entries, domain.NewGatewayFeeSettlementEntry(journal.UUID, tx.UUID, gatewayAccount.UUID, tx.Fee.GatewayFee))
-
-	switch {
-	case adjustment.FeeDelta > 0:
-		// Singapay took more than expected. The absorbing party's remaining PENDING is
-		// written off: terminal, with no AVAILABLE counterpart, because that money left
-		// for the gateway and is not coming back.
-		entries = append(entries, domain.NewFeeAdjustmentWriteOffEntry(
-			journal.UUID, tx.UUID, adjustment.AbsorbingAccountUUID(tx, platformAccount.UUID), adjustment.FeeDelta))
-	case adjustment.FeeDelta < 0:
-		// Singapay took less than expected. The surplus is credited to the seller.
-		entries = append(entries, domain.NewFeeAdjustmentCreditEntry(
-			journal.UUID, tx.UUID, tx.SellerAccountID, -adjustment.FeeDelta))
-	}
 
 	settledAt := time.Now()
 
@@ -731,7 +738,8 @@ func (c *LedgerClient) bookSettlement(
 
 		// Written inside the same transaction as the status move, so the transfer step
 		// can never find a SETTLED row whose figures are still unset.
-		if err := dbtx.ProductTransaction().SaveSettledFees(ctx, tx.UUID, adjustment.PlatformFee, settled.Fee); err != nil {
+		if err := dbtx.ProductTransaction().SaveSettledFees(ctx, tx.UUID,
+			adjustment.PlatformFeeMinor, settled.FeeMinor, adjustment.PlatformResidualMinor()); err != nil {
 			return err
 		}
 
@@ -760,9 +768,10 @@ func (c *LedgerClient) bookSettlement(
 		"invoice_number", tx.InvoiceNumber,
 		"payment_channel", settled.PaymentChannel,
 		"seller_net", adjustment.SellerNet,
-		"platform_fee", adjustment.PlatformFee,
-		"actual_gateway_fee", settled.Fee,
-		"fee_delta", adjustment.FeeDelta,
+		"platform_fee", formatMinor(adjustment.PlatformFeeMinor),
+		"platform_residual_minor", adjustment.PlatformResidualMinor(),
+		"actual_gateway_fee", formatMinor(settled.FeeMinor),
+		"fee_delta", formatMinor(adjustment.FeeDeltaMinor),
 		"fee_reported", settled.FeeReported,
 	)
 
@@ -773,63 +782,107 @@ func (c *LedgerClient) bookSettlement(
 // bookSettlement.
 var errAlreadySettled = errors.New("transaction already settled")
 
-// feeAdjustment is what each party actually receives once the gateway fee is known.
+// feeAdjustment is what each party actually receives once the real gateway fee is known.
+//
+// # The rule
+//
+// The seller is paid what they were priced, always. Singapay's money-in fee is a decimal
+// figure and the one quoted at checkout is an estimate from fee_configs, so the two rarely
+// agree to the sen — but the difference is not the seller's to carry in either direction,
+// and a net that moves by a few sen per transaction is a net nobody can reconcile against
+// what the checkout promised. The platform sub-account is the balancing account:
+//
+//	platformAdjustment = estimatedGatewayFee - actualGatewayFee
+//
+// Positive — Singapay charged less than estimated — and the residual is the platform's.
+// Negative and the platform absorbs the shortfall out of its own fee. Zero and nothing
+// moves. This holds the invariant the whole design exists for: a seller's Singapay
+// sub-account balance and their ledger balance are the same number, because the only two
+// things that leave that sub-account are the fee Singapay itself deducts and the platform
+// fee swept out by ProcessPlatformFeeTransfer, and the sweep moves precisely the figure
+// below.
+//
+// # Units
+//
+// Everything here is sen. The delta is routinely a fraction of a rupiah — the case this
+// whole mechanism exists for — so the arithmetic cannot be done in whole rupiah without
+// throwing away the very quantity it is meant to place. PlatformFeeMinor is the one figure
+// that can carry a fraction; SellerNet is whole rupiah because the priced net always is.
 type feeAdjustment struct {
-	// FeeDelta is actual minus expected. Positive means Singapay took more than priced.
-	FeeDelta int64
-	// SellerNet and PlatformFee are the amounts that move from PENDING to AVAILABLE.
-	SellerNet   int64
-	PlatformFee int64
+	// FeeDeltaMinor is actual minus estimated, in sen. Positive means Singapay took more
+	// than was quoted at checkout.
+	FeeDeltaMinor int64
+
+	// SellerNet is what moves from PENDING to AVAILABLE for the seller, in whole rupiah.
+	// It is the priced figure, unconditionally — the field exists to be carried into the
+	// journal and the entries, not to be adjusted.
+	SellerNet int64
+
+	// PlatformFeeMinor is what the platform actually earned, in sen: the priced platform
+	// fee less the delta. It is what ProcessPlatformFeeTransfer moves, and the account
+	// transfer endpoint takes a decimal amount, so it moves exactly — fraction included.
+	PlatformFeeMinor int64
 }
 
-// AbsorbingAccountUUID names the account carrying a positive delta: the platform under
-// GATEWAY_ON_CUSTOMER, the seller under GATEWAY_ON_SELLER.
-func (a feeAdjustment) AbsorbingAccountUUID(tx *domain.ProductTransaction, platformAccountUUID string) string {
-	if tx.Fee.FeeModel == domain.FeeModelGatewayOnSeller {
-		return tx.SellerAccountID
-	}
-	return platformAccountUUID
+// PlatformFeeRupiah is PlatformFeeMinor truncated to whole rupiah, for the ledger entry.
+//
+// ledger_entries.amount is whole rupiah and stays that way; the sen that will not divide
+// are returned by PlatformResidualMinor and persisted alongside the transaction instead of
+// being dropped. The platform's ledger balance therefore trails its Singapay balance by the
+// sum of those residuals, which is a figure that can be queried and explained rather than a
+// discrepancy that cannot.
+func (a feeAdjustment) PlatformFeeRupiah() int64 {
+	rupiah, _ := domain.MinorToRupiah(a.PlatformFeeMinor)
+	return rupiah
+}
+
+// PlatformResidualMinor is the sub-rupiah part of the platform's settled fee, in sen: what
+// the transfer moves but the rupiah-denominated ledger entry cannot express.
+func (a feeAdjustment) PlatformResidualMinor() int64 {
+	return a.PlatformFeeMinor - domain.RupiahToMinor(a.PlatformFeeRupiah())
 }
 
 // resolveFeeAdjustment applies the rules in docs/104-fee-mismatch-reconciliation.md.
 //
-// It returns a non-empty second value when the delta cannot be absorbed — the platform
-// would owe more than it ever charged, or the seller would receive less than nothing.
-// Those are not roundings to swallow; they mean the priced fee and the real one disagree
-// by more than the transaction can carry, and there is no arithmetic that makes the result
+// It returns a non-empty second value when the delta cannot be absorbed: Singapay took so
+// much more than was quoted that the platform would have to pay in more than it ever
+// charged. That is not a rounding to swallow — it means the quoted fee and the real one
+// disagree by more than the transaction can carry, and no arithmetic makes the result
 // correct. The transaction stays COMPLETED and keeps showing up as unsettled, which is the
 // loud failure rather than the silent one.
+//
+// The block is the only place the fee model still matters. Under GATEWAY_ON_SELLER the
+// platform fee is zero — that model is used for subscriptions, where the platform is itself
+// the beneficiary and SkipPlatformFee is set — so any positive delta blocks rather than
+// quietly taking the difference out of a seller who is the platform anyway. In practice the
+// delta there is zero by construction: GATEWAY_ON_SELLER only ever runs over a payment link,
+// and a payment link reports no fee, so the estimate is copied to the actual.
 func resolveFeeAdjustment(tx *domain.ProductTransaction, settled domain.SettledTransaction) (feeAdjustment, string) {
+	estimatedMinor := domain.RupiahToMinor(tx.Fee.GatewayFee)
+	deltaMinor := settled.FeeMinor - estimatedMinor
+
 	adj := feeAdjustment{
-		FeeDelta:    settled.Fee - tx.Fee.GatewayFee,
-		SellerNet:   tx.Fee.SellerNetAmount,
-		PlatformFee: tx.Fee.PlatformFee,
+		FeeDeltaMinor:    deltaMinor,
+		SellerNet:        tx.Fee.SellerNetAmount,
+		PlatformFeeMinor: domain.RupiahToMinor(tx.Fee.PlatformFee) - deltaMinor,
 	}
 
-	if adj.FeeDelta <= 0 {
-		// No shortfall to absorb. A negative delta is a surplus, credited to the seller
-		// as a separate entry rather than by inflating either party's settled amount.
-		return adj, ""
-	}
-
-	switch tx.Fee.FeeModel {
-	case domain.FeeModelGatewayOnSeller:
-		adj.SellerNet = tx.Fee.SellerNetAmount - adj.FeeDelta
-		if adj.SellerNet < 0 {
-			return adj, fmt.Sprintf(
-				"seller net would be %d: the actual gateway fee (%d) exceeds the seller's entire share (%d)",
-				adj.SellerNet, settled.Fee, tx.Fee.SellerNetAmount)
-		}
-	default:
-		// GATEWAY_ON_CUSTOMER, and the safe default for anything unrecognised: the
-		// platform absorbs rather than the seller.
-		adj.PlatformFee = tx.Fee.PlatformFee - adj.FeeDelta
-		if adj.PlatformFee < 0 {
-			return adj, fmt.Sprintf(
-				"platform fee would be %d: the gateway overcharge (%d) exceeds the entire platform fee (%d)",
-				adj.PlatformFee, adj.FeeDelta, tx.Fee.PlatformFee)
-		}
+	if adj.PlatformFeeMinor < 0 {
+		return adj, fmt.Sprintf(
+			"the platform fee would be %s: the gateway overcharge (%s) exceeds the entire platform fee (%d)",
+			formatMinor(adj.PlatformFeeMinor), formatMinor(deltaMinor), tx.Fee.PlatformFee)
 	}
 
 	return adj, ""
+}
+
+// formatMinor renders sen as rupiah with two decimals, for log lines and block reasons.
+// A delta of 16 sen reported as "16" is the kind of thing that starts an investigation into
+// a missing Rp16 that was never missing.
+func formatMinor(minor int64) string {
+	sign := ""
+	if minor < 0 {
+		sign, minor = "-", -minor
+	}
+	return fmt.Sprintf("%s%d.%02d", sign, minor/domain.MinorPerRupiah, minor%domain.MinorPerRupiah)
 }

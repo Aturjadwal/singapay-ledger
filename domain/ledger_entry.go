@@ -186,12 +186,38 @@ func NewSettlementEntriesForAccount(
 	accountID string,
 	amount int64,
 ) []*LedgerEntry {
+	return NewSettlementEntriesForAccountSplit(journalUUID, productTransactionID, accountID, amount, amount)
+}
+
+// NewSettlementEntriesForAccountSplit is [NewSettlementEntriesForAccount] for an account
+// whose two legs differ:
+//
+//	account -pending    PENDING    SETTLEMENT_CLEAR
+//	account +available  AVAILABLE  SETTLEMENT_NET
+//
+// They differ for exactly one account per settlement — the one balancing the gateway fee
+// delta. Its PENDING was credited the fee quoted at checkout and has to clear by precisely
+// that or the bucket never empties; what it actually earned is that figure adjusted by the
+// difference between the quoted gateway fee and the one Singapay really took. Passing a
+// single amount for both legs, as the settling pass once did, leaves the difference stranded
+// in PENDING and needs a second write-off entry to mop up — two entries describing one fact,
+// which is how the same delta ends up counted twice.
+//
+// The seller is never this account. Its two legs are always equal by design, which is the
+// ledger-side statement of the rule that a seller is paid what they were priced.
+func NewSettlementEntriesForAccountSplit(
+	journalUUID string,
+	productTransactionID string,
+	accountID string,
+	pending int64,
+	available int64,
+) []*LedgerEntry {
 	// TODO: VALIDATE ALL THE LEDGER ENTRY
 
 	pendingEntry := &LedgerEntry{
 		JournalUUID:   journalUUID,
 		AccountUUID:   accountID,
-		Amount:        -amount,
+		Amount:        -pending,
 		BalanceBucket: BalanceBucketPending,
 		EntryType:     EntryTypeSettlementClear,
 		SourceType:    SourceTypeProductTransaction,
@@ -202,7 +228,7 @@ func NewSettlementEntriesForAccount(
 	availableEntry := &LedgerEntry{
 		JournalUUID:   journalUUID,
 		AccountUUID:   accountID,
-		Amount:        amount,
+		Amount:        available,
 		BalanceBucket: BalanceBucketAvailable,
 		EntryType:     EntryTypeSettlementNet,
 		SourceType:    SourceTypeProductTransaction,

@@ -1341,21 +1341,26 @@ type PlatformFeeTransferResult struct {
 	Transfers []PlatformFeeTransferSuccess `json:"transfers,omitempty"`
 }
 
-// PlatformFeeTransferError contains error details for a failed transfer
+// PlatformFeeTransferError contains error details for a failed transfer.
+//
+// PlatformFeeMinor is in sen, like every settled fee figure: the amount a sweep moves is
+// the platform fee after it has balanced the gateway fee delta, and that is routinely not
+// a whole rupiah.
 type PlatformFeeTransferError struct {
-	TransactionID string `json:"transaction_id"`
-	InvoiceNumber string `json:"invoice_number"`
-	PlatformFee   int64  `json:"platform_fee"`
-	ErrorMessage  string `json:"error_message"`
+	TransactionID    string `json:"transaction_id"`
+	InvoiceNumber    string `json:"invoice_number"`
+	PlatformFeeMinor int64  `json:"platform_fee_minor"`
+	ErrorMessage     string `json:"error_message"`
 }
 
-// PlatformFeeTransferSuccess contains details for a successful transfer
+// PlatformFeeTransferSuccess contains details for a successful transfer.
+// PlatformFeeMinor is in sen — see [PlatformFeeTransferError].
 type PlatformFeeTransferSuccess struct {
-	TransactionID  string `json:"transaction_id"`
-	InvoiceNumber  string `json:"invoice_number"`
-	PlatformFee    int64  `json:"platform_fee"`
-	FromSubAccount string `json:"from_sub_account"`
-	ToSubAccount   string `json:"to_sub_account"`
+	TransactionID    string `json:"transaction_id"`
+	InvoiceNumber    string `json:"invoice_number"`
+	PlatformFeeMinor int64  `json:"platform_fee_minor"`
+	FromSubAccount   string `json:"from_sub_account"`
+	ToSubAccount     string `json:"to_sub_account"`
 }
 
 // ProcessPlatformFeeTransfer moves the platform's share out of seller sub-accounts and
@@ -1429,25 +1434,49 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 
 	for _, tx := range transactions {
 		// The amount to move is what the platform actually earned, which is not always
-		// what was priced at checkout. Under GATEWAY_ON_CUSTOMER the platform absorbs any
-		// gateway overcharge, so settlement can book a smaller platform fee than the one
-		// quoted — and moving the quoted figure would take money out of the seller's
-		// sub-account that the ledger never credited the platform.
+		// what was priced at checkout. The platform sub-account balances the difference
+		// between the gateway fee quoted at checkout and the one Singapay really took, in
+		// both directions, so settlement can book a platform fee either side of the quoted
+		// one — and moving the quoted figure would leave the seller's sub-account holding
+		// an amount the ledger never agreed with.
 		//
-		// SettledPlatformFee is nil for transactions that settled before it was recorded.
-		// Those were transferred under the old rule and their money has already moved, so
-		// the priced figure is the right fallback. nil means "not recorded", never zero.
-		platformFee := tx.Fee.PlatformFee
-		if tx.SettledPlatformFee != nil {
-			platformFee = *tx.SettledPlatformFee
+		// This is in SEN and is transferred as a decimal, because the balanced figure is
+		// routinely not a whole rupiah. Rounding it here would strand the fraction in the
+		// seller's sub-account and reintroduce exactly the drift the balancing removes.
+		//
+		// SettledPlatformFeeMinor is nil for transactions that settled before it was
+		// recorded. Those were transferred under the old rule and their money has already
+		// moved, so the priced figure is the right fallback. nil means "not recorded",
+		// never zero.
+		platformFeeMinor := domain.RupiahToMinor(tx.Fee.PlatformFee)
+		if tx.SettledPlatformFeeMinor != nil {
+			platformFeeMinor = *tx.SettledPlatformFeeMinor
 		}
 
-		if platformFee <= 0 {
+		if platformFeeMinor <= 0 {
 			c.logger.WarnContext(ctx, "Transaction has zero platform fee, skipping",
 				"transaction_id", tx.UUID,
 				"invoice_number", tx.InvoiceNumber,
 				"priced_platform_fee", tx.Fee.PlatformFee,
-				"settled_platform_fee_recorded", tx.SettledPlatformFee != nil,
+				"settled_platform_fee_recorded", tx.SettledPlatformFeeMinor != nil,
+			)
+			continue
+		}
+
+		// Singapay rejects a transfer below 1 rupiah. A balanced platform fee that lands
+		// under it is left for a person rather than retried forever: the row keeps its
+		// untransferred flag, so it stays in GetSettledWithoutPlatformFeeTransfer and stays
+		// counted, instead of being marked done with the money still in the seller's
+		// sub-account.
+		if platformFeeMinor < domain.MinorPerRupiah {
+			result.recordFailure(tx, fmt.Sprintf(
+				"settled platform fee %s is below the Rp1 minimum Singapay accepts for a transfer",
+				formatMinor(platformFeeMinor)))
+			c.logger.WarnContext(ctx, "Platform fee transfer skipped - below the Rp1 gateway minimum",
+				"transaction_id", tx.UUID,
+				"invoice_number", tx.InvoiceNumber,
+				"settled_platform_fee_minor", platformFeeMinor,
+				"priced_platform_fee", tx.Fee.PlatformFee,
 			)
 			continue
 		}
@@ -1491,7 +1520,7 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 		}
 
 		_, gwErr := c.gateway.TransferBetweenAccounts(ctx, sellerAccount.SingapayAccountID, singapay.TransferRequest{
-			Amount:                   platformFee,
+			Amount:                   singapay.NewAmountFromMinor(platformFeeMinor, string(domain.CurrencyIDR)),
 			BeneficiaryAccountNumber: platformAccount.SingapayAccountNumber,
 			MerchantRefNo:            reference,
 		})
@@ -1500,7 +1529,7 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 			c.logger.ErrorContext(ctx, "Platform fee transfer failed - Singapay API error",
 				"transaction_id", tx.UUID,
 				"invoice_number", tx.InvoiceNumber,
-				"platform_fee", platformFee,
+				"platform_fee", formatMinor(platformFeeMinor),
 				"from_account", sellerAccount.SingapayAccountID,
 				"to_account_number", platformAccount.SingapayAccountNumber,
 				"merchant_ref_no", reference,
@@ -1515,7 +1544,7 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 			c.logger.ErrorContext(ctx, "Singapay transfer succeeded but the DB update failed - the next run will re-present the same reference",
 				"transaction_id", tx.UUID,
 				"invoice_number", tx.InvoiceNumber,
-				"platform_fee", platformFee,
+				"platform_fee", formatMinor(platformFeeMinor),
 				"merchant_ref_no", reference,
 				"db_error", err,
 			)
@@ -1526,17 +1555,17 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 		c.logger.InfoContext(ctx, "Platform fee transferred successfully",
 			"transaction_id", tx.UUID,
 			"invoice_number", tx.InvoiceNumber,
-			"platform_fee", platformFee,
+			"platform_fee", formatMinor(platformFeeMinor),
 			"from_account", sellerAccount.SingapayAccountID,
 			"to_account_number", platformAccount.SingapayAccountNumber,
 		)
 		result.Succeeded++
 		result.Transfers = append(result.Transfers, PlatformFeeTransferSuccess{
-			TransactionID:  tx.UUID,
-			InvoiceNumber:  tx.InvoiceNumber,
-			PlatformFee:    platformFee,
-			FromSubAccount: sellerAccount.SingapayAccountID,
-			ToSubAccount:   platformAccount.SingapayAccountNumber,
+			TransactionID:    tx.UUID,
+			InvoiceNumber:    tx.InvoiceNumber,
+			PlatformFeeMinor: platformFeeMinor,
+			FromSubAccount:   sellerAccount.SingapayAccountID,
+			ToSubAccount:     platformAccount.SingapayAccountNumber,
 		})
 	}
 
@@ -1554,10 +1583,18 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 // that lets one of them quietly forget to increment the counter.
 func (r *PlatformFeeTransferResult) recordFailure(tx *domain.ProductTransaction, message string) {
 	r.Failed++
+	// The settled figure where it exists, the priced one where it does not — the same
+	// fallback the sweep itself makes, so a failure report names the amount that was
+	// actually attempted rather than the one from checkout.
+	platformFeeMinor := domain.RupiahToMinor(tx.Fee.PlatformFee)
+	if tx.SettledPlatformFeeMinor != nil {
+		platformFeeMinor = *tx.SettledPlatformFeeMinor
+	}
+
 	r.Errors = append(r.Errors, PlatformFeeTransferError{
-		TransactionID: tx.UUID,
-		InvoiceNumber: tx.InvoiceNumber,
-		PlatformFee:   tx.Fee.PlatformFee,
-		ErrorMessage:  message,
+		TransactionID:    tx.UUID,
+		InvoiceNumber:    tx.InvoiceNumber,
+		PlatformFeeMinor: platformFeeMinor,
+		ErrorMessage:     message,
 	})
 }

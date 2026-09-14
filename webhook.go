@@ -162,18 +162,24 @@ func (c *LedgerClient) HandlePaymentSuccess(ctx context.Context, req singapay.We
 	// on the webhook; QRIS and e-wallet expose theirs on the transaction record, and a
 	// payment link nowhere at all. Recording it here turns a fee mismatch into something
 	// visible at payment time rather than a surprise at settlement.
-	var reportedFee int64
-	if fee, ok := notification.ChannelFee(); ok {
-		if rupiah, err := fee.Rupiah(); err == nil {
-			reportedFee = rupiah
-			if reportedFee != productTx.Fee.GatewayFee {
-				c.logger.WarnContext(ctx, "Channel fee on the webhook differs from the fee expected at payment time — settlement will carry an adjustment",
-					"invoice_number", invoiceNumber,
-					"expected_gateway_fee", productTx.Fee.GatewayFee,
-					"reported_gateway_fee", reportedFee,
-					"fee_delta", reportedFee-productTx.Fee.GatewayFee,
-				)
-			}
+	//
+	// Read in sen, not rupiah. Rupiah() refuses a fractional amount rather than rounding
+	// it, which is right for the charged amount above — the ledger cannot book what it
+	// cannot represent — but reading the FEE through it silently discarded the warning in
+	// exactly the case worth warning about: a fee of 119.84 made Rupiah() error, the
+	// branch fell through, reportedFee stayed 0, and the one early signal that the
+	// estimate is off never fired. A fractional fee is normal, and settlement balances it
+	// on the platform sub-account; this line is only here to say so a day earlier.
+	var reportedFeeMinor int64
+	if fee, ok := notification.ChannelFee(); ok && fee.Set {
+		reportedFeeMinor = fee.Minor()
+		if expected := domain.RupiahToMinor(productTx.Fee.GatewayFee); reportedFeeMinor != expected {
+			c.logger.WarnContext(ctx, "Channel fee on the webhook differs from the fee estimated at payment time — settlement will balance the difference on the platform sub-account",
+				"invoice_number", invoiceNumber,
+				"estimated_gateway_fee", productTx.Fee.GatewayFee,
+				"reported_gateway_fee", fee.String(),
+				"fee_delta_minor", reportedFeeMinor-expected,
+			)
 		}
 	}
 
@@ -197,16 +203,16 @@ func (c *LedgerClient) HandlePaymentSuccess(ctx context.Context, req singapay.We
 		domain.SourceTypeProductTransaction,
 		productTx.UUID,
 		map[string]any{
-			"invoice_number":       invoiceNumber,
-			"event":                string(notification.Kind()),
-			"gateway_transaction":  notification.Data.Transaction.TransactionID,
-			"seller_price":         productTx.Fee.SellerPrice,
-			"seller_net_amount":    productTx.Fee.SellerNetAmount,
-			"platform_fee":         productTx.Fee.PlatformFee,
-			"gateway_fee":          productTx.Fee.GatewayFee,
-			"reported_gateway_fee": reportedFee,
-			"charged":              charged,
-			"fee_model":            productTx.Fee.FeeModel,
+			"invoice_number":             invoiceNumber,
+			"event":                      string(notification.Kind()),
+			"gateway_transaction":        notification.Data.Transaction.TransactionID,
+			"seller_price":               productTx.Fee.SellerPrice,
+			"seller_net_amount":          productTx.Fee.SellerNetAmount,
+			"platform_fee":               productTx.Fee.PlatformFee,
+			"gateway_fee":                productTx.Fee.GatewayFee,
+			"reported_gateway_fee_minor": reportedFeeMinor,
+			"charged":                    charged,
+			"fee_model":                  productTx.Fee.FeeModel,
 		},
 	)
 

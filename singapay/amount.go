@@ -32,6 +32,17 @@ func NewAmount(rupiah int64, currency string) Amount {
 	return Amount{minor: rupiah * 100, Currency: currency, Set: true}
 }
 
+// NewAmountFromMinor builds an Amount from sen.
+//
+// This is the constructor for a figure that may not be a whole rupiah — a gateway fee
+// Singapay reported as 119.84, or a platform fee balanced against one. Sending such a
+// figure back to Singapay is not a special case: the account-transfer endpoint types its
+// amount as a number with decimals and returns it as a string "to preserve decimal
+// precision", and Amount marshals to exactly two decimals without going through float64.
+func NewAmountFromMinor(minor int64, currency string) Amount {
+	return Amount{minor: minor, Currency: currency, Set: true}
+}
+
 // Minor returns the value in sen. Always exact.
 func (a Amount) Minor() int64 { return a.minor }
 

@@ -27,7 +27,7 @@ func (r *PostgresProductTransactionRepository) GetByID(ctx context.Context, id s
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
-		       settled_platform_fee, settled_gateway_fee
+		       settled_platform_fee, settled_gateway_fee, platform_residual
 		FROM product_transactions
 		WHERE uuid = $1
 	`
@@ -41,7 +41,7 @@ func (r *PostgresProductTransactionRepository) GetByInvoiceNumber(ctx context.Co
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
-		       settled_platform_fee, settled_gateway_fee
+		       settled_platform_fee, settled_gateway_fee, platform_residual
 		FROM product_transactions
 		WHERE invoice_number = $1
 	`
@@ -56,7 +56,7 @@ func (r *PostgresProductTransactionRepository) GetBySellerAccountID(ctx context.
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
-		       settled_platform_fee, settled_gateway_fee
+		       settled_platform_fee, settled_gateway_fee, platform_residual
 		FROM product_transactions
 		WHERE seller_account_id = $1
 		ORDER BY created_at DESC
@@ -73,7 +73,7 @@ func (r *PostgresProductTransactionRepository) GetByBuyerAccountID(ctx context.C
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
-		       settled_platform_fee, settled_gateway_fee
+		       settled_platform_fee, settled_gateway_fee, platform_residual
 		FROM product_transactions
 		WHERE buyer_account_id = $1
 		ORDER BY created_at DESC
@@ -104,7 +104,7 @@ func (r *PostgresProductTransactionRepository) GetBySellerAccountIDWithCursor(ct
 			       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 			       status, created_at, updated_at, completed_at, settled_at,
 			       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
-		       settled_platform_fee, settled_gateway_fee
+		       settled_platform_fee, settled_gateway_fee, platform_residual
 			FROM product_transactions
 			WHERE seller_account_id = $1
 			ORDER BY created_at %s
@@ -120,7 +120,7 @@ func (r *PostgresProductTransactionRepository) GetBySellerAccountIDWithCursor(ct
 				       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 				       status, created_at, updated_at, completed_at, settled_at,
 				       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
-		       settled_platform_fee, settled_gateway_fee
+		       settled_platform_fee, settled_gateway_fee, platform_residual
 				FROM product_transactions
 				WHERE seller_account_id = $1 
 				  AND (created_at < (SELECT created_at FROM product_transactions WHERE randid = $2)
@@ -134,7 +134,7 @@ func (r *PostgresProductTransactionRepository) GetBySellerAccountIDWithCursor(ct
 				       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 				       status, created_at, updated_at, completed_at, settled_at,
 				       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
-		       settled_platform_fee, settled_gateway_fee
+		       settled_platform_fee, settled_gateway_fee, platform_residual
 				FROM product_transactions
 				WHERE seller_account_id = $1 
 				  AND (created_at > (SELECT created_at FROM product_transactions WHERE randid = $2)
@@ -155,7 +155,7 @@ func (r *PostgresProductTransactionRepository) GetPendingBySellerAccountID(ctx c
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
-		       settled_platform_fee, settled_gateway_fee
+		       settled_platform_fee, settled_gateway_fee, platform_residual
 		FROM product_transactions
 		WHERE seller_account_id = $1 AND status = 'PENDING'
 		ORDER BY created_at DESC
@@ -170,7 +170,7 @@ func (r *PostgresProductTransactionRepository) GetCompletedNotSettled(ctx contex
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
-		       settled_platform_fee, settled_gateway_fee
+		       settled_platform_fee, settled_gateway_fee, platform_residual
 		FROM product_transactions
 		WHERE seller_account_id = $1 AND status = 'COMPLETED'
 		ORDER BY created_at ASC
@@ -185,7 +185,7 @@ func (r *PostgresProductTransactionRepository) GetAllBySellerID(ctx context.Cont
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
-		       settled_platform_fee, settled_gateway_fee
+		       settled_platform_fee, settled_gateway_fee, platform_residual
 		FROM product_transactions
 		WHERE seller_account_id = $1
 		ORDER BY created_at DESC
@@ -393,8 +393,9 @@ func (r *PostgresProductTransactionRepository) scanRow(rows *sql.Rows) (*domain.
 		PlatformFeeTransferredAt sql.NullTime
 		TransferRequestID        sql.NullString
 		Metadata                 []byte
-		SettledPlatformFee       sql.NullInt64
-		SettledGatewayFee        sql.NullInt64
+		SettledPlatformFeeMinor  sql.NullInt64
+		SettledGatewayFeeMinor   sql.NullInt64
+		PlatformResidualMinor    sql.NullInt64
 	}
 
 	err := rows.Scan(
@@ -421,8 +422,9 @@ func (r *PostgresProductTransactionRepository) scanRow(rows *sql.Rows) (*domain.
 		&row.PlatformFeeTransferredAt,
 		&row.TransferRequestID,
 		&row.Metadata,
-		&row.SettledPlatformFee,
-		&row.SettledGatewayFee,
+		&row.SettledPlatformFeeMinor,
+		&row.SettledGatewayFeeMinor,
+		&row.PlatformResidualMinor,
 	)
 	if err != nil {
 		return nil, ErrFailedScanSQL.WithError(err)
@@ -446,14 +448,19 @@ func (r *PostgresProductTransactionRepository) scanRow(rows *sql.Rows) (*domain.
 	// NULL here means "not recorded" — a transaction that settled before these columns
 	// existed, or one that has not settled. It is not zero, and must not collapse to it:
 	// the platform fee transfer reads this and falls back to the priced figure.
-	var settledPlatformFee *int64
-	if row.SettledPlatformFee.Valid {
-		settledPlatformFee = &row.SettledPlatformFee.Int64
+	var settledPlatformFeeMinor *int64
+	if row.SettledPlatformFeeMinor.Valid {
+		settledPlatformFeeMinor = &row.SettledPlatformFeeMinor.Int64
 	}
 
-	var settledGatewayFee *int64
-	if row.SettledGatewayFee.Valid {
-		settledGatewayFee = &row.SettledGatewayFee.Int64
+	var settledGatewayFeeMinor *int64
+	if row.SettledGatewayFeeMinor.Valid {
+		settledGatewayFeeMinor = &row.SettledGatewayFeeMinor.Int64
+	}
+
+	var platformResidualMinor *int64
+	if row.PlatformResidualMinor.Valid {
+		platformResidualMinor = &row.PlatformResidualMinor.Int64
 	}
 
 	var metadata map[string]any
@@ -485,8 +492,9 @@ func (r *PostgresProductTransactionRepository) scanRow(rows *sql.Rows) (*domain.
 		PlatformFeeTransferred:   row.PlatformFeeTransferred,
 		PlatformFeeTransferredAt: platformFeeTransferredAt,
 		TransferRequestID:        row.TransferRequestID.String,
-		SettledPlatformFee:       settledPlatformFee,
-		SettledGatewayFee:        settledGatewayFee,
+		SettledPlatformFeeMinor:  settledPlatformFeeMinor,
+		SettledGatewayFeeMinor:   settledGatewayFeeMinor,
+		PlatformResidualMinor:    platformResidualMinor,
 	}
 	redifu.InitRecord(tx)
 	// Override auto-generated values with database values
@@ -561,7 +569,7 @@ func (r *PostgresProductTransactionRepository) GetSettledWithoutPlatformFeeTrans
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
-		       settled_platform_fee, settled_gateway_fee
+		       settled_platform_fee, settled_gateway_fee, platform_residual
 		FROM product_transactions
 		WHERE status = 'SETTLED' 
 		  AND platform_fee_transferred = false 
@@ -587,7 +595,7 @@ func (r *PostgresProductTransactionRepository) GetAwaitingSettlement(ctx context
 		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
 		       status, created_at, updated_at, completed_at, settled_at,
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
-		       settled_platform_fee, settled_gateway_fee
+		       settled_platform_fee, settled_gateway_fee, platform_residual
 		FROM product_transactions
 		WHERE status = 'COMPLETED'
 		ORDER BY completed_at ASC
@@ -604,14 +612,24 @@ func (r *PostgresProductTransactionRepository) GetAwaitingSettlement(ctx context
 // can never reach SETTLED with these unset — ProcessPlatformFeeTransfer reads them the
 // moment the status changes, and an unset value there means it silently moves the priced
 // figure instead of the booked one.
-func (r *PostgresProductTransactionRepository) SaveSettledFees(ctx context.Context, id string, platformFee, gatewayFee int64) error {
+//
+// The Go names carry a Minor suffix and the columns do not. All of them are sen: the
+// columns were left named as migration 024 created them rather than renamed by 027, since
+// the tables were near-empty when the unit changed and a rename would have churned a dozen
+// queries. The suffix is kept in Go because that is where it earns its place — the ×100 bug
+// this replaced was a rupiah figure assigned to a sen field, and a compiler cannot catch
+// that when neither name says which is which.
+func (r *PostgresProductTransactionRepository) SaveSettledFees(ctx context.Context, id string, platformFeeMinor, gatewayFeeMinor, residualMinor int64) error {
 	query := `
 		UPDATE product_transactions
-		SET settled_platform_fee = $1, settled_gateway_fee = $2, updated_at = $3
-		WHERE uuid = $4
+		SET settled_platform_fee = $1,
+		    settled_gateway_fee = $2,
+		    platform_residual = $3,
+		    updated_at = $4
+		WHERE uuid = $5
 	`
 
-	result, err := r.db.ExecContext(ctx, query, platformFee, gatewayFee, time.Now(), id)
+	result, err := r.db.ExecContext(ctx, query, platformFeeMinor, gatewayFeeMinor, residualMinor, time.Now(), id)
 	if err != nil {
 		return ErrFailedUpdateSQL.WithError(err)
 	}

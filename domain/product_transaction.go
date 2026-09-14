@@ -62,25 +62,41 @@ type ProductTransaction struct {
 	PlatformFeeTransferredAt *time.Time     // When platform fee was successfully transferred between sub-accounts
 	TransferRequestID        string         // merchant_ref_no used for the platform fee transfer (for idempotent retries)
 
-	// SettledPlatformFee and SettledGatewayFee are what the fees turned out to be once
-	// Singapay reported what it actually took, as opposed to Fee.PlatformFee and
+	// SettledPlatformFeeMinor and SettledGatewayFeeMinor are what the fees turned out to
+	// be once Singapay reported what it actually took, as opposed to Fee.PlatformFee and
 	// Fee.GatewayFee, which are what was priced at checkout.
 	//
-	// They differ when the gateway's actual fee misses the expected one. Who absorbs the
-	// difference depends on the fee model (see docs/104-fee-mismatch-reconciliation.md):
-	// on GATEWAY_ON_CUSTOMER the platform does, so the platform fee that survives
-	// settlement can be smaller than the one priced. On GATEWAY_ON_SELLER the seller's
-	// net absorbs it and the platform fee is untouched.
+	// IN SEN, not rupiah — the Minor suffix is the whole point of the name. Singapay's
+	// money-in fee carries two decimals, the difference between it and the estimate is
+	// routinely a fraction of a rupiah, and that fraction is the quantity this pair exists
+	// to preserve. Fee.PlatformFee and Fee.GatewayFee beside them are whole rupiah.
+	//
+	// They differ from the priced figures whenever the gateway's real fee misses the
+	// estimate. The seller never absorbs that difference in either direction — the seller
+	// is paid what they were priced — so it lands entirely on the platform fee:
+	//
+	//     SettledPlatformFeeMinor = (Fee.PlatformFee × 100) - (actual - estimated)
 	//
 	// This matters beyond bookkeeping: ProcessPlatformFeeTransfer moves real money out of
 	// the seller's Singapay sub-account, and moving the priced figure when the ledger
-	// booked a smaller one puts the gateway and the ledger out of step — always against
-	// the seller. The transfer reads SettledPlatformFee and falls back to Fee.PlatformFee.
+	// booked a different one puts the gateway and the ledger out of step. The transfer
+	// reads SettledPlatformFeeMinor and falls back to Fee.PlatformFee.
 	//
 	// nil means "not recorded" — a transaction that settled before these were kept, or
 	// one that has not settled at all. It never means zero.
-	SettledPlatformFee *int64
-	SettledGatewayFee  *int64
+	SettledPlatformFeeMinor *int64
+	SettledGatewayFeeMinor  *int64
+
+	// PlatformResidualMinor is the sub-rupiah part of SettledPlatformFeeMinor, in sen:
+	// what the account transfer moves but a whole-rupiah ledger entry cannot express.
+	//
+	// It is the reconciliation handle for the platform's own two balances. The seller's
+	// agree exactly and always; the platform's differ by SUM(PlatformResidualMinor) over
+	// settled transactions, which is a number that can be produced on demand rather than
+	// a drift nobody can account for.
+	//
+	// nil means "not recorded", as above. Zero is a real value and the common one.
+	PlatformResidualMinor *int64
 }
 
 // ProductTransactionRepository defines data access for product transactions
@@ -123,10 +139,14 @@ type ProductTransactionRepository interface {
 	// the transactions the batch covered.
 	GetAwaitingSettlement(ctx context.Context, limit int) ([]*ProductTransaction, error)
 
-	// SaveSettledFees records what the fees turned out to be. Called inside the same
-	// transaction as the status move, so a transaction never reaches SETTLED with the
+	// SaveSettledFees records what the fees turned out to be, IN SEN. Called inside the
+	// same transaction as the status move, so a transaction never reaches SETTLED with the
 	// figures the transfer step reads still unset.
-	SaveSettledFees(ctx context.Context, id string, platformFee, gatewayFee int64) error
+	//
+	// residualMinor is the sub-rupiah part of platformFeeMinor — the part the ledger entry
+	// could not carry. Passing it here rather than deriving it later keeps the figure the
+	// settling pass actually decided, instead of one recomputed from a rounded entry.
+	SaveSettledFees(ctx context.Context, id string, platformFeeMinor, gatewayFeeMinor, residualMinor int64) error
 
 	// OldestAwaitingSettlement returns when the oldest unsettled COMPLETED transaction
 	// was completed, and false when there are none.

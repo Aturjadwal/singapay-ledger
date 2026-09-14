@@ -33,8 +33,22 @@ type AccountTransfer struct {
 
 // TransferRequest is the body of POST /api/v1.0/account-transfer/{account_id}/transfer.
 type TransferRequest struct {
-	// Amount is in whole rupiah.
-	Amount int64 `json:"amount"`
+	// Amount may carry decimals, and needs to.
+	//
+	// Singapay types this field as a number with decimals and echoes it back as a string
+	// "to preserve decimal precision", so a transfer is the one outbound path in this
+	// client that is not whole rupiah. That matters because this endpoint is how the
+	// platform sub-account balances the gateway fee: the difference between the fee quoted
+	// at checkout and the one Singapay actually took is usually a fraction of a rupiah, and
+	// an int64 here would silently drop it — leaving that fraction stranded in the seller's
+	// sub-account, which is precisely the divergence the balancing exists to prevent.
+	//
+	// Amount marshals to two decimals without going through float64, so 4000.16 is sent as
+	// 4000.16 rather than 4000.1599999999999.
+	//
+	// Singapay rejects anything below 1: a transfer must be at least one rupiah, so a
+	// balanced platform fee that lands under Rp1 cannot be swept and must not be attempted.
+	Amount Amount `json:"amount"`
 
 	// BeneficiaryAccountNumber is the destination's 12-digit account *number* — not
 	// its ULID. This is the asymmetry to watch: the remitter is named by ULID in the

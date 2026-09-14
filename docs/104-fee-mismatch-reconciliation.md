@@ -2,20 +2,108 @@
 
 ## Overview
 
-This document describes what happens when `ExpectedGatewayFee` (recorded at payment time)
+This document describes what happens when `EstimatedGatewayFee` (recorded at payment time)
 and `ActualGatewayFee` (what Singapay actually took) disagree.
 
 > **Where the actual fee comes from.** The settling pass reads each open invoice back from
 > Singapay directly and takes the fee off that record — see
-> [102](./102-settlement-reconciliation.md). There is no settlement file: an earlier version of
-> this document described the figures as columns of a settlement CSV, which was the previous
-> gateway's format. The arithmetic below is unchanged and is what `resolveFeeAdjustment` in
-> [`settlement.go`](../settlement.go) implements.
+> [102](./102-settlement-reconciliation.md). There is no settlement file.
 >
 > **Virtual account, QRIS and e-wallet report their own fee. Payment link reports none.** For
-> a payment link the actual fee is copied from the expected one, which makes `feeDelta` zero
+> a payment link the actual fee is copied from the estimate, which makes `feeDelta` zero
 > by construction — that is the absence of a reconciliation, not a perfect one, and
 > `FeeReported` is what keeps the two distinguishable.
+
+The arithmetic below is what `resolveFeeAdjustment` in [`settlement.go`](../settlement.go)
+implements.
+
+---
+
+## The rule, in one line
+
+**The seller is paid what they were priced. The platform sub-account balances the rest.**
+
+```
+platformAdjustment = EstimatedGatewayFee - ActualGatewayFee
+```
+
+| Sign | Meaning | Where it goes |
+|---|---|---|
+| Positive | Singapay charged **less** than estimated | The residual is the platform's |
+| Negative | Singapay charged **more** than estimated | The platform absorbs it out of its own fee |
+| Zero | The estimate was exact | Nothing moves |
+
+`SellerNetAmount` is the same number in all three rows. That is the point of the design, not
+a side effect of it.
+
+### Why the seller and not a shared split
+
+Money lands in the **seller's** Singapay sub-account, net of whatever fee Singapay deducted.
+The only other thing that ever leaves that sub-account is the platform fee, swept out by
+`ProcessPlatformFeeTransfer`. So:
+
+```
+seller's Singapay balance = TotalCharged - ActualGatewayFee - SweptPlatformFee
+```
+
+Set `SweptPlatformFee = PlatformFee - (Actual - Estimated)` and the actual fee cancels:
+
+```
+= TotalCharged - EstimatedGatewayFee - PlatformFee
+= SellerPrice                                            ← exactly what the ledger booked
+```
+
+**Seller's Singapay balance = seller's ledger balance**, for every transaction, whatever
+Singapay charged. That invariant is the whole reason this mechanism exists, and it holds only
+because the sweep moves the *balanced* figure rather than the one quoted at checkout.
+
+---
+
+## Units: this is all in sen
+
+Singapay reports a money-in fee with two decimals. A QRIS fee of `119.84` is a real figure,
+not a rounding artefact, so `platformAdjustment` is routinely a fraction of a rupiah — which
+is precisely the quantity the balancing exists to place.
+
+| Thing | Unit | Why |
+|---|---|---|
+| `FeeBreakdown` (`SellerPrice`, `PlatformFee`, `GatewayFee`, …) | whole rupiah | every figure quoted at checkout is whole |
+| `SettledTransaction` (`GrossMinor`, `NetMinor`, `FeeMinor`) | **sen** | it comes from Singapay, which uses decimals |
+| `product_transactions.settled_platform_fee` / `settled_gateway_fee` / `platform_residual` | **sen** | what the fees turned out to be |
+| `ledger_entries.amount` | whole rupiah | unchanged |
+| `TransferRequest.Amount` | **decimal** | the account-transfer endpoint takes one |
+
+> **The ×100 bug this replaced.** `SettledTransaction`'s fields were once named
+> `GrossAmount` / `NetAmount` / `Fee` and carried no unit, while `readSettledTransaction`
+> filled them with `.Minor()` for VA, QRIS and e-wallet and with whole rupiah for payment
+> link. `feeDelta = settled.Fee - tx.Fee.GatewayFee` was therefore sen minus rupiah: a real
+> fee of Rp120 read as `12000` produced a delta of `11880`. Most channels blocked loudly
+> (the platform fee went negative); payment link was unaffected because its delta is zero
+> by construction. The `Minor` suffix on every field is the fix, and the unit test now
+> builds the struct through a `settledWithFeeMinor` helper rather than inline in rupiah —
+> building it by hand in the wrong unit is how the bug stayed green.
+
+### The residual
+
+`ledger_entries.amount` is whole rupiah and the settled platform fee is not, so the two are
+reconciled explicitly rather than by rounding:
+
+```
+settled_platform_fee = (ledger entry rupiah × 100) + platform_residual
+```
+
+- The **transfer** moves `SettledPlatformFeeMinor` exactly, fraction included.
+- The **ledger entry** books the whole-rupiah part.
+- `product_transactions.platform_residual` holds the difference (in sen, like the two settled-fee columns beside it).
+
+The platform's ledger balance therefore trails its Singapay balance by
+`SUM(platform_residual)` over settled rows — a number that can be produced on demand,
+not a drift. The seller's two balances agree exactly, with no residual at all.
+
+> **Rp1 minimum.** Singapay rejects an account transfer below 1 rupiah. A balanced platform
+> fee under Rp1 is not swept: the row keeps its untransferred flag, stays in
+> `GetSettledWithoutPlatformFeeTransfer`, and is reported as a failure rather than marked
+> done with the money still in the seller's sub-account.
 
 ---
 
@@ -23,13 +111,11 @@ and `ActualGatewayFee` (what Singapay actually took) disagree.
 
 | Term | Definition |
 |---|---|
-| `ExpectedGatewayFee` | gateway fee predicted at payment time (stored in `ProductTransaction.Fee.GatewayFee`) |
-| `ActualGatewayFee` | Gateway fee Singapay actually took, from the per-transaction read (`SettledTransaction.Fee`) |
-| `feeDelta` | `ActualGatewayFee - ExpectedGatewayFee` |
-| `PayToMerchant` | Net credited to the seller's sub-account (`SettledTransaction.NetAmount`) |
-| `ExpectedNetAmount` | Amount we expect in `PayToMerchant` based on the fee model |
-| `AmountDiscrepancy` | `PayToMerchant - ExpectedNetAmount` |
-| `FeeReported` | Whether `ActualGatewayFee` is a fact or a copy of the expectation (false for payment link) |
+| `EstimatedGatewayFee` | gateway fee predicted at payment time from `fee_configs` (`ProductTransaction.Fee.GatewayFee`, rupiah) |
+| `ActualGatewayFee` | what Singapay really took, from the per-transaction read (`SettledTransaction.FeeMinor`, sen) |
+| `feeDelta` | `ActualGatewayFee - EstimatedGatewayFee`, in sen |
+| `SettledPlatformFee` | `PlatformFee - feeDelta` — the balanced figure the sweep moves |
+| `FeeReported` | whether `ActualGatewayFee` is a fact or a copy of the estimate (false for payment link) |
 
 ---
 
@@ -37,305 +123,123 @@ and `ActualGatewayFee` (what Singapay actually took) disagree.
 
 ### `GATEWAY_ON_CUSTOMER`
 
-Customer bears the gateway fee.
+Customer bears the gateway fee. This is the ordinary path.
 
 ```
-TotalCharged      = SellerPrice + PlatformFee + GatewayFee
-SellerNetAmount   = SellerPrice  (seller receives 100% of their price)
-ExpectedNetAmount = SellerNetAmount + PlatformFee
-PayToMerchant     = TotalCharged - ActualGatewayFee
+TotalCharged    = SellerPrice + PlatformFee + EstimatedGatewayFee
+SellerNetAmount = SellerPrice                      (seller receives 100% of their price)
 ```
 
 ### `GATEWAY_ON_SELLER`
 
-Seller bears the gateway fee.
+Used for subscriptions, where the platform is itself the beneficiary and `SkipPlatformFee`
+is set — so `PlatformFee` is zero and there is nothing to balance out of.
 
 ```
-TotalCharged      = SellerPrice + PlatformFee
-SellerNetAmount   = SellerPrice - GatewayFee   (seller's share only; platform tracked separately)
-ExpectedNetAmount = SellerNetAmount + PlatformFee
-PayToMerchant     = TotalCharged - ActualGatewayFee
+TotalCharged    = SellerPrice + PlatformFee
+SellerNetAmount = SellerPrice - EstimatedGatewayFee
 ```
+
+Its `feeDelta` is zero by construction: `GATEWAY_ON_SELLER` only ever runs over a payment
+link, and a payment link reports no fee, so the estimate is copied to the actual. Should a
+non-zero delta ever appear there, the settlement **blocks** rather than quietly repricing a
+seller who was promised that net.
 
 ---
 
-## Reconciliation Rules
+## Blocking
 
-Adjustment logic differs by fee model because who bears the gateway cost determines who absorbs the discrepancy.
+The one condition:
 
-### `GATEWAY_ON_CUSTOMER`
+```
+SettledPlatformFeeMinor < 0
+```
 
-Customer already paid `ExpectedGatewayFee` upfront. Any delta is absorbed internally.
+Singapay took so much more than estimated that the platform would have to pay in more than
+it ever charged. That is not a rounding to swallow — it means the estimate in `fee_configs`
+and the real rate disagree by more than the transaction can carry, and no arithmetic makes
+the result correct.
 
-| Case | Rule | BLOCK condition |
-|---|---|---|
-| feeDelta > 0 | `adjustedPlatformFee = PlatformFee - feeDelta` | `adjustedPlatformFee < 0` |
-| feeDelta < 0 | `adjustedSellerNet = SellerNetAmount + abs(feeDelta)` | — |
-| feeDelta = 0 | Normal flow | — |
+When it blocks:
 
-### `GATEWAY_ON_SELLER`
+- No ledger entries are written.
+- The transaction stays `COMPLETED`, not `SETTLED`.
+- It stays visible in `GetAwaitingSettlement` and keeps pushing up the oldest-awaiting age.
+- The seller's net in the returned adjustment is still the priced figure — blocking is a
+  decision about the platform's share and never reprices the seller.
 
-Seller agreed to bear the gateway fee. Any delta on the gateway cost falls on the seller.
-
-| Case | Rule | BLOCK condition |
-|---|---|---|
-| feeDelta > 0 | `adjustedSellerNet = SellerNetAmount - feeDelta` | `adjustedSellerNet < 0` |
-| feeDelta < 0 | `adjustedSellerNet = SellerNetAmount + abs(feeDelta)` | — |
-| feeDelta = 0 | Normal flow | — |
-
-> For `GATEWAY_ON_SELLER`, `PlatformFee` is always unchanged. Only `SellerNetAmount` adjusts.
+A block is almost always a stale `fee_configs` row for that channel. Fix the rate, then the
+next pass settles it.
 
 ---
 
-## Example: `GATEWAY_ON_CUSTOMER` — feeDelta > 0
-
-### Setup
+## Example — the fractional case
 
 ```
-SellerPrice     = 100,000
-PlatformFee     =   5,000
-ExpectedGatewayFee =   3,000
-TotalCharged    = 108,000
+SellerPrice           = 13,000
+PlatformFee           =  4,000
+EstimatedGatewayFee   =    120
+TotalCharged          = 17,120
 
-ActualGatewayFee (reported) =  4,000
-feeDelta                 = +1,000
-adjustedPlatformFee      =  4,000
+ActualGatewayFee      = 119.84      (Singapay charged 0.16 less than estimated)
+feeDelta              =  -0.16
+SettledPlatformFee    = 4,000.16
 ```
 
-### Phase 2 — Payment Entries
+### Phase 2 — Payment entries (at payment time, all rupiah)
 
 | # | Account | Amount | Bucket | EntryType |
 |---|---|---|---|---|
-| 1 | Seller | +100,000 | PENDING | `PRODUCT_PAYMENT` |
-| 2 | Platform | +5,000 | PENDING | `PLATFORM_COMMISSION` |
-| 3 | Singapay | +3,000 | PENDING | `PROCESSOR_FEE` |
+| 1 | Seller | +13,000 | PENDING | `PRODUCT_PAYMENT` |
+| 2 | Platform | +4,000 | PENDING | `PLATFORM_COMMISSION` |
+| 3 | Singapay | +120 | PENDING | `PROCESSOR_FEE` |
 
-### Phase 3 — Settlement Entries
+> Total PENDING = 17,120 = TotalCharged ✓
 
-| # | Account | Amount | Bucket | EntryType | Notes |
-|---|---|---|---|---|---|
-| 4 | Seller | -100,000 | PENDING | `SETTLEMENT_CLEAR` | clear seller PENDING |
-| 5 | Seller | +100,000 | AVAILABLE | `SETTLEMENT_NET` | seller can withdraw |
-| 6 | Platform | -4,000 | PENDING | `SETTLEMENT_CLEAR` | clear platform PENDING (adjusted) |
-| 7 | Platform | +4,000 | AVAILABLE | `SETTLEMENT_NET` | platform receives 4,000 |
-| 8 | Platform | -1,000 | PENDING | `FEE_ADJUSTMENT` | write-off remaining PENDING |
-| 9 | Singapay | -3,000 | PENDING | `SETTLEMENT` | clear Singapay PENDING |
-
-### Final State
-
-```
-Seller   PENDING   = +100,000 - 100,000         =       0  ✓
-Seller   AVAILABLE = +100,000                   = 100,000
-
-Platform PENDING   = +5,000 - 4,000 - 1,000    =       0  ✓
-Platform AVAILABLE = +4,000                     =   4,000
-
-Singapay     PENDING   = +3,000 - 3,000             =       0  ✓
-Singapay     AVAILABLE =                            =       0
-```
-
-**PayToMerchant check:**
-```
-Seller AVAILABLE + Platform AVAILABLE = 100,000 + 4,000 = 104,000
-PayToMerchant reported                = 108,000 - 4,000 = 104,000  ✓
-```
-
----
-
-## Example: `GATEWAY_ON_CUSTOMER` — feeDelta < 0
-
-### Setup
-
-```
-ActualGatewayFee (reported) =  2,000
-feeDelta                 = -1,000
-adjustedSellerNet        = 101,000
-```
-
-### Phase 3 — Settlement Entries
+### Phase 3 — Settlement entries
 
 | # | Account | Amount | Bucket | EntryType | Notes |
 |---|---|---|---|---|---|
-| 4 | Seller | -100,000 | PENDING | `SETTLEMENT_CLEAR` | clear seller PENDING |
-| 5 | Seller | +100,000 | AVAILABLE | `SETTLEMENT_NET` | from PENDING |
-| 6 | Seller | +1,000 | AVAILABLE | `FEE_ADJUSTMENT` | surplus credited directly to AVAILABLE |
-| 7 | Platform | -5,000 | PENDING | `SETTLEMENT_CLEAR` | clear platform PENDING |
-| 8 | Platform | +5,000 | AVAILABLE | `SETTLEMENT_NET` | platform unchanged |
-| 9 | Singapay | -3,000 | PENDING | `SETTLEMENT` | clear Singapay PENDING |
+| 4 | Seller | -13,000 | PENDING | `SETTLEMENT_CLEAR` | clears exactly what payment put in |
+| 5 | Seller | +13,000 | AVAILABLE | `SETTLEMENT_NET` | the priced net, unconditionally |
+| 6 | Platform | -4,000 | PENDING | `SETTLEMENT_CLEAR` | clears the priced fee |
+| 7 | Platform | +4,000 | AVAILABLE | `SETTLEMENT_NET` | the whole-rupiah part of 4,000.16 |
+| 8 | Singapay | -120 | PENDING | `SETTLEMENT` | clears the estimated fee |
 
-### Final State
+Plus `platform_residual = 16`.
 
-```
-Seller   PENDING   = +100,000 - 100,000         =       0  ✓
-Seller   AVAILABLE = +100,000 + 1,000           = 101,000
+The platform's two legs differ, and **that difference is the fee delta** — there is no
+separate `FEE_ADJUSTMENT` write-off entry any more. Booking the delta both as a gap between
+the legs and as its own entry was counting it twice; one settlement, one statement of it.
 
-Platform PENDING   = +5,000 - 5,000             =       0  ✓
-Platform AVAILABLE = +5,000                     =   5,000
-
-Singapay     PENDING   = +3,000 - 3,000             =       0  ✓
-```
-
-**PayToMerchant check:**
-```
-Seller AVAILABLE + Platform AVAILABLE = 101,000 + 5,000 = 106,000
-PayToMerchant reported                = 108,000 - 2,000 = 106,000  ✓
-```
-
----
-
-## Example: `GATEWAY_ON_SELLER` — feeDelta > 0
-
-### Setup
+### Final state
 
 ```
-SellerPrice     = 100,000
-PlatformFee     =   5,000
-ExpectedGatewayFee =   3,000
-TotalCharged    = 105,000    (= SellerPrice + PlatformFee; customer does NOT pay gateway fee)
-SellerNetAmount =  97,000    (= SellerPrice - ExpectedGatewayFee)
+Seller   PENDING   = +13,000 - 13,000 = 0  ✓
+Seller   AVAILABLE = +13,000              = 13,000     ← exactly the priced net
 
-ActualGatewayFee (reported) =  4,000
-feeDelta                 = +1,000
-adjustedSellerNet        =  96,000   (= 97,000 - 1,000)
+Platform PENDING   = +4,000 - 4,000   = 0  ✓
+Platform AVAILABLE = +4,000               =  4,000     (+ 16 sen residual, recorded)
+
+Singapay PENDING   = +120 - 120       = 0  ✓
 ```
 
-### Phase 2 — Payment Entries
+### Phase 4 — the sweep
 
-| # | Account | Amount | Bucket | EntryType |
-|---|---|---|---|---|
-| 1 | Seller | +97,000 | PENDING | `PRODUCT_PAYMENT` |
-| 2 | Platform | +5,000 | PENDING | `PLATFORM_COMMISSION` |
-| 3 | Singapay | +3,000 | PENDING | `PROCESSOR_FEE` |
-
-> Total PENDING = 97,000 + 5,000 + 3,000 = 105,000 = TotalCharged ✓
-
-### Phase 3 — Settlement Entries
-
-| # | Account | Amount | Bucket | EntryType | Notes |
-|---|---|---|---|---|---|
-| 4 | Seller | -96,000 | PENDING | `SETTLEMENT_CLEAR` | clear adjusted amount from PENDING |
-| 5 | Seller | +96,000 | AVAILABLE | `SETTLEMENT_NET` | seller receives adjusted amount |
-| 6 | Seller | -1,000 | PENDING | `FEE_ADJUSTMENT` | write-off extra fee absorbed by seller |
-| 7 | Platform | -5,000 | PENDING | `SETTLEMENT_CLEAR` | clear platform PENDING |
-| 8 | Platform | +5,000 | AVAILABLE | `SETTLEMENT_NET` | platform unchanged |
-| 9 | Singapay | -3,000 | PENDING | `SETTLEMENT` | clear Singapay PENDING (ExpectedGatewayFee) |
-
-### Final State
+`ProcessPlatformFeeTransfer` moves **4,000.16** from the seller's sub-account to the
+platform's.
 
 ```
-Seller   PENDING   = +97,000 - 96,000 - 1,000  =       0  ✓
-Seller   AVAILABLE = +96,000                    =  96,000
-
-Platform PENDING   = +5,000 - 5,000            =       0  ✓
-Platform AVAILABLE = +5,000                     =   5,000
-
-Singapay     PENDING   = +3,000 - 3,000             =       0  ✓
-Singapay     AVAILABLE =                            =       0
+seller's Singapay balance = 17,120 - 119.84 - 4,000.16 = 13,000.00
+seller's ledger balance   =                              13,000
+                                                         ✓ equal
 ```
 
-**PayToMerchant check:**
-```
-Seller AVAILABLE + Platform AVAILABLE = 96,000 + 5,000 = 101,000
-PayToMerchant reported                = 105,000 - 4,000 = 101,000  ✓
-```
+### The mirror case
 
----
-
-## Example: `GATEWAY_ON_SELLER` — feeDelta < 0
-
-### Setup
-
-```
-ActualGatewayFee (reported) =  2,000
-feeDelta                 = -1,000
-adjustedSellerNet        =  98,000   (= 97,000 + 1,000)
-```
-
-### Phase 3 — Settlement Entries
-
-| # | Account | Amount | Bucket | EntryType | Notes |
-|---|---|---|---|---|---|
-| 4 | Seller | -97,000 | PENDING | `SETTLEMENT_CLEAR` | clear original PENDING |
-| 5 | Seller | +97,000 | AVAILABLE | `SETTLEMENT_NET` | from PENDING |
-| 6 | Seller | +1,000 | AVAILABLE | `FEE_ADJUSTMENT` | surplus — Singapay charged less than expected |
-| 7 | Platform | -5,000 | PENDING | `SETTLEMENT_CLEAR` | clear platform PENDING |
-| 8 | Platform | +5,000 | AVAILABLE | `SETTLEMENT_NET` | platform unchanged |
-| 9 | Singapay | -3,000 | PENDING | `SETTLEMENT` | clear Singapay PENDING (ExpectedGatewayFee) |
-
-### Final State
-
-```
-Seller   PENDING   = +97,000 - 97,000           =       0  ✓
-Seller   AVAILABLE = +97,000 + 1,000            =  98,000
-
-Platform PENDING   = +5,000 - 5,000             =       0  ✓
-Platform AVAILABLE = +5,000                     =   5,000
-
-Singapay     PENDING   = +3,000 - 3,000             =       0  ✓
-```
-
-**PayToMerchant check:**
-```
-Seller AVAILABLE + Platform AVAILABLE = 98,000 + 5,000 = 103,000
-PayToMerchant reported                = 105,000 - 2,000 = 103,000  ✓
-```
-
----
-
-## BLOCK Conditions
-
-A transaction is **irreconcilable** (BLOCK) when the absorbing party would receive a negative net amount — meaning Singapay's actual fee exceeds what is available to absorb.
-
-### `GATEWAY_ON_CUSTOMER`
-
-The platform absorbs `feeDelta > 0`.
-
-```
-BLOCK when: PlatformFee - feeDelta < 0
-        i.e. ActualGatewayFee - ExpectedGatewayFee > PlatformFee
-```
-
-This means Singapay's overcharge exceeds the entire platform fee. The platform would owe money it never collected — there is no valid accounting outcome. The transaction must be investigated and resolved manually.
-
-**Example:** PlatformFee = 500, feeDelta = +600 → adjustedPlatformFee = −100 → **BLOCK**
-
-### `GATEWAY_ON_SELLER`
-
-The seller absorbs `feeDelta > 0`.
-
-```
-BLOCK when: SellerNetAmount - feeDelta < 0
-        i.e. ActualGatewayFee > SellerPrice
-             (since SellerNetAmount = SellerPrice - ExpectedGatewayFee,
-              and feeDelta = ActualGatewayFee - ExpectedGatewayFee,
-              so SellerNetAmount - feeDelta = SellerPrice - ActualGatewayFee)
-```
-
-This means Singapay's actual fee exceeded the seller's entire price — the seller would receive negative proceeds. This is an abnormal situation (likely a data entry or integration error) and must be handled manually.
-
-**Example:** SellerPrice = 10,000, ExpectedGatewayFee = 500, SellerNetAmount = 9,500, ActualGatewayFee = 11,000, feeDelta = +10,500 → adjustedSellerNet = −1,000 → **BLOCK**
-
-### Handling BLOCKed Transactions
-
-When a BLOCK condition is detected:
-- The settlement item is marked as **unmatched** (`IsMatched = false`)
-- A `DiscrepancySummary` of type `FEE_MISMATCH_IRRECONCILABLE` is recorded in the batch result
-- No ledger entries are written for that transaction
-- The transaction remains in `COMPLETED` status (not `SETTLED`)
-- Manual investigation is required before the transaction can be settled
-
----
-
-## Nature of `FEE_ADJUSTMENT` Entries
-
-`FEE_ADJUSTMENT` entries are **terminal** — they have no counterpart and no subsequent phase.
-
-| Fee Model | Case | Account | Bucket | Direction | Nature |
-|---|---|---|---|---|---|
-| `GATEWAY_ON_CUSTOMER` | feeDelta > 0 | Platform | PENDING | - (debit) | Write-off. Singapay took more than expected; platform absorbs the delta. Does not reduce AVAILABLE. |
-| `GATEWAY_ON_CUSTOMER` | feeDelta < 0 | Seller | AVAILABLE | + (credit) | Direct credit. Singapay charged less; surplus passed to seller. |
-| `GATEWAY_ON_SELLER` | feeDelta > 0 | Seller | PENDING | - (debit) | Write-off. Singapay took more than expected; seller absorbs the delta. Does not reduce AVAILABLE. |
-| `GATEWAY_ON_SELLER` | feeDelta < 0 | Seller | AVAILABLE | + (credit) | Direct credit. Singapay charged less; surplus passed to seller. |
+`ActualGatewayFee = 120.30` → `feeDelta = +0.30` → `SettledPlatformFee = 3,999.70`. The
+platform's AVAILABLE leg books 3,999, the residual is 70, the sweep moves 3,999.70, and the
+seller still ends at exactly 13,000.
 
 ---
 
@@ -349,50 +253,29 @@ When a BLOCK condition is detected:
 | `SETTLEMENT_CLEAR` | PENDING | - | Phase 3: settlement |
 | `SETTLEMENT_NET` | AVAILABLE | + | Phase 3: settlement |
 | `SETTLEMENT` | PENDING | - | Phase 3: clear Singapay PENDING |
-| `FEE_ADJUSTMENT` | PENDING / AVAILABLE | - / + | Phase 3: fee mismatch adjustment |
 | `DISBURSEMENT` | AVAILABLE | - | Seller withdrawal |
+
+`FEE_ADJUSTMENT` is no longer written. It stays in the `CHECK` constraint and in
+`domain.EntryType` because `ledger_entries` is insert-only and rows booked under the old
+rules carry it — a reader that cannot name it cannot read its own history.
 
 ---
 
-## Implementation
+## What does not change
 
-### Required Changes
+- `ProductTransaction.Fee` — the values priced at payment time, kept as the historical record.
+- Existing `ledger_entries` rows — never modified; insert-only by design.
+- The Singapay expense account is always cleared using `EstimatedGatewayFee`, because that is
+  what was credited to it at payment time.
 
-**`domain/ledger_entry.go`** — add new entry type:
-```go
-EntryTypeFeeAdjustment EntryType = "FEE_ADJUSTMENT"
-```
+---
 
-**`domain/settlement_item.go`** — add field for tracking (optional, for reporting):
-```go
-FeeAdjustment int64  // feeDelta applied (0 if no mismatch)
-```
+## Early warning
 
-**`ledger.go`** — replace `HasAmountDiscrepancy()` block with fee adjustment logic:
-```
-feeDelta = ActualGatewayFee - ExpectedGatewayFee
+The money-in webhook carries a channel fee for virtual accounts. `HandleMoneyIn` compares it
+against the estimate and logs a warning when they differ — a day's notice that a
+`fee_configs` rate has drifted, before settlement has to balance it.
 
-if feeDelta > 0:
-    switch feeModel:
-        GATEWAY_ON_CUSTOMER:
-            adjustedPlatformFee = PlatformFee - feeDelta
-            if adjustedPlatformFee < 0 → BLOCK (irreconcilable)
-        GATEWAY_ON_SELLER:
-            adjustedSellerNet = SellerNetAmount - feeDelta
-            if adjustedSellerNet < 0 → BLOCK (irreconcilable)
-    → proceed with adjustment entries
-
-elif feeDelta < 0:
-    adjustedSellerNet = SellerNetAmount + abs(feeDelta)
-    → proceed with adjustment entries (both models: surplus always to seller)
-
-else:
-    → normal settlement
-```
-
-### What Does Not Change
-
-- `ProductTransaction.Fee` — retains original values from payment time (historical record)
-- Existing `ledger_entries` rows — never modified (immutable by design)
-- Singapay is always cleared using `ExpectedGatewayFee`
-- Matching logic is unchanged
+That comparison reads the fee in **sen**. It once went through `Amount.Rupiah()`, which
+refuses a fractional amount rather than rounding it: a fee of `119.84` made it error, the
+branch fell through, and the warning never fired in exactly the case worth warning about.

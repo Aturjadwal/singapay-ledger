@@ -359,13 +359,14 @@ func (f *FakeProductTransactionRepository) GetSettledWithoutPlatformFeeTransfer(
 	return nil, nil
 }
 
-func (f *FakeProductTransactionRepository) SaveSettledFees(ctx context.Context, id string, platformFee, gatewayFee int64) error {
+func (f *FakeProductTransactionRepository) SaveSettledFees(ctx context.Context, id string, platformFeeMinor, gatewayFeeMinor, residualMinor int64) error {
 	tx, ok := f.transactions[id]
 	if !ok {
 		return repo.ErrNotFound
 	}
-	tx.SettledPlatformFee = &platformFee
-	tx.SettledGatewayFee = &gatewayFee
+	tx.SettledPlatformFeeMinor = &platformFeeMinor
+	tx.SettledGatewayFeeMinor = &gatewayFeeMinor
+	tx.PlatformResidualMinor = &residualMinor
 	return nil
 }
 

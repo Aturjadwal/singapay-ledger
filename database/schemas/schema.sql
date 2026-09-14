@@ -209,10 +209,24 @@ CREATE TABLE IF NOT EXISTS product_transactions (
     -- it was missing here, which would have made the next Atlas diff drop it.
     transfer_request_id TEXT,
     -- What the fees turned out to be once Singapay reported what it actually took
-    -- (migration 024). NULLABLE ON PURPOSE: NULL means "this settled before we recorded
-    -- it", i.e. use the priced figure. A DEFAULT 0 here would silently transfer nothing.
+    -- (migration 024).
+    --
+    -- ALL THREE OF THESE ARE IN SEN, since migration 027 — unlike platform_fee and
+    -- gateway_fee above, which are whole rupiah. Singapay's money-in fee carries two
+    -- decimals, and these are the columns that hold the fraction the pricing columns
+    -- cannot. The names carry no unit suffix because 027 changed their meaning without
+    -- renaming them; the Go fields that map here are SettledPlatformFeeMinor and friends,
+    -- and that is where the unit is spelled out.
+    --
+    -- NULLABLE ON PURPOSE: NULL means "this settled before we recorded it", i.e. use the
+    -- priced figure. A DEFAULT 0 here would silently transfer nothing.
     settled_platform_fee BIGINT,
     settled_gateway_fee BIGINT,
+    -- The sub-rupiah part of settled_platform_fee: what the account transfer moves but a
+    -- whole-rupiah ledger entry cannot express (migration 027). The platform's ledger
+    -- balance differs from its Singapay balance by SUM of this over settled rows; the
+    -- seller's two balances agree exactly, with no residual at all.
+    platform_residual BIGINT,
     -- Product details (what was purchased)
     metadata JSONB -- Buyer name, product title, resolution, license type, etc.
 );

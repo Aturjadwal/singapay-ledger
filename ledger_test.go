@@ -78,9 +78,9 @@ func TestLedgerEntries_PaymentThroughSettlement(t *testing.T) {
 		GatewayTransactionID: "SP-TX-1",
 		GatewayAccountID:     "01SELLERACCOUNTULID",
 		PaymentChannel:       "VA_BCA",
-		GrossAmount:          51000,
-		NetAmount:            46005,
-		Fee:                  4995,
+		GrossMinor:           5100000,
+		NetMinor:             4600500,
+		FeeMinor:             499500,
 		FeeReported:          true,
 	})
 	require.NoError(t, err)
@@ -105,9 +105,12 @@ func TestLedgerEntries_PaymentThroughSettlement(t *testing.T) {
 	settled, err := fakes.ProductTransaction().GetByID(ctx, tx.UUID)
 	require.NoError(t, err)
 	assert.Equal(t, domain.TransactionStatusSettled, settled.Status)
-	require.NotNil(t, settled.SettledGatewayFee)
-	assert.Equal(t, int64(4995), *settled.SettledGatewayFee,
-		"the fee Singapay actually took is what the transfer step must read")
+	require.NotNil(t, settled.SettledGatewayFeeMinor)
+	assert.Equal(t, int64(499500), *settled.SettledGatewayFeeMinor,
+		"the fee Singapay actually took is what the transfer step must read, in sen")
+	require.NotNil(t, settled.PlatformResidualMinor)
+	assert.Equal(t, int64(0), *settled.PlatformResidualMinor,
+		"a fee that matches the estimate to the rupiah strands no fraction")
 }
 
 // A payment-link row carries no fee anywhere in Singapay's API, so its Fee is a fallback
@@ -130,19 +133,19 @@ func TestResolveFeeAdjustment_PaymentLinkFeeIsNotReported(t *testing.T) {
 	settled := domain.SettledTransaction{
 		MerchantReference: "INV-002",
 		PaymentChannel:    ChannelPaymentLink,
-		GrossAmount:       51000,
-		NetAmount:         46005,
-		Fee:               4995, // copied from what was expected, not observed
+		GrossMinor:        5100000,
+		NetMinor:          4600500,
+		FeeMinor:          499500, // copied from what was expected, not observed
 		FeeReported:       false,
 	}
 
 	adj, blocked := resolveFeeAdjustment(tx, settled)
 
 	assert.Empty(t, blocked)
-	assert.Equal(t, int64(0), adj.FeeDelta,
+	assert.Equal(t, int64(0), adj.FeeDeltaMinor,
 		"a copied fee can only ever produce a zero delta")
 	assert.Equal(t, tx.Fee.SellerNetAmount, adj.SellerNet)
-	assert.Equal(t, tx.Fee.PlatformFee, adj.PlatformFee)
+	assert.Equal(t, domain.RupiahToMinor(tx.Fee.PlatformFee), adj.PlatformFeeMinor)
 	assert.False(t, settled.FeeReported,
 		"the zero delta above must stay distinguishable from a real reconciliation")
 }
