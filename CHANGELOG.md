@@ -4,6 +4,90 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — the settled gateway fee is read in sen, and the platform balances it
+
+**Breaking.** Field names and one field type change on exported types.
+
+Singapay reports a money-in fee with two decimals: a QRIS fee of `119.84` is a real figure.
+`readSettledTransaction` filled `domain.SettledTransaction` by calling `.Minor()` on those
+amounts — sen — for virtual account, QRIS and e-wallet, and with whole rupiah for payment
+link. The fields were named `GrossAmount` / `NetAmount` / `Fee` and carried no unit, so
+`resolveFeeAdjustment` computed `settled.Fee - tx.Fee.GatewayFee`: sen minus rupiah. A real
+fee of Rp120 read as `12000` against an estimate of `120` gave a delta of `11880`.
+
+Most channels blocked loudly — the platform fee went negative and the settlement wrote
+nothing — so the damage accumulated as an unsettled backlog rather than as wrong entries.
+Payment link was unaffected; its delta is zero by construction.
+
+```go
+// Before
+type SettledTransaction struct {
+    GrossAmount int64
+    NetAmount   int64
+    Fee         int64
+}
+
+// After — the suffix is the fix; a compiler cannot catch a rupiah figure
+// assigned to a sen field when neither name says which is which.
+type SettledTransaction struct {
+    GrossMinor int64
+    NetMinor   int64
+    FeeMinor   int64
+}
+```
+
+**The seller is now paid what they were priced, unconditionally.** A surplus used to be
+credited to the seller, so a seller's net moved by a few sen depending on what Singapay
+charged. The platform sub-account is now the balancing account in both directions:
+
+```
+platformAdjustment = estimatedGatewayFee - actualGatewayFee
+```
+
+This is what holds the invariant the design exists for — a seller's Singapay sub-account
+balance equals their ledger balance — because the only two things that leave that
+sub-account are Singapay's own deduction and the platform fee sweep, and the sweep now
+moves the balanced figure rather than the one quoted at checkout.
+
+**`TransferRequest.Amount` is now an `Amount`, not an `int64`.** Singapay's account-transfer
+endpoint types its amount as a number with decimals and returns it as a string to preserve
+precision, so the fraction moves with the transfer. Amounts below the Rp1 minimum the
+endpoint enforces are reported as failures rather than marked transferred.
+
+```go
+// Before
+singapay.TransferRequest{Amount: platformFee}
+
+// After
+singapay.TransferRequest{Amount: singapay.NewAmountFromMinor(platformFeeMinor, "IDR")}
+```
+
+**`PlatformFeeTransferError.PlatformFee` and `PlatformFeeTransferSuccess.PlatformFee` are
+now `PlatformFeeMinor`,** in sen.
+
+**`SaveSettledFees` takes a third argument,** `residualMinor`.
+
+**The platform's two settlement legs may now differ, and that difference is the fee delta.**
+The separate `FEE_ADJUSTMENT` entry is gone — booking the delta both as a gap between the
+legs and as its own entry counted it twice. The entry type stays in the `CHECK` constraint
+and in `domain.EntryType`, because `ledger_entries` is insert-only and historical rows carry
+it.
+
+`ledger_entries.amount` stays whole rupiah. The sub-rupiah part it cannot carry is recorded
+per transaction in `platform_residual`, so the platform's ledger balance and its Singapay
+balance reconcile to `SUM(platform_residual)` — a number that can be queried, not a drift.
+The seller's two balances agree exactly.
+
+Also fixes the money-in webhook's early warning, which read the fee through `Amount.Rupiah()`
+and so fell through silently in exactly the case worth warning about: a fractional fee.
+
+**Migration 027** converts `settled_platform_fee` and `settled_gateway_fee` to sen and adds
+`platform_residual`. It is channel-aware — only payment-link rows held rupiah — and the
+columns keep their names, so a build that predates it reads sen as rupiah. **Stop the
+settlement worker and the platform fee transfer before applying it, not after.**
+
+Full rules: [docs/104-fee-mismatch-reconciliation.md](docs/104-fee-mismatch-reconciliation.md).
+
 ### Changed — DOKU replaced by Singapay
 
 The payment gateway is now Singapay throughout. `github.com/21strive/doku` is no longer a
