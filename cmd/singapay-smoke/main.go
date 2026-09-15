@@ -345,8 +345,10 @@ func stepFee(ctx context.Context, c *singapay.Client, o options) error {
 	fmt.Printf("    transfer fee               : %s\n", q.TransferFee)
 	fmt.Printf("    gross (account is debited) : %s\n", q.GrossAmount)
 	fmt.Println()
-	fmt.Println("  The gross is what a withdrawal must reserve. Reserving only the net")
-	fmt.Println("  leaves the ledger short by the fee on every payout.")
+	fmt.Println("  Note the direction: the amount you pass is the NET, and Singapay debits")
+	fmt.Println("  the gross. A withdrawal runs this backwards — it quotes the fee, sends")
+	fmt.Println("  requested − fee as the net, and so is debited exactly the requested")
+	fmt.Println("  amount, which is what the seller's balance moved by.")
 	return nil
 }
 

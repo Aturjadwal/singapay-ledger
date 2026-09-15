@@ -43,7 +43,12 @@ func (c *LedgerAnalyticsClient) RunFactWithdrawalTimeseriesETL(ctx context.Conte
 			return fmt.Errorf("failed to log microbatch start: %w", err)
 		}
 
-		// Phase 1: Query affected disbursements from ledgerDB
+		// Phase 1: Query affected disbursements from ledgerDB.
+		//
+		// Both money columns sum disbursements.amount, which is what the seller REQUESTED
+		// and what their balance was debited — the transfer fee is inside it, not beside
+		// it (migration 028). So total_disbursed_amount is what sellers were charged, and
+		// it runs above the sum that actually reached their banks by the fees paid.
 		queryAffected := `
 SELECT DISTINCT
   TO_CHAR(DATE_TRUNC(i.trunc_unit::TEXT, d.created_at), 'YYYYMMDD')::INT AS date_key,

@@ -15,7 +15,7 @@ This folder contains high-level architecture diagrams and technical documentatio
     - Still open: the refund policy, which needs a negative-balance decision rather than code.
 
 3. **Withdrawal (Disbursement)** ([`103-withdrawal-disbursement.md`](./103-withdrawal-disbursement.md))
-    - Visualizes the withdrawal process: quote the fee, reserve the gross under a row lock, send, book the outcome.
+    - Visualizes the withdrawal process: quote the fee, carve it out of the request, reserve the requested amount under a row lock, send the net, book the outcome.
     - Documents the failure taxonomy — why `singapay.Outcome` decides whether a reservation may be released, and never the HTTP status.
 
 4. **Fee Mismatch Reconciliation** ([`104-fee-mismatch-reconciliation.md`](./104-fee-mismatch-reconciliation.md))

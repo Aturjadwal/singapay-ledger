@@ -277,23 +277,32 @@ valid, err := client.ValidateBankAccount(ctx, &ledger.ValidateBankAccountRequest
 
 resp, err := client.Withdraw(ctx, sellerID, &ledger.WithdrawRequest{
     AccountID:     account.UUID,
-    Amount:        500000,       // the NET the beneficiary receives
+    Amount:        500000,       // what the seller asked for = the whole balance debit
     BankCode:      "BNINIDJA",
     AccountNumber: "1234567890",
     AccountName:   "John Doe",
 })
-// resp.Amount      — the net
-// resp.TransferFee — charged on top; the balance moves by Amount + TransferFee
+// resp.Amount      — 500000, requested and debited
+// resp.TransferFee —   4000, DEDUCTED from it, not charged on top
+// resp.NetAmount   — 496000, what reaches the beneficiary's bank account
 
 history, err := client.GetDisbursements(ctx, sellerID, cursor, 20, "DESC")
 ```
 
+**The transfer fee comes out of the withdrawal, not on top of it.** `Amount` is what the
+seller asked for and the whole of what their balance moves by; the fee is carved out of it,
+so `NetAmount = Amount - TransferFee` is what reaches the bank. Singapay's own API runs the
+other way — its disbursement amount is the net and it adds the fee — which is exactly why
+the ledger sends the net: that makes Singapay's sub-account debit land on the requested
+amount. A withdrawal whose fee would swallow it is refused with
+`ErrInvalidDisbursementAmount`.
+
 **Store SWIFT bank codes, not three-digit national codes.** The transfer endpoint accepts
 either, but the fee quote (`check-fee`) is a v1.0 endpoint with no v2 counterpart and
-accepts SWIFT only. With a three-digit code the quote fails, the fee is not reserved, and
-the ledger drifts from Singapay by the transfer fee on every payout — silently, because the
-books stay internally consistent and disagree only with the gateway. The withdrawal still
-goes out (refusing it would be worse), and the failure is logged.
+accepts SWIFT only. With a three-digit code the quote fails, the fee falls to zero, and the
+full requested amount goes out as the net — so the seller receives everything they asked for
+and the platform sub-account absorbs the transfer fee. The withdrawal still goes out
+(refusing it would be worse), and the failure is logged.
 
 **A failed payout is not the same as a payout that did not happen.** Singapay returns HTTP
 400 for `SP001`, `SP002`, `SP004` and `SP005`, and its own documentation says to call

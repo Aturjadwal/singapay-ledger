@@ -623,12 +623,15 @@ dan gagal** — kalau diperlakukan sebagai processing, uang seller tertahan sela
 
 Tambahan penting yang tidak dimiliki DOKU:
 
-- **`amount` adalah net, fee ditambahkan di atasnya.** `gross = amount + fee` didebit dari
-  saldo. `WithdrawRequest.Amount` di [ledger.go:408](../ledger.go#L408) harus jelas
-  maknanya: kalau seller minta tarik Rp 50.000 dan menerima Rp 50.000, saldo terpotong
-  Rp 51.000. Kalau maksudnya seller menerima 50.000 − fee, `amount` harus dihitung mundur.
-  `POST /api/v1.0/disbursement/{account_id}/check-fee` ada persis untuk ini dan sebaiknya
-  dipanggil sebelum reservasi saldo, supaya yang direservasi adalah **gross**.
+- **`amount` milik Singapay adalah net, fee ditambahkan di atasnya.** Sub-account didebit
+  `net + fee`. Pertanyaan yang tersisa waktu itu — apakah `WithdrawRequest.Amount` berarti
+  "yang diterima seller" atau "yang dipotong dari saldo" — **sudah dijawab**: `Amount`
+  adalah nominal yang diminta seller dan seluruh potongan saldonya, dan fee dipotong dari
+  dalamnya. Seller minta tarik Rp 15.000 dengan fee Rp 3.000 → saldo berkurang Rp 15.000,
+  yang dikirim ke Singapay Rp 12.000, yang diterima Rp 12.000. Jadi `amount` memang
+  "dihitung mundur": `POST /api/v1.0/disbursement/{account_id}/check-fee` dipanggil sebelum
+  reservasi, dan yang direservasi adalah **nominal permintaan**, bukan permintaan + fee.
+  Lihat `docs/103-withdrawal-disbursement.md` dan migrasi 028.
 - **`SP004` = duplicate reference number.** Ini adalah jawaban idempotensi untuk
   `RetryDisbursement` ([ledger.go:574](../ledger.go#L574)): kalau `SP004` muncul, panggil
   `POST /api/v2.0/disbursement/{account_id}/inquiry-status` dengan `reference_number` yang
@@ -947,7 +950,8 @@ Bertahap, tiap tahap bisa diuji sendiri:
 2. **Accounts + balance** — `CreateAccount`, simpan ULID **dan** `account_number`. Migrasi
    skema: `doku_sub_account_id` → `gateway_account_id` + `gateway_account_number`.
 3. **Bank inquiry** — paling terisolasi, tidak menyentuh uang.
-4. **Disbursement** — `check-fee` → reservasi **gross** → `transfer` → pemetaan status
+4. **Disbursement** — `check-fee` → reservasi **nominal permintaan** (fee dipotong dari
+   dalamnya, lihat migrasi 028) → `transfer` sebesar net → pemetaan status
    `00/01/02/03/04/05/06/07` → handler webhook `disbursement` → `SP004` menuju
    `inquiry-status`.
 5. **Account transfer** untuk platform fee — `merchant_ref_no` sebagai idempotency key.

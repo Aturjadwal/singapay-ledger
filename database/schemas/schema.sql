@@ -316,6 +316,9 @@ CREATE TABLE IF NOT EXISTS disbursements (
     uuid VARCHAR(255) PRIMARY KEY,
     randid VARCHAR(255) NOT NULL UNIQUE,
     account_uuid VARCHAR(255) NOT NULL,
+    -- What the seller asked to withdraw, and the whole of what their balance is debited.
+    -- The transfer fee comes OUT of it (migration 028): the beneficiary receives
+    -- amount - gateway_fee, and that difference is what is sent to Singapay.
     amount BIGINT NOT NULL,
     currency VARCHAR(3) NOT NULL CHECK (currency IN ('IDR', 'USD')),
     status VARCHAR(20) NOT NULL CHECK (
@@ -337,6 +340,10 @@ CREATE TABLE IF NOT EXISTS disbursements (
     -- inquire on it rather than send a second one
     -- rather than issue a second payout. Write-once (migration 014).
     payout_request_id TEXT,
+    -- Transfer fee quoted before the payout was sent (migration 018), deducted from amount
+    -- rather than added to it (migration 028). Write-once: the reversal has to release the
+    -- same number the reservation held.
+    gateway_fee BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL,
     processed_at TIMESTAMP,

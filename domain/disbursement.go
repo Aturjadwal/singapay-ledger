@@ -44,8 +44,16 @@ func (ba *BankAccount) Validate() error {
 
 // Disbursement represents a withdrawal request to an external bank account
 type Disbursement struct {
-	*redifu.Record        `json:",inline" bson:",inline" db:"-"`
-	LedgerUUID            string
+	*redifu.Record `json:",inline" bson:",inline" db:"-"`
+	LedgerUUID     string
+
+	// Amount is what the seller asked for, and exactly what their balance is debited.
+	// The transfer fee comes OUT of it, so the beneficiary receives Amount minus
+	// GatewayFee — see [Disbursement.NetAmount].
+	//
+	// It is deliberately not the number sent to Singapay. Singapay's disbursement amount
+	// is the net the beneficiary receives and it adds the fee on top, so the net is what
+	// travels and Amount is what the sub-account ends up debited.
 	Amount                int64
 	Currency              Currency
 	Status                DisbursementStatus
@@ -55,13 +63,14 @@ type Disbursement struct {
 	FailureReason         string
 	ProcessedAt           *time.Time
 
-	// GatewayFee is what Singapay charges to move the money, quoted before the payout
-	// is sent and reserved on top of Amount.
+	// GatewayFee is what Singapay charges to move the money, quoted before the payout is
+	// sent and taken OUT of Amount rather than added to it.
 	//
-	// Singapay's disbursement amount is the NET the beneficiary receives; the fee is
-	// added, so the sub-account is debited Amount + GatewayFee. Reserving only Amount
-	// would leave the ledger short by the fee on every single payout, and the drift is
-	// silent — the books balance against themselves and disagree only with Singapay.
+	// The seller asked to withdraw Amount and their balance moves by Amount, full stop.
+	// The fee is a deduction from that, so the beneficiary receives Amount - GatewayFee.
+	// Singapay's own arithmetic runs the other way — it takes a net and adds the fee — so
+	// the net is what gets sent and the fee is what brings the sub-account debit back to
+	// Amount.
 	GatewayFee int64
 
 	// PayoutRequestID is the reference_number this payout was, or will be, sent under.
@@ -171,6 +180,16 @@ func NewDisbursementWithID(
 // GenerateID generates a new UUID string for use as entity ID
 func GenerateID() string {
 	return uuid.New().String()
+}
+
+// NetAmount is what the beneficiary actually receives, and the amount Singapay is asked
+// to transfer: the requested Amount less the transfer fee it charges.
+//
+// This is the one place the subtraction lives. Singapay takes the net and adds the fee on
+// top, so sending NetAmount is what makes the sub-account debit come to exactly Amount —
+// which is what the ledger reserved and what the seller was told they were withdrawing.
+func (d *Disbursement) NetAmount() int64 {
+	return d.Amount - d.GatewayFee
 }
 
 // GetMoney returns the disbursement amount as Money

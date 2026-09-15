@@ -4,6 +4,66 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — the disbursement fee comes out of the withdrawal, not on top of it
+
+**Breaking.** `disbursements.amount` changes meaning, `WithdrawResponse` gains a field, and
+migration `028` rewrites existing rows. Read it before applying — it is not idempotent.
+
+A seller asking to withdraw Rp 15.000 against a Rp 3.000 transfer fee had **Rp 18.000**
+taken off their balance and received Rp 15.000. The requested amount was treated as the net
+the beneficiary receives, and the fee was reserved on top of it. So the fee was an extra
+charge beside the withdrawal, and a seller could never withdraw their whole balance: the
+last Rp 3.000 was always out of reach.
+
+The requested amount is now the whole of what a withdrawal costs. The fee is carved out of
+it:
+
+```
+  requested (debited, reserved)   15.000
+  − transfer fee (quoted)          3.000
+  = net (sent, received)          12.000
+```
+
+Singapay's own arithmetic is unchanged and still runs the other way — its disbursement
+amount is the net and it adds the fee on top — which is exactly why the ledger now sends the
+net. That makes Singapay's sub-account debit land on the requested amount, so the
+reservation and the gateway agree on one number instead of two.
+
+```go
+// Before — Amount was the net; TransferFee was charged on top of it.
+resp.Amount      // 15000, what the beneficiary receives
+resp.TransferFee // 3000, charged on top: balance moved 18000
+
+// After — Amount is the request and the whole balance movement.
+resp.Amount      // 15000, requested and debited
+resp.TransferFee // 3000, deducted from it
+resp.NetAmount   // 12000, what the beneficiary receives
+```
+
+What changed, concretely:
+
+- `Disbursement.Amount` is the requested amount; `Disbursement.NetAmount()` is what is sent
+  and received. `GatewayFee` is a deduction, not an addition.
+- The reservation, its reversal and `total_withdrawal_amount` all move by the requested
+  amount. They were `amount + fee`.
+- `executePayout` sends `NetAmount()`. It sent `Amount`.
+- A withdrawal whose fee would swallow it — a net of zero or less — is refused with
+  `ErrInvalidDisbursementAmount`, before anything is reserved or any row is written.
+- A fee that cannot be quoted still does not fail the withdrawal, but the error now falls
+  the other way: the full request goes out as the net and the **platform** absorbs the
+  transfer fee. The seller is never short-changed by a quote that failed.
+- Journal metadata records `net_amount` where it recorded `gross_amount`.
+
+`quotePayoutFee` quotes against the requested amount rather than the net it is about to
+compute. That is correct only because Indonesian payout fees are flat per destination
+(Rp 3.000 to a bank, Rp 2.500 to a wallet — migration 020); a percentage fee would have to
+be solved for instead, and the comment there says so.
+
+Migration `028` folds `gateway_fee` into `amount` for every existing row, because for an old
+row `amount + gateway_fee` is exactly the debit its ledger entry already carries. Without
+it, reversals would under-release by the fee, retries would short-pay the beneficiary, and
+every historical payout would read as cheaper than it was.
+
 ### Fixed — the settled gateway fee is read in sen, and the platform balances it
 
 **Breaking.** Field names and one field type change on exported types.

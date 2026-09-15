@@ -363,24 +363,68 @@ func TestWithdraw_PersistsReferenceBeforeCallingTheGateway(t *testing.T) {
 	assert.Equal(t, resp.DisbursementID, storedAtCallTime.UUID)
 }
 
-// Singapay's amount is the NET the beneficiary receives; the transfer fee is charged on
-// top. Reserving only the net leaves the ledger short by the fee on every payout, and the
-// drift is silent — the books stay internally consistent and disagree only with Singapay.
-func TestWithdraw_ReservesTheGrossIncludingTheTransferFee(t *testing.T) {
+// The whole arithmetic of a withdrawal, in one test. A seller who asks for 50000 against a
+// 4000 fee is charged 50000 and receives 46000 — the fee comes OUT of the request. Charging
+// 54000 for 50000 received is the bug this asserts against: it bills the seller the fee
+// twice, once by shrinking the payout and once again off the balance.
+func TestWithdraw_FeeIsDeductedFromTheRequestedAmountNotAddedToIt(t *testing.T) {
 	gw := &fakeGateway{disburse: payoutSuccess(t), fee: 4000}
 	client, fakes, account := newPayoutTestClient(t, gw, 100000)
 
-	resp, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest()) // net 50000
+	resp, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest()) // asks 50000
 	require.NoError(t, err)
 
+	assert.Equal(t, int64(50000), resp.Amount, "the response must report what was requested")
 	assert.Equal(t, int64(4000), resp.TransferFee)
-	assert.Equal(t, int64(46000), availableBalance(fakes, account.UUID),
-		"the reservation must hold net + fee (50000 + 4000), not just the net")
+	assert.Equal(t, int64(46000), resp.NetAmount, "the beneficiary receives the request less the fee")
+
+	assert.Equal(t, int64(50000), availableBalance(fakes, account.UUID),
+		"the balance must move by the requested 50000 — not 54000, which would charge the fee twice")
+
+	require.Len(t, gw.bodies, 1)
+	assert.Equal(t, int64(46000), gw.bodies[0].Amount,
+		"Singapay's amount is the net the beneficiary receives, so the net goes on the wire")
+}
+
+// The debit that holds the money is the requested amount, so the reversal that releases it
+// must be too. Any other pairing hands back more or less than was held.
+func TestWithdraw_ReleasesExactlyWhatItReservedWhenThePayoutFails(t *testing.T) {
+	gw := &fakeGateway{disburse: payoutWithStatus(t, "04"), fee: 4000} // 04 = terminally failed
+	client, fakes, account := newPayoutTestClient(t, gw, 100000)
+
+	_, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest())
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, countReversals(fakes))
+	assert.Equal(t, int64(100000), availableBalance(fakes, account.UUID),
+		"a failed payout must leave the seller exactly where they started, fee included")
+}
+
+// A request the fee would swallow has no payout left in it. Refused before anything is
+// reserved or written, rather than sent to Singapay as a zero-or-negative transfer.
+func TestWithdraw_RefusesAnAmountTheFeeWouldSwallow(t *testing.T) {
+	gw := &fakeGateway{disburse: payoutSuccess(t), fee: 4000}
+	client, fakes, account := newPayoutTestClient(t, gw, 100000)
+
+	req := withdrawRequest()
+	req.Amount = 4000 // exactly the fee: nothing would reach the beneficiary
+
+	_, err := client.Withdraw(context.Background(), "seller-1", req)
+	require.Error(t, err)
+	assert.True(t, ledgererr.IsAppError(err, ledgererr.ErrInvalidDisbursementAmount),
+		"expected an invalid-amount refusal, got: %v", err)
+
+	assert.Empty(t, gw.references, "nothing should have been sent")
+	assert.Empty(t, fakes.disbursementRepo.disbursements, "a refused withdrawal must leave no row")
+	assert.Zero(t, countDebits(fakes))
+	assert.Equal(t, int64(100000), availableBalance(fakes, account.UUID))
 }
 
 // A quote that cannot be made is not a withdrawal that cannot be made. check-fee accepts
-// SWIFT codes only, so an account stored with a three-digit bank code can never be quoted —
-// refusing those payouts outright would be worse than under-reserving by the fee.
+// SWIFT codes only, so an account stored with a three-digit bank code can never be quoted.
+// The fee falls to zero, which sends the full request as the net: the seller gets every
+// rupiah they asked for, their balance still moves by exactly that, and the platform
+// sub-account absorbs the fee. That is the right way round for the error to fall.
 func TestWithdraw_ProceedsWhenTheFeeCannotBeQuoted(t *testing.T) {
 	gw := &fakeGateway{
 		disburse: payoutSuccess(t),
@@ -392,7 +436,10 @@ func TestWithdraw_ProceedsWhenTheFeeCannotBeQuoted(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Zero(t, resp.TransferFee)
+	assert.Equal(t, int64(50000), resp.NetAmount)
 	assert.Len(t, gw.references, 1, "the payout must still have gone out")
+	require.Len(t, gw.bodies, 1)
+	assert.Equal(t, int64(50000), gw.bodies[0].Amount)
 	assert.Equal(t, int64(50000), availableBalance(fakes, account.UUID))
 }
 

@@ -501,7 +501,11 @@ func (c *LedgerClient) ValidateBankAccount(ctx context.Context, req *ValidateBan
 
 // WithdrawRequest contains the parameters to withdraw funds to a bank account
 type WithdrawRequest struct {
-	AccountID     string `json:"account_id"`
+	AccountID string `json:"account_id"`
+
+	// Amount is what the seller asked to withdraw and the whole of what their balance is
+	// debited. The transfer fee is taken out of it, not charged on top, so they receive
+	// Amount less the fee.
 	Amount        int64  `json:"amount"`
 	Currency      string `json:"currency"`
 	BankCode      string `json:"bank_code"`
@@ -510,27 +514,54 @@ type WithdrawRequest struct {
 	Description   string `json:"description"`
 }
 
-// WithdrawResponse contains the result of a withdrawal request
+// WithdrawResponse contains the result of a withdrawal request.
+//
+// The three amounts are one subtraction: Amount - TransferFee = NetAmount. Amount is what
+// the seller asked for and what their balance moved by; NetAmount is what lands in their
+// bank account.
 type WithdrawResponse struct {
 	DisbursementID string `json:"disbursement_id"`
 	Status         string `json:"status"`
-	// Amount is the NET the beneficiary receives. TransferFee is charged on top, so the
-	// seller's balance moves by Amount + TransferFee.
-	Amount      int64  `json:"amount"`
-	TransferFee int64  `json:"transfer_fee"`
-	Currency    string `json:"currency"`
-	Message     string `json:"message"`
+
+	// Amount is what was requested, and exactly what the seller's balance was debited.
+	Amount int64 `json:"amount"`
+
+	// TransferFee is Singapay's charge for the transfer, deducted from Amount.
+	TransferFee int64 `json:"transfer_fee"`
+
+	// NetAmount is what the beneficiary receives: Amount less TransferFee.
+	NetAmount int64 `json:"net_amount"`
+
+	Currency string `json:"currency"`
+	Message  string `json:"message"`
 }
 
 // Withdraw initiates a withdrawal from an account to an external bank account.
+//
+// The fee comes out of the requested amount, it is not charged on top of it. A seller who
+// asks to withdraw Rp 15.000 against a Rp 3.000 transfer fee has their balance debited
+// Rp 15.000 and receives Rp 12.000 — never Rp 18.000 off the balance for Rp 15.000
+// received. The requested amount is the whole cost to the seller, and every number here
+// derives from it:
+//
+//	requested (req.Amount, debited, reserved)  15.000
+//	  − transfer fee (quoted)                   3.000
+//	  = net (sent to Singapay, received)       12.000
+//
+// Singapay's arithmetic runs the other way: its disbursement amount is the net the
+// beneficiary receives and it adds the fee on top, debiting the sub-account net + fee.
+// Sending the net is therefore exactly what makes the sub-account debit come to the
+// requested amount, so the ledger's reservation and Singapay's debit agree.
+//
 // Flow:
 //  1. Look up Account by sellerID (owner_id)
-//  2. Quote the transfer fee, because Singapay debits Amount + fee
-//  3. Reserve: under a row lock, check the available balance against the GROSS and — in
-//     the same transaction — write the journal, the PENDING Disbursement carrying the
-//     reference number, and the debit that holds the money
-//  4. Send the payout under that reference
-//  5. Book the answer: complete it, leave it in flight, or release the reservation if the
+//  2. Quote the transfer fee, because it has to be carved out of the requested amount
+//  3. Refuse a request the fee would swallow — a net of zero or less is not a payout
+//  4. Reserve: under a row lock, check the available balance against the REQUESTED amount
+//     and — in the same transaction — write the journal, the PENDING Disbursement carrying
+//     the reference number, and the debit that holds the money
+//  5. Send the payout under that reference, for the NET
+//  6. Book the answer: complete it, leave it in flight, or release the reservation if the
 //     payout is known not to have happened
 //
 // Three things go wrong here if this order is disturbed, and they are different problems.
@@ -545,11 +576,10 @@ type WithdrawResponse struct {
 // and both pay out. Idempotency does not help — each is a distinct payout with its own
 // reference. Only holding the money at request time does.
 //
-// And the reservation must cover the fee. Singapay's disbursement amount is the NET the
-// beneficiary receives; the transfer fee is added on top, so the sub-account is debited
-// Amount + fee. Reserving only Amount leaves the ledger over-stating the seller's balance
-// by the fee on every payout, and the error is silent: the books stay internally
-// consistent and disagree only with Singapay.
+// And the fee must be quoted before the net is worked out, because the net is the
+// subtraction. A fee that could not be quoted is treated as zero, which sends the full
+// requested amount as the net and leaves the platform absorbing the fee — see
+// quotePayoutFee for why that is the chosen failure.
 func (c *LedgerClient) Withdraw(ctx context.Context, sellerID string, req *WithdrawRequest) (*WithdrawResponse, error) {
 	if req.AccountID == "" {
 		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "account_id is required", nil)
@@ -595,6 +625,17 @@ func (c *LedgerClient) Withdraw(ctx context.Context, sellerID string, req *Withd
 	disbursement.PayoutRequestID = uuid.NewString()
 	disbursement.GatewayFee = c.quotePayoutFee(ctx, account, disbursement)
 
+	// The fee is carved out of the request, so a request the fee would swallow has nothing
+	// left to send. Refused here rather than at the gateway: Singapay would reject a
+	// zero-or-negative transfer anyway, and by then the balance is already reserved and a
+	// row is already written for a payout that was never possible.
+	if disbursement.NetAmount() <= 0 {
+		return nil, ledgererr.ErrInvalidDisbursementAmount.WithError(
+			fmt.Errorf("requested %d leaves nothing after the %d transfer fee; withdraw more than the fee",
+				disbursement.Amount, disbursement.GatewayFee),
+		)
+	}
+
 	if err := c.reserveBalance(ctx, account, disbursement); err != nil {
 		return nil, err
 	}
@@ -602,14 +643,29 @@ func (c *LedgerClient) Withdraw(ctx context.Context, sellerID string, req *Withd
 	return c.executePayout(ctx, account, disbursement)
 }
 
-// quotePayoutFee asks Singapay what this payout will cost, so the reservation can cover
-// the gross.
+// quotePayoutFee asks Singapay what this payout will cost, so the fee can be carved out of
+// the requested amount.
+//
+// It quotes against the requested amount rather than the net it is about to work out,
+// which is only correct because the fee is flat rather than a percentage: for a flat fee
+// both quotes return the same number, whereas quoting the net would need the very fee the
+// quote is meant to produce. For bank transfers — the only destination this ledger pays
+// out to — Rp 3.000 flat is contractually agreed with Singapay, not merely observed, so
+// the assumption is guaranteed rather than inferred. Other destinations are flat too but
+// priced differently (Rp 2.500 to a wallet; see migration 020).
+//
+// It is still quoted per payout rather than hardcoded, so that a rate Singapay changes is
+// followed automatically instead of silently mispricing every withdrawal — and if the fee
+// ever becomes a percentage, this is the one place that assumption breaks: the quote would
+// then have to be solved for rather than read off.
 //
 // A failed quote is not a failed withdrawal. The quote endpoint takes a SWIFT code where
 // the transfer itself takes either a SWIFT or a three-digit national code, so an account
 // stored with a three-digit code cannot be quoted at all — and refusing every such payout
-// would be a worse outcome than under-reserving by the fee. The fee is left at zero and
-// logged; the disbursement still goes out, and the drift is visible in the log rather
+// would be a worse outcome than mispricing the fee. The fee is left at zero and logged:
+// the seller then receives the full amount they asked for, their balance still moves by
+// exactly that amount, and it is the platform sub-account that absorbs the transfer fee.
+// That is the right way round for the error to fall, and it is visible in the log rather
 // than invisible in the books.
 //
 // The quote is also a balance check: Singapay refuses it when the resulting gross would
@@ -619,11 +675,11 @@ func (c *LedgerClient) Withdraw(ctx context.Context, sellerID string, req *Withd
 func (c *LedgerClient) quotePayoutFee(ctx context.Context, account *domain.Account, disbursement *domain.Disbursement) int64 {
 	quote, err := c.gateway.CheckFee(ctx, account.SingapayAccountID, disbursement.BankAccount.BankCode, disbursement.Amount)
 	if err != nil {
-		c.logger.WarnContext(ctx, "Could not quote the payout fee — reserving the net only, which under-reserves by the transfer fee",
+		c.logger.WarnContext(ctx, "Could not quote the payout fee — sending the full requested amount, so the platform absorbs the transfer fee",
 			"disbursement_id", disbursement.UUID,
 			"account_id", account.UUID,
 			"bank_code", disbursement.BankAccount.BankCode,
-			"amount", disbursement.Amount,
+			"requested_amount", disbursement.Amount,
 			"error", err,
 		)
 		return 0
@@ -633,7 +689,7 @@ func (c *LedgerClient) quotePayoutFee(ctx context.Context, account *domain.Accou
 	if err != nil {
 		// Rupiah() refuses to round rather than silently truncating. A fractional fee
 		// is not something to guess at on the path that moves money.
-		c.logger.WarnContext(ctx, "Payout fee quote is not a whole rupiah amount — reserving the net only",
+		c.logger.WarnContext(ctx, "Payout fee quote is not a whole rupiah amount — sending the full requested amount instead",
 			"disbursement_id", disbursement.UUID,
 			"transfer_fee", quote.TransferFee.String(),
 			"error", err,
@@ -643,9 +699,9 @@ func (c *LedgerClient) quotePayoutFee(ctx context.Context, account *domain.Accou
 
 	c.logger.InfoContext(ctx, "Quoted payout fee",
 		"disbursement_id", disbursement.UUID,
-		"net_amount", disbursement.Amount,
+		"requested_amount", disbursement.Amount,
 		"transfer_fee", fee,
-		"gross_amount", disbursement.Amount+fee,
+		"net_amount", disbursement.Amount-fee,
 	)
 	return fee
 }
@@ -662,11 +718,11 @@ func (c *LedgerClient) quotePayoutFee(ctx context.Context, account *domain.Accou
 // The balance check therefore lives inside this transaction. Checking outside and writing
 // inside would be the same race with extra steps.
 //
-// What is reserved is the gross — net plus the quoted transfer fee — because that is what
-// Singapay will debit.
+// What is reserved is the requested amount and nothing more. The transfer fee is already
+// inside it — the payout goes out for the net — so Singapay's debit of net + fee comes to
+// the same number. Reserving the requested amount plus the fee would charge the seller the
+// fee twice: once by shrinking what they receive, once again against their balance.
 func (c *LedgerClient) reserveBalance(ctx context.Context, account *domain.Account, disbursement *domain.Disbursement) error {
-	gross := disbursement.Amount + disbursement.GatewayFee
-
 	err := c.txProvider.Transact(ctx, func(tx repo.Tx) error {
 		if _, err := tx.Account().GetByIDForUpdate(ctx, account.UUID); err != nil {
 			return ledgererr.NewError(ledgererr.CodeInternal, "failed to lock account for withdrawal", err)
@@ -677,16 +733,16 @@ func (c *LedgerClient) reserveBalance(ctx context.Context, account *domain.Accou
 			return ledgererr.NewError(ledgererr.CodeInternal, "failed to derive available balance", err)
 		}
 
-		if gross > available {
+		if disbursement.Amount > available {
 			c.logger.WarnContext(ctx, "Insufficient available balance for withdrawal",
 				"account_id", account.UUID,
 				"requested_amount", disbursement.Amount,
 				"transfer_fee", disbursement.GatewayFee,
-				"required_gross", gross,
+				"net_amount", disbursement.NetAmount(),
 				"available_balance", available,
 			)
 			return ledgererr.ErrInsufficientBalance.WithError(
-				fmt.Errorf("requested: %d + fee %d = %d, available: %d", disbursement.Amount, disbursement.GatewayFee, gross, available),
+				fmt.Errorf("requested: %d, available: %d", disbursement.Amount, available),
 			)
 		}
 
@@ -706,20 +762,21 @@ func (c *LedgerClient) reserveBalance(ctx context.Context, account *domain.Accou
 // writeReservation persists the journal, the PENDING disbursement and the debit that holds
 // the money. Caller owns the transaction and any locking.
 //
-// The debit is the gross. A reversal, when one is written, reverses the same amount — the
-// two must always agree, or releasing a refused payout would hand back more or less than
-// was held.
+// The debit is the requested amount — the fee is inside it, not on top of it. A reversal,
+// when one is written, reverses the same amount; the two must always agree, or releasing a
+// refused payout would hand back more or less than was held.
 func (c *LedgerClient) writeReservation(ctx context.Context, tx repo.Tx, account *domain.Account, disbursement *domain.Disbursement) error {
-	gross := disbursement.Amount + disbursement.GatewayFee
-
 	journal := domain.NewJournal(
 		domain.EventTypeDisbursement,
 		domain.SourceTypeDisbursement,
 		disbursement.UUID,
 		map[string]any{
+			// "amount" is the requested amount and the size of the debit. net_amount is
+			// what the beneficiary receives. Both are recorded because the difference
+			// between them is the only trace the fee leaves on the seller's books.
 			"amount":       disbursement.Amount,
 			"transfer_fee": disbursement.GatewayFee,
-			"gross_amount": gross,
+			"net_amount":   disbursement.NetAmount(),
 			"bank_code":    disbursement.BankAccount.BankCode,
 			"stage":        "RESERVED",
 		},
@@ -730,7 +787,7 @@ func (c *LedgerClient) writeReservation(ctx context.Context, tx repo.Tx, account
 	if err := tx.Disbursement().Save(ctx, disbursement); err != nil {
 		return err
 	}
-	return tx.LedgerEntry().Save(ctx, domain.NewDisbursementEntry(journal.UUID, disbursement.UUID, account.UUID, gross))
+	return tx.LedgerEntry().Save(ctx, domain.NewDisbursementEntry(journal.UUID, disbursement.UUID, account.UUID, disbursement.Amount))
 }
 
 // RetryDisbursement resolves a payout that never reached a settled outcome.
@@ -887,8 +944,9 @@ func (c *LedgerClient) ensureReserved(ctx context.Context, account *domain.Accou
 	c.logger.WarnContext(ctx, "Disbursement has no reservation entry — backfilling before retry",
 		"disbursement_id", disbursement.UUID,
 		"account_id", account.UUID,
-		"amount", disbursement.Amount,
+		"requested_amount", disbursement.Amount,
 		"transfer_fee", disbursement.GatewayFee,
+		"net_amount", disbursement.NetAmount(),
 	)
 
 	err = c.txProvider.Transact(ctx, func(tx repo.Tx) error {
@@ -906,12 +964,17 @@ func (c *LedgerClient) ensureReserved(ctx context.Context, account *domain.Accou
 // in the ledger — written before the call went out. So the only question left is whether
 // to give it back, and that question is answered by Outcome, never by the HTTP status.
 func (c *LedgerClient) executePayout(ctx context.Context, account *domain.Account, disbursement *domain.Disbursement) (*WithdrawResponse, error) {
+	// The NET goes on the wire, never the requested amount. Singapay treats this field as
+	// what the beneficiary receives and debits the sub-account this plus the fee, so
+	// sending the net is what brings that debit to the requested amount — the very amount
+	// already reserved. Sending the requested amount here would debit the sub-account
+	// requested + fee and put the drift back.
 	payoutReq := singapay.DisburseRequest{
 		AccountID:         account.SingapayAccountID,
 		ReferenceNumber:   disbursement.PayoutRequestID,
 		BankCode:          disbursement.BankAccount.BankCode,
 		BankAccountNumber: disbursement.BankAccount.AccountNumber,
-		Amount:            disbursement.Amount,
+		Amount:            disbursement.NetAmount(),
 		Notes:             disbursement.UUID,
 	}
 
@@ -925,8 +988,9 @@ func (c *LedgerClient) executePayout(ctx context.Context, account *domain.Accoun
 		// blank account_id, and Singapay answers with a not-found rather than a clear
 		// validation error.
 		"singapay_account_id_empty", account.SingapayAccountID == "",
-		"net_amount", disbursement.Amount,
+		"requested_amount", disbursement.Amount,
 		"transfer_fee", disbursement.GatewayFee,
+		"net_amount", disbursement.NetAmount(),
 		"payout_reference", disbursement.PayoutRequestID,
 		"request_target", "/api/v2.0/disbursement/transfer",
 		"request_body", payoutRequestLogBody(payoutReq),
@@ -952,7 +1016,6 @@ func (c *LedgerClient) executePayout(ctx context.Context, account *domain.Accoun
 //	01, 02, 03   still in flight — hold the reservation and wait
 func (c *LedgerClient) bookPayoutOutcome(ctx context.Context, account *domain.Account, disbursement *domain.Disbursement, result *singapay.Disbursement) (*WithdrawResponse, error) {
 	status := result.TransactionStatus()
-	gross := disbursement.Amount + disbursement.GatewayFee
 
 	c.logger.InfoContext(ctx, "Singapay disbursement outcome",
 		"disbursement_id", disbursement.UUID,
@@ -962,16 +1025,20 @@ func (c *LedgerClient) bookPayoutOutcome(ctx context.Context, account *domain.Ac
 		"failed_reason", result.FailedReason,
 	)
 
-	// If Singapay reports a fee different from the one quoted, the reservation is wrong.
-	// It is recorded but not re-reserved here: changing the held amount after the money
-	// has moved would need its own compensating entry, and a quiet adjustment on this
-	// path is exactly the kind of thing that makes a balance impossible to explain.
+	// If Singapay charges a fee other than the one quoted, the payout has already gone out
+	// for a net computed from the quote, so the sub-account is debited net + actual fee
+	// while the seller's balance moved by the requested amount. The difference lands on
+	// the platform. It is recorded but not adjusted here: a compensating entry written
+	// after the money has moved, on this path, is exactly the kind of quiet correction
+	// that makes a balance impossible to explain afterwards.
 	if actualFee, err := result.Fee.Rupiah(); err == nil && result.Fee.Set && actualFee != disbursement.GatewayFee {
-		c.logger.WarnContext(ctx, "Singapay charged a different transfer fee than was quoted — the reservation is off by the difference",
+		c.logger.WarnContext(ctx, "Singapay charged a different transfer fee than was quoted — the platform absorbs the difference",
 			"disbursement_id", disbursement.UUID,
 			"quoted_fee", disbursement.GatewayFee,
 			"actual_fee", actualFee,
 			"difference", actualFee-disbursement.GatewayFee,
+			"requested_amount", disbursement.Amount,
+			"net_sent", disbursement.NetAmount(),
 		)
 	}
 
@@ -1006,7 +1073,7 @@ func (c *LedgerClient) bookPayoutOutcome(ctx context.Context, account *domain.Ac
 		map[string]any{
 			"amount":             disbursement.Amount,
 			"transfer_fee":       disbursement.GatewayFee,
-			"gross_amount":       gross,
+			"net_amount":         disbursement.NetAmount(),
 			"bank_code":          disbursement.BankAccount.BankCode,
 			"transaction_status": string(status),
 			"transaction_id":     result.TransactionID,
@@ -1023,12 +1090,14 @@ func (c *LedgerClient) bookPayoutOutcome(ctx context.Context, account *domain.Ac
 		}
 
 		if reverse {
-			if err := tx.LedgerEntry().Save(ctx, domain.NewDisbursementReversalEntry(settlementJournal.UUID, disbursement.UUID, account.UUID, gross)); err != nil {
+			// Reverses exactly what writeReservation held: the requested amount.
+			if err := tx.LedgerEntry().Save(ctx, domain.NewDisbursementReversalEntry(settlementJournal.UUID, disbursement.UUID, account.UUID, disbursement.Amount)); err != nil {
 				return err
 			}
 		}
 
-		// If disbursement is COMPLETED, increment total_withdrawal_amount
+		// If disbursement is COMPLETED, increment total_withdrawal_amount by what the
+		// seller was actually charged — the requested amount, fee included.
 		if disbursement.IsCompleted() {
 			if err := tx.Account().IncrementWithdrawal(ctx, account.UUID, disbursement.Amount); err != nil {
 				c.logger.WarnContext(ctx, "Failed to increment withdrawal amount",
@@ -1060,7 +1129,9 @@ func (c *LedgerClient) bookPayoutOutcome(ctx context.Context, account *domain.Ac
 	c.logger.InfoContext(ctx, "Withdrawal booked",
 		"disbursement_id", disbursement.UUID,
 		"status", disbursement.Status,
-		"amount", disbursement.Amount,
+		"requested_amount", disbursement.Amount,
+		"transfer_fee", disbursement.GatewayFee,
+		"net_amount", disbursement.NetAmount(),
 	)
 
 	return &WithdrawResponse{
@@ -1068,6 +1139,7 @@ func (c *LedgerClient) bookPayoutOutcome(ctx context.Context, account *domain.Ac
 		Status:         string(disbursement.Status),
 		Amount:         disbursement.Amount,
 		TransferFee:    disbursement.GatewayFee,
+		NetAmount:      disbursement.NetAmount(),
 		Currency:       string(disbursement.Currency),
 		Message:        fmt.Sprintf("Payout %s", status),
 	}, nil
@@ -1156,15 +1228,16 @@ func (c *LedgerClient) recordPayoutFailure(ctx context.Context, account *domain.
 			"disbursement_id", disbursement.UUID,
 			"payout_reference", disbursement.PayoutRequestID,
 			"outcome", outcome.String(),
-			"amount", disbursement.Amount,
+			"requested_amount", disbursement.Amount,
+			"net_amount", disbursement.NetAmount(),
 		)
 		return ledgererr.ErrGatewayOutcomeUnknown.WithError(
 			fmt.Errorf("outcome %s (code %s, http %d): %w", outcome, code, statusCode, gwErr))
 	}
 
 	// Known refusal: no money left, so the reservation goes back to the available balance
-	// and the row reaches its terminal state.
-	gross := disbursement.Amount + disbursement.GatewayFee
+	// and the row reaches its terminal state. What goes back is the requested amount,
+	// because that is what writeReservation held.
 	if err := disbursement.MarkFailed(fmt.Sprintf("Singapay refused the payout (%s): %v", code, gwErr)); err == nil {
 		reversalJournal := domain.NewJournal(
 			domain.EventTypeDisbursement,
@@ -1173,7 +1246,7 @@ func (c *LedgerClient) recordPayoutFailure(ctx context.Context, account *domain.
 			map[string]any{
 				"amount":        disbursement.Amount,
 				"transfer_fee":  disbursement.GatewayFee,
-				"gross_amount":  gross,
+				"net_amount":    disbursement.NetAmount(),
 				"bank_code":     disbursement.BankAccount.BankCode,
 				"response_code": string(code),
 				"stage":         "REVERSED",
@@ -1187,7 +1260,7 @@ func (c *LedgerClient) recordPayoutFailure(ctx context.Context, account *domain.
 			if err := tx.Disbursement().Save(ctx, disbursement); err != nil {
 				return err
 			}
-			return tx.LedgerEntry().Save(ctx, domain.NewDisbursementReversalEntry(reversalJournal.UUID, disbursement.UUID, account.UUID, gross))
+			return tx.LedgerEntry().Save(ctx, domain.NewDisbursementReversalEntry(reversalJournal.UUID, disbursement.UUID, account.UUID, disbursement.Amount))
 		})
 		if saveErr != nil {
 			// The seller's money is held by a reservation that no longer corresponds to
@@ -1195,7 +1268,7 @@ func (c *LedgerClient) recordPayoutFailure(ctx context.Context, account *domain.
 			c.logger.ErrorContext(ctx, "CRITICAL: payout refused but the reservation could not be released — balance is understated",
 				"disbursement_id", disbursement.UUID,
 				"account_id", account.UUID,
-				"gross_amount", gross,
+				"reserved_amount", disbursement.Amount,
 				"error", saveErr,
 			)
 		}

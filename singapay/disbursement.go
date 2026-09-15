@@ -71,8 +71,12 @@ type DisburseRequest struct {
 	// Amount is the NET amount in whole rupiah — what the beneficiary receives. The
 	// transfer fee is added on top, so the account is debited Amount + fee.
 	//
-	// A caller that reserves only Amount will drift from Singapay's balance by the fee
-	// on every payout. Quote with [Client.CheckFee] and reserve the gross.
+	// Whatever a caller means by "the withdrawal amount", it has to decide which side of
+	// that addition it is on and put the right number here. The ledger treats the amount
+	// a seller requests as the account debit, so it quotes with [Client.CheckFee] and
+	// sends requested − fee; a caller that instead means "pay the beneficiary exactly
+	// this" sends it directly and must reserve Amount + fee. Sending the wrong one drifts
+	// from Singapay's balance by the fee on every payout, silently.
 	Amount int64 `json:"amount"`
 
 	Notes string `json:"notes,omitempty"`

@@ -85,8 +85,9 @@ func TestDisburseSuccess(t *testing.T) {
 		t.Error("00 must report as succeeded")
 	}
 
-	// gross = net + fee, and the account is debited the gross. A caller that reserves
-	// only the net drifts from Singapay's balance by the fee on every payout.
+	// gross = net + fee, and the account is debited the gross. This is the arithmetic a
+	// caller has to work backwards through if what it holds is a requested amount rather
+	// than a beneficiary amount.
 	if got.GrossAmount.Minor() != got.NetAmount.Minor()+got.Fee.Minor() {
 		t.Errorf("gross %s != net %s + fee %s", got.GrossAmount, got.NetAmount, got.Fee)
 	}
