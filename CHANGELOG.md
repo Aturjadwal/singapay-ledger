@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed — the money-out webhook reports what it booked
+
+**Breaking.** `HandleDisbursementNotification` returns `(*DisbursementOutcome, error)`
+where it returned `error`. Callers that only checked the error add one ignored return
+value; callers that want to react to a settled payout now can.
+
+A payout settles asynchronously, and until now the only thing this package told the
+caller about a delivery was whether it failed. A caller that wanted to email the seller
+"your withdrawal arrived" had two options, and both were wrong: parse the webhook body
+itself — bytes whose signature only this package has checked — or query the
+`disbursements` table, which this package owns.
+
+So the handler now says what it did. `DisbursementOutcome` carries the row as it stands
+after booking, the seller id the caller knows its users by (not this package's account
+uuid), and `Booked`, which is false when the delivery arrived for a row that was already
+terminal. That last field is what lets a caller act exactly once per outcome without
+keeping its own record of the deliveries it has seen: a redelivery still returns the row,
+it just does not claim to have settled it.
+
+A delivery for another product on the shared money-out URL returns an empty outcome and a
+nil error, as before — it is genuine, and it settled nothing.
+
+
 ### Fixed — the disbursement fee comes out of the withdrawal, not on top of it
 
 **Breaking.** `disbursements.amount` changes meaning, `WithdrawResponse` gains a field, and

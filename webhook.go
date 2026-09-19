@@ -298,8 +298,44 @@ func (c *LedgerClient) HandlePaymentSuccess(ctx context.Context, req singapay.We
 	return nil
 }
 
+// DisbursementOutcome is what a money-out delivery did, in the vocabulary a caller
+// can act on.
+//
+// It exists so that reacting to a settled payout — emailing the seller, moving a
+// projection — needs neither the raw webhook body nor a query against the
+// disbursements table. Both belong to this package: the body is only trustworthy
+// after the signature check that happens here, and the table is this package's to
+// read. A caller that parsed the payload itself would be re-deriving, from bytes it
+// has not verified, a fact this handler already established.
+type DisbursementOutcome struct {
+	// Disbursement is the payout as it stands once the delivery has been booked.
+	//
+	// Nil means the delivery settled nothing this caller can act on: it announced
+	// another product on the shared money-out URL, or it named a reference this
+	// ledger has no row for. Both are ordinary and neither is an error.
+	Disbursement *Disbursement
+
+	// SellerID is the owner of the account the payout was made from — the id the
+	// caller knows its own users by, not this package's account uuid. Empty
+	// whenever Disbursement is nil.
+	SellerID string
+
+	// Booked reports whether THIS delivery is what moved the row.
+	//
+	// False with a non-nil Disbursement means the row was already terminal when the
+	// delivery arrived, which is what a redelivery looks like. The row is still
+	// returned, because "already COMPLETED" is a useful answer and the caller should
+	// not have to ask again to get it — but a caller that acts once per outcome
+	// should act on Booked, not on the status.
+	Booked bool
+}
+
+// Disbursement is domain.Disbursement, re-exported so a caller reading an outcome
+// does not have to import the domain package to name its type.
+type Disbursement = domain.Disbursement
+
 // HandleDisbursementNotification books the outcome of a payout Singapay has finished
-// deciding on.
+// deciding on, and reports what it booked.
 //
 // This handler is not optional the way a money-in one might be. A Singapay payout is
 // asynchronous: the transfer call answers SP000 to say the instruction was accepted, and
@@ -309,18 +345,23 @@ func (c *LedgerClient) HandlePaymentSuccess(ctx context.Context, req singapay.We
 //
 // The payload's Data is the same shape the transfer and inquiry endpoints return, so it is
 // booked through the same code path as those — one set of rules for all three.
-func (c *LedgerClient) HandleDisbursementNotification(ctx context.Context, req singapay.WebhookRequest) error {
+//
+// The returned outcome is how a caller learns a payout reached its end without going
+// near the payload or the table. A nil error and an outcome with no disbursement means
+// the delivery was genuine and settled nothing — another product, or a reference this
+// ledger never issued.
+func (c *LedgerClient) HandleDisbursementNotification(ctx context.Context, req singapay.WebhookRequest) (*DisbursementOutcome, error) {
 	if err := c.gateway.VerifyWebhook(req); err != nil {
 		c.logger.WarnContext(ctx, "Rejected a money-out webhook that failed signature verification",
 			"endpoint", req.Endpoint,
 			"error", err,
 		)
-		return ledgererr.ErrWebhookVerificationFailed.WithError(err)
+		return nil, ledgererr.ErrWebhookVerificationFailed.WithError(err)
 	}
 
 	notification, err := singapay.ParseMoneyOutNotification(req.Body)
 	if err != nil {
-		return ledgererr.NewError(ledgererr.CodeInvalidRequest, "could not parse money-out notification", err)
+		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "could not parse money-out notification", err)
 	}
 
 	c.warnIfStale(ctx, "money-out", req.Timestamp)
@@ -330,12 +371,12 @@ func (c *LedgerClient) HandleDisbursementNotification(ctx context.Context, req s
 	if notification.Event != "" && notification.Event != singapay.EventDisbursement {
 		c.logger.InfoContext(ctx, "Ignoring a money-out notification for another product",
 			"event", notification.Event)
-		return nil
+		return &DisbursementOutcome{}, nil
 	}
 
 	reference := notification.Data.ReferenceNumber
 	if reference == "" {
-		return ledgererr.NewError(ledgererr.CodeInvalidRequest,
+		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest,
 			"money-out notification carries no reference number; it cannot be matched to a disbursement", nil)
 	}
 
@@ -349,31 +390,46 @@ func (c *LedgerClient) HandleDisbursementNotification(ctx context.Context, req s
 				"reference_number", reference,
 				"transaction_id", notification.Data.TransactionID,
 			)
-			return ledgererr.ErrDisbursementNotFound.WithError(err)
+			return nil, ledgererr.ErrDisbursementNotFound.WithError(err)
 		}
-		return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to load disbursement", err)
+		return nil, ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to load disbursement", err)
+	}
+
+	account, err := c.repoProvider.Account().GetByID(ctx, disbursement.LedgerUUID)
+	if err != nil {
+		return nil, ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to get account for disbursement", err)
 	}
 
 	// Terminal rows are left alone. A retried delivery for a payout already booked
 	// COMPLETED or FAILED must not write a second reversal.
+	//
+	// It is still reported back, with Booked false: "this payout is already
+	// COMPLETED" is the honest answer to a redelivery, and a caller that has to
+	// distinguish a first settlement from a repeat should be told rather than left
+	// to infer it from a nil.
 	if !disbursement.IsPending() && !disbursement.IsProcessing() {
 		c.logger.InfoContext(ctx, "Money-out notification for an already terminal disbursement — nothing to do",
 			"disbursement_id", disbursement.UUID,
 			"status", disbursement.Status,
 		)
-		return nil
-	}
-
-	account, err := c.repoProvider.Account().GetByID(ctx, disbursement.LedgerUUID)
-	if err != nil {
-		return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to get account for disbursement", err)
+		return &DisbursementOutcome{
+			Disbursement: disbursement,
+			SellerID:     account.OwnerID,
+		}, nil
 	}
 
 	data := notification.Data
 	if _, err := c.bookPayoutOutcome(ctx, account, disbursement, &data); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+
+	// bookPayoutOutcome mutated the row in place before persisting it, so this is the
+	// status the delivery just wrote, not the one it arrived to.
+	return &DisbursementOutcome{
+		Disbursement: disbursement,
+		SellerID:     account.OwnerID,
+		Booked:       true,
+	}, nil
 }
 
 // warnIfStale logs a verified delivery that arrived outside the replay window, and
