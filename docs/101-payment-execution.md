@@ -16,8 +16,15 @@ sequenceDiagram
     Note right of LedgerAPI: The channel selects the product:<br/>QRIS / VA_* / EWALLET_* / payment link
     LedgerAPI->>Singapay: Create VA, QRIS, e-wallet order, or payment link
     Singapay-->>LedgerAPI: VA number, QR payload, or checkout URL
-    LedgerAPI->>LedgerAPI: Save ProductTransaction (PENDING) + PaymentRequest (PENDING)
+    LedgerAPI->>LedgerAPI: Save ProductTransaction (PENDING) + PaymentRequest
+    Note right of LedgerAPI: Only the transaction carries a status;<br/>the payment request has none by design
     LedgerAPI-->>Frontend: Payment info
+
+    %% Step 1b: The payer comes back later
+    Payer->>Frontend: Reopen the payment (link in an email or message)
+    Frontend->>LedgerAPI: GetPaymentByInvoiceNumber
+    LedgerAPI-->>Frontend: Same instrument, plus Status and IsExpired
+    Note right of LedgerAPI: PENDING and not expired → show it again.<br/>Anything else → do not issue a second payment<br/>without saying why
 
     %% Step 2: Payment confirmation
     Payer->>Singapay: Complete payment
@@ -30,8 +37,7 @@ sequenceDiagram
     LedgerAPI->>LedgerAPI: Resolve the merchant reference to an invoice
     Note right of LedgerAPI: Every channel puts it somewhere different;<br/>a payment link's transaction.reff_no is an<br/>ATTEMPT id, not the reference we sent
     LedgerAPI->>LedgerAPI: Already booked? → no-op (Singapay retries)
-    LedgerAPI->>LedgerAPI: PaymentRequest → COMPLETED
-    LedgerAPI->>LedgerAPI: ProductTransaction → COMPLETED
+    LedgerAPI->>LedgerAPI: ProductTransaction PENDING → COMPLETED (compare-and-set)
     end
 
     %% Step 3: Ledger recording

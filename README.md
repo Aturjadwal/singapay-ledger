@@ -190,6 +190,25 @@ resp, err := client.GeneratePaymentGatewayOnCustomer(ctx, req)
 resp, err := client.GeneratePaymentGatewayOnSeller(ctx, req)
 ```
 
+### Reading a payment back
+
+`GetPaymentByInvoiceNumber` returns an issued payment as it stands now, so a payer who
+walked away can be handed the same instrument instead of a second one.
+
+```go
+payment, err := client.GetPaymentByInvoiceNumber(ctx, "INV-20260910143012-A1B2C3")
+// payment.Status      — PENDING, COMPLETED, SETTLED, FAILED, REFUNDED
+// payment.PaymentCode — the VA number or QRIS payload to render again
+// payment.IsExpired   — the instrument lapsed at the gateway; issue a new one
+```
+
+Read `Status` and `IsExpired` together. They answer different questions and neither is
+enough alone: `Status` says whether the invoice still wants paying, and only
+`product_transactions.status` knows that; `IsExpired` says whether the number on the page
+is still alive, and nothing in this library sweeps on it — a lapsed instrument leaves its
+transaction `PENDING` forever. Still `PENDING` and not expired is the one case where the
+old instrument can be shown again.
+
 ### Subscription payments
 
 `GenerateSubscriptionPayment` creates a platform subscription payment. There is no seller —

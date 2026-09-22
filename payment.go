@@ -595,6 +595,119 @@ func (c *LedgerClient) CalculateFeesForCustomer(ctx context.Context, sellerPrice
 	}, nil
 }
 
+// PaymentStatusResponse is a payment read back after it was issued, in the shape a payer
+// facing page needs to resume it.
+//
+// GeneratePaymentResponse answers "what did I just create?" and is returned once. This
+// answers "what is this invoice now?", which is a different question in one respect that
+// matters: it carries Status. An instrument alone cannot say whether it still wants
+// paying — product_transactions.status is the only place that is known — so a caller that
+// reopened a page on PaymentCode alone would show a virtual account number for a booking
+// that was paid an hour ago.
+type PaymentStatusResponse struct {
+	TransactionID string `json:"transaction_id"`
+	InvoiceNumber string `json:"invoice_number"`
+
+	// Status is the transaction's, not the instrument's: PENDING, COMPLETED, SETTLED,
+	// FAILED or REFUNDED. Only PENDING still wants paying.
+	Status string `json:"status"`
+
+	ProductID   string `json:"product_id"`
+	ProductType string `json:"product_type"`
+
+	// PaymentChannel is the channel the instrument was issued on, PAYMENT_LINK included.
+	PaymentChannel string `json:"payment_channel"`
+	// PaymentURL is set for the redirect channels (e-wallet, payment link) and empty for
+	// QRIS and virtual account, exactly as at creation.
+	PaymentURL string `json:"payment_url,omitempty"`
+	// PaymentCode is the virtual account number, or the QRIS payload to render.
+	PaymentCode string `json:"payment_code,omitempty"`
+
+	// ExpiresAt is the deadline the instrument was issued with, Unix seconds, and
+	// IsExpired reports that it has passed. The ledger does not sweep on it — an
+	// instrument lapses at the gateway and its transaction simply stays PENDING — so a
+	// caller reading IsExpired on a PENDING transaction is reading the one signal that
+	// says "this number is dead, issue a new one".
+	ExpiresAt int64 `json:"expires_at"`
+	IsExpired bool  `json:"is_expired"`
+
+	// The priced breakdown, as at checkout. TotalCharged is what the payer owes and what
+	// a closed virtual account will accept; the rest is here so a page can itemise it
+	// without a second call.
+	SellerPrice     int64  `json:"seller_price"`
+	SellerNetAmount int64  `json:"seller_net_amount"`
+	PlatformFee     int64  `json:"platform_fee"`
+	GatewayFee      int64  `json:"gateway_fee"`
+	TotalCharged    int64  `json:"total_charged"`
+	FeeModel        string `json:"fee_model"`
+	Currency        string `json:"currency"`
+
+	// CompletedAt is when the payer paid, SettledAt when Singapay released the funds.
+	// Both nil while the transaction is PENDING.
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	SettledAt   *time.Time `json:"settled_at,omitempty"`
+
+	// Metadata is what the caller attached at creation — for a booking, which terms and
+	// which additional charges this invoice covers.
+	Metadata map[string]any `json:"metadata,omitempty"`
+}
+
+// GetPaymentByInvoiceNumber reads back the payment issued for an invoice.
+//
+// The invoice number is the key rather than the transaction UUID because it is the
+// identifier that survives everywhere a payment is referred to — it is the merchant
+// reference at Singapay, what the money-in webhook resolves, and what a consumer stores
+// beside its own rows. A consumer holding a transaction UUID holds the invoice too.
+//
+// A transaction with no payment request is a transaction whose instrument was never
+// issued, which GeneratePayment cannot produce: the two rows are written in one database
+// transaction. It is reported as not found rather than as a payment with empty fields,
+// because an empty PaymentCode rendered on a page is indistinguishable from a bug.
+func (c *LedgerClient) GetPaymentByInvoiceNumber(ctx context.Context, invoiceNumber string) (*PaymentStatusResponse, error) {
+	if invoiceNumber == "" {
+		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "invoice_number is required", nil)
+	}
+
+	transaction, err := c.repoProvider.ProductTransaction().GetByInvoiceNumber(ctx, invoiceNumber)
+	if err != nil {
+		if ledgererr.IsAppError(err, repo.ErrNotFound) {
+			return nil, ledgererr.ErrProductTransactionNotFound.WithError(err)
+		}
+		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to read the product transaction", err)
+	}
+
+	paymentRequest, err := c.repoProvider.PaymentRequest().GetByProductTransactionID(ctx, transaction.UUID)
+	if err != nil {
+		if ledgererr.IsAppError(err, repo.ErrNotFound) {
+			return nil, ledgererr.ErrPaymentRequestNotFound.WithError(err)
+		}
+		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to read the payment request", err)
+	}
+
+	return &PaymentStatusResponse{
+		TransactionID:   transaction.UUID,
+		InvoiceNumber:   transaction.InvoiceNumber,
+		Status:          string(transaction.Status),
+		ProductID:       transaction.ProductID,
+		ProductType:     transaction.ProductType,
+		PaymentChannel:  paymentRequest.PaymentChannel,
+		PaymentURL:      paymentRequest.PaymentURL,
+		PaymentCode:     paymentRequest.PaymentCode,
+		ExpiresAt:       paymentRequest.ExpiresAt.Unix(),
+		IsExpired:       paymentRequest.HasExpired(),
+		SellerPrice:     transaction.Fee.SellerPrice,
+		SellerNetAmount: transaction.Fee.SellerNetAmount,
+		PlatformFee:     transaction.Fee.PlatformFee,
+		GatewayFee:      transaction.Fee.GatewayFee,
+		TotalCharged:    transaction.Fee.TotalCharged,
+		FeeModel:        string(transaction.Fee.FeeModel),
+		Currency:        string(transaction.Fee.Currency),
+		CompletedAt:     transaction.CompletedAt,
+		SettledAt:       transaction.SettledAt,
+		Metadata:        transaction.Metadata,
+	}, nil
+}
+
 // GetPaymentChannelFeeConfigs returns all fee configurations excluding the PLATFORM config.
 // Use this to present available payment channels and their fee details to end users.
 func (c *LedgerClient) GetPaymentChannelFeeConfigs(ctx context.Context) ([]*domain.FeeConfig, error) {

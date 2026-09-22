@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added — a payment can be read back after it was issued
+
+`GetPaymentByInvoiceNumber(ctx, invoiceNumber) (*PaymentStatusResponse, error)`.
+
+`GeneratePayment` returned the instrument once and that was the only time a consumer ever
+saw it. A payer who left the page — closed the tab, followed a link from a message hours
+later — could not be shown the virtual account number again, so the only thing a consumer
+could do was issue a second payment for a booking that already had one outstanding.
+
+The response carries the instrument (`PaymentCode`, `PaymentURL`, `PaymentChannel`), the
+transaction's `Status`, the priced fee breakdown and the metadata attached at creation.
+`Status` and `IsExpired` answer different questions and are both needed: `Status` says
+whether the invoice still wants paying, `IsExpired` whether the number on the page is
+still alive. Nothing here sweeps expiry — a lapsed instrument leaves its transaction
+`PENDING` — so `PENDING` and not expired is the one state in which the old instrument can
+be shown again.
+
+Read-only. No schema change, no gateway call.
+
+
 ### Changed — the money-out webhook reports what it booked
 
 **Breaking.** `HandleDisbursementNotification` returns `(*DisbursementOutcome, error)`
