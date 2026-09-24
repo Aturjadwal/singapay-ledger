@@ -151,7 +151,7 @@ resp, err := client.GeneratePayment(ctx, &ledger.GeneratePaymentRequest{
     SellerAccountID: "seller-uuid",
     BuyerAccountID:  "buyer-uuid",
     BuyerName:       "Jane Doe",
-    BuyerEmail:      "jane@example.com",
+    BuyerEmail:      "jane@example.com", // optional
     ProductID:       "prod-123",
     ProductType:     "PHOTO",
     SellerPrice:     100000,       // whole rupiah
@@ -219,7 +219,7 @@ sub-account.
 resp, err := client.GenerateSubscriptionPayment(ctx, &ledger.GenerateSubscriptionPaymentRequest{
     BuyerAccountID:    "buyer-uuid",
     BuyerName:         "Jane Doe",
-    BuyerEmail:        "jane@example.com",
+    BuyerEmail:        "jane@example.com", // optional
     ProductID:         "plan-pro",
     SubscriptionPrice: 99000,
     Currency:          "IDR",

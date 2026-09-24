@@ -21,7 +21,10 @@ type GeneratePaymentRequest struct {
 	// Buyer information
 	BuyerAccountID string `json:"buyer_account_id"`
 	BuyerName      string `json:"buyer_name"`
-	BuyerEmail     string `json:"buyer_email"`
+	// BuyerEmail is optional. Singapay does not ask for one: a virtual account and a QRIS
+	// charge never receive it, and an e-wallet order sends it only when it is set. Leave it
+	// empty for a payer who gave none.
+	BuyerEmail string `json:"buyer_email"`
 
 	// Product information
 	ProductID   string         `json:"product_id"`
@@ -237,7 +240,9 @@ type GenerateSubscriptionPaymentRequest struct {
 	// Buyer information
 	BuyerAccountID string `json:"buyer_account_id"`
 	BuyerName      string `json:"buyer_name"`
-	BuyerEmail     string `json:"buyer_email"`
+	// BuyerEmail is optional: the payment link takes it only as a pre-fill, and leaves it
+	// out when empty.
+	BuyerEmail string `json:"buyer_email"`
 
 	// Subscription information
 	ProductID         string         `json:"product_id"`
@@ -726,9 +731,7 @@ func (c *LedgerClient) validateGenerateSubscriptionPaymentRequest(req *GenerateS
 	if req.BuyerName == "" {
 		return ledgererr.NewError(ledgererr.CodeInvalidRequest, "buyer_name is required", nil)
 	}
-	if req.BuyerEmail == "" {
-		return ledgererr.NewError(ledgererr.CodeInvalidRequest, "buyer_email is required", nil)
-	}
+	// No buyer_email check: the email is optional. See GenerateSubscriptionPaymentRequest.
 	if req.ProductID == "" {
 		return ledgererr.NewError(ledgererr.CodeInvalidRequest, "product_id is required", nil)
 	}
@@ -755,9 +758,7 @@ func (c *LedgerClient) validateGeneratePaymentRequest(req *GeneratePaymentReques
 	if req.BuyerName == "" {
 		return ledgererr.NewError(ledgererr.CodeInvalidRequest, "buyer_name is required", nil)
 	}
-	if req.BuyerEmail == "" {
-		return ledgererr.NewError(ledgererr.CodeInvalidRequest, "buyer_email is required", nil)
-	}
+	// No buyer_email check: the email is optional. See GeneratePaymentRequest.
 	if req.ProductID == "" {
 		return ledgererr.NewError(ledgererr.CodeInvalidRequest, "product_id is required", nil)
 	}

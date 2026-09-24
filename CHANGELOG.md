@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed — a payment no longer requires the buyer's email
+
+`GeneratePayment` and `GenerateSubscriptionPayment` accept an empty `BuyerEmail`. Both used
+to refuse it with `buyer_email is required` (`CodeInvalidRequest`), before the gateway was
+ever called.
+
+Singapay never asked for it. A virtual account and a QRIS charge do not receive the email at
+all, and an e-wallet order and a payment link take it only as an optional pre-fill, leaving
+the field out when it is empty. So the check refused payers Singapay would have charged: a
+consumer whose customers may book without an email could not bill them without inventing an
+address to satisfy it.
+
+Not breaking. A request that passed before passes now, and a given email is still forwarded
+exactly as before.
+
+
 ### Added — a payment can be read back after it was issued
 
 `GetPaymentByInvoiceNumber(ctx, invoiceNumber) (*PaymentStatusResponse, error)`.
