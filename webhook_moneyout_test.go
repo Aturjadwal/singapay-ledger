@@ -77,6 +77,7 @@ func TestHandleDisbursementNotification_ReportsTheRowItSettledAndItsSeller(t *te
 	// The caller's own id for the seller, not this package's account uuid: a caller
 	// that had to translate one into the other would need the accounts table too.
 	assert.Equal(t, "seller-1", outcome.SellerID)
+	assert.Equal(t, domain.OwnerTypeSeller, outcome.OwnerType)
 }
 
 func TestHandleDisbursementNotification_ReportsAFailedPayoutAsFailed(t *testing.T) {

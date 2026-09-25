@@ -4,6 +4,50 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added — the platform account can be read and paid out of
+
+`GetPlatformAccount`, `GetPlatformTransactions` and `WithdrawFromPlatform`, plus `OwnerType`
+on `DisbursementOutcome`.
+
+A seller's balance, history and withdrawal were all reachable only by seller id, so the
+platform's own account — the one that collects every platform fee and the subscription
+proceeds — could be booked into but not looked at or paid out of. A consumer that wanted to
+would have had to query `ledger_accounts`, `ledger_entries` and `disbursements` itself,
+which is the one thing this package asks consumers not to do.
+
+- **`GetPlatformAccount`** returns the account, cached balances included.
+- **`WithdrawFromPlatform`** is `Withdraw` with the account resolved by type. `Withdraw` is
+  split at the lookup; everything after it — fee carved out of the request, reservation
+  under a row lock, reference stored before the call, outcome booking — is one shared
+  `withdrawFrom`, so the two cannot drift apart. `req.AccountID` is ignored.
+- **`GetPlatformTransactions`** is the statement: money in and money out, interleaved by
+  when each happened, with an opaque keyset cursor. An income's amount is the sum of the
+  platform's ledger entries for the sale, so a settled line shows what settlement booked,
+  not what was priced.
+- **`DisbursementOutcome.OwnerType`** says whose payout a money-out webhook settled. A
+  platform payout's `SellerID` is the platform's owner id, which names no user; a caller
+  sending seller receipts must skip it.
+
+Two repository methods back the statement: `ProductTransactionRepository.GetPlatformIncomes`
+and `DisbursementRepository.GetByAccountIDAfter`, both taking a `domain.KeysetCursor`.
+Out-of-tree implementations of either interface must add them.
+
+Not breaking for callers of `LedgerClient`. No schema change, and no gateway call beyond the
+ones `Withdraw` already makes.
+
+### Changed — an unknown payout outcome now names the payout
+
+`Withdraw` and `WithdrawFromPlatform` return a response **alongside**
+`ErrGatewayOutcomeUnknown`: the in-flight disbursement, `Status` PENDING, with its id.
+
+Before, that error came alone. The row had been written and its balance reserved, and the
+money might be on its way — but the caller had no id to wait on, so the only thing it could
+offer was another attempt, which is a second payout under a new reference, not a retry.
+
+Not breaking: every other error still returns a nil response, and a caller that checks the
+error first behaves exactly as before.
+
+
 ### Changed — a payment no longer requires the buyer's email
 
 `GeneratePayment` and `GenerateSubscriptionPayment` accept an empty `BuyerEmail`. Both used

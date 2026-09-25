@@ -580,6 +580,12 @@ type WithdrawResponse struct {
 // subtraction. A fee that could not be quoted is treated as zero, which sends the full
 // requested amount as the net and leaves the platform absorbing the fee — see
 // quotePayoutFee for why that is the chosen failure.
+//
+// One error comes with a response: ErrGatewayOutcomeUnknown. The payout was sent, or may
+// have been, and nobody knows yet whether it landed — so the disbursement stays PENDING
+// with its balance reserved, and the response names it. A caller should show that payout
+// as in progress rather than invite a second attempt, which would be a new payout under a
+// new reference, not a retry of this one.
 func (c *LedgerClient) Withdraw(ctx context.Context, sellerID string, req *WithdrawRequest) (*WithdrawResponse, error) {
 	if req.AccountID == "" {
 		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "account_id is required", nil)
@@ -596,6 +602,16 @@ func (c *LedgerClient) Withdraw(ctx context.Context, sellerID string, req *Withd
 		}
 		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to get account", err)
 	}
+
+	return c.withdrawFrom(ctx, account, req)
+}
+
+// withdrawFrom runs a withdrawal against an account that has already been resolved.
+//
+// Withdraw and WithdrawFromPlatform differ only in how they find the account. Everything
+// from here on — and every reason the order matters, set out on Withdraw — is shared, so a
+// seller's payout and the platform's cannot drift apart in how they reserve, price or book.
+func (c *LedgerClient) withdrawFrom(ctx context.Context, account *domain.Account, req *WithdrawRequest) (*WithdrawResponse, error) {
 	if account.SingapayAccountID == "" {
 		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest,
 			"account has no Singapay sub-account id; nothing can be paid out of it", nil)
@@ -640,7 +656,29 @@ func (c *LedgerClient) Withdraw(ctx context.Context, sellerID string, req *Withd
 		return nil, err
 	}
 
-	return c.executePayout(ctx, account, disbursement)
+	resp, err := c.executePayout(ctx, account, disbursement)
+	if err != nil && ledgererr.IsErrorCode(ledgererr.CodeGatewayOutcomeUnknown, err) {
+		// The row and its reservation stand, and the money may be on its way. Naming the row
+		// is the difference between a caller that waits for this payout and one that asks
+		// again — and asking again is a second payout under a new reference, not a retry.
+		return inFlightWithdrawResponse(disbursement), err
+	}
+	return resp, err
+}
+
+// inFlightWithdrawResponse describes a payout whose outcome is not known: sent, or possibly
+// sent, with its balance still reserved and its row still open. RetryDisbursement or the
+// money-out webhook settles it.
+func inFlightWithdrawResponse(disbursement *domain.Disbursement) *WithdrawResponse {
+	return &WithdrawResponse{
+		DisbursementID: disbursement.UUID,
+		Status:         string(disbursement.Status),
+		Amount:         disbursement.Amount,
+		TransferFee:    disbursement.GatewayFee,
+		NetAmount:      disbursement.NetAmount(),
+		Currency:       string(disbursement.Currency),
+		Message:        "Payout outcome unknown; it stays reserved until resolved by inquiry",
+	}
 }
 
 // quotePayoutFee asks Singapay what this payout will cost, so the fee can be carved out of

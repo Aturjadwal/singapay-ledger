@@ -91,6 +91,14 @@ type DisbursementRepository interface {
 	// sortOrder: "ASC" or "DESC" for created_at ordering (defaults to DESC)
 	GetByAccountIDWithCursor(ctx context.Context, accountID string, cursor string, pageSize int, sortOrder string) ([]*Disbursement, error)
 
+	// GetByAccountIDAfter returns an account's disbursements ordered by (created_at, uuid),
+	// descending unless ascending is set. A non-nil after continues strictly past that
+	// position.
+	//
+	// Unlike GetByAccountIDWithCursor the cursor carries its own sort key rather than a
+	// RandId to look up, so it can continue a list merged with rows from another table.
+	GetByAccountIDAfter(ctx context.Context, accountID string, after *KeysetCursor, limit int, ascending bool) ([]*Disbursement, error)
+
 	GetPendingByLedgerID(ctx context.Context, ledgerID string) ([]*Disbursement, error)
 
 	// GetPendingOlderThan returns PENDING disbursements across every account, created

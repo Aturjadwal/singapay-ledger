@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sort"
 	"testing"
 	"time"
 
@@ -70,6 +71,27 @@ func (f *FakeDisbursementRepository) GetByLedgerID(ctx context.Context, ledgerID
 
 func (f *FakeDisbursementRepository) GetByAccountIDWithCursor(ctx context.Context, accountID string, cursor string, pageSize int, sortOrder string) ([]*domain.Disbursement, error) {
 	return nil, nil
+}
+
+// GetByAccountIDAfter mirrors the Postgres query: one account's disbursements in keyset
+// order, strictly past the cursor.
+func (f *FakeDisbursementRepository) GetByAccountIDAfter(ctx context.Context, accountID string, after *domain.KeysetCursor, limit int, ascending bool) ([]*domain.Disbursement, error) {
+	var out []*domain.Disbursement
+	for _, d := range f.disbursements {
+		if d.LedgerUUID != accountID || !keysetAfter(d.CreatedAt, d.UUID, after, ascending) {
+			continue
+		}
+		copied := *d
+		out = append(out, &copied)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return keysetBefore(out[i].CreatedAt, out[i].UUID, out[j].CreatedAt, out[j].UUID, ascending)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 func (f *FakeDisbursementRepository) GetPendingByLedgerID(ctx context.Context, ledgerID string) ([]*domain.Disbursement, error) {
@@ -473,6 +495,39 @@ func TestWithdraw_UnknownOutcomeKeepsTheReservationEvenOn4xx(t *testing.T) {
 			}
 		})
 	}
+}
+
+// An unknown outcome still names the payout it left in flight. Without the id, a caller
+// that sees an error has nothing to wait on and every reason to ask again — and asking
+// again is a second payout under a new reference.
+func TestWithdraw_UnknownOutcomeNamesThePayoutInFlight(t *testing.T) {
+	gw := &fakeGateway{err: &singapay.Error{StatusCode: http.StatusBadRequest, Code: singapay.CodeTimeout}, fee: 3_000}
+	client, fakes, _ := newPayoutTestClient(t, gw, 100000)
+
+	resp, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest())
+
+	require.Error(t, err)
+	assert.True(t, ledgererr.IsErrorCode(ledgererr.CodeGatewayOutcomeUnknown, err))
+	require.NotNil(t, resp, "the in-flight payout is reported alongside the error")
+	assert.Equal(t, string(domain.DisbursementStatusPending), resp.Status)
+	assert.Equal(t, int64(50000), resp.Amount)
+	assert.Equal(t, int64(3_000), resp.TransferFee)
+	assert.Equal(t, int64(47_000), resp.NetAmount)
+
+	stored, getErr := fakes.Disbursement().GetByID(context.Background(), resp.DisbursementID)
+	require.NoError(t, getErr, "the id names the row that was written")
+	assert.Equal(t, domain.DisbursementStatusPending, stored.Status)
+}
+
+// A refusal is a known outcome: the error stands alone, and the row it leaves is FAILED.
+func TestWithdraw_RefusalReturnsNoResponse(t *testing.T) {
+	gw := &fakeGateway{err: &singapay.Error{StatusCode: http.StatusBadRequest, Code: singapay.CodeInsufficientFunds}}
+	client, _, _ := newPayoutTestClient(t, gw, 100000)
+
+	resp, err := client.Withdraw(context.Background(), "seller-1", withdrawRequest())
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
 }
 
 // A refusal Singapay states outright is the one case where the money is known not to have

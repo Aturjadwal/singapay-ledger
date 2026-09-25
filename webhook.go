@@ -318,7 +318,16 @@ type DisbursementOutcome struct {
 	// SellerID is the owner of the account the payout was made from — the id the
 	// caller knows its own users by, not this package's account uuid. Empty
 	// whenever Disbursement is nil.
+	//
+	// For a payout from the platform account this is the platform's owner id, which
+	// names no user. Read OwnerType before treating it as one.
 	SellerID string
+
+	// OwnerType is the kind of account the payout was made from: OwnerTypeSeller for
+	// a seller's withdrawal, OwnerTypePlatform for WithdrawFromPlatform. A caller that
+	// reacts per seller — a receipt, say — acts only on the first. Empty whenever
+	// Disbursement is nil.
+	OwnerType domain.OwnerType
 
 	// Booked reports whether THIS delivery is what moved the row.
 	//
@@ -415,6 +424,7 @@ func (c *LedgerClient) HandleDisbursementNotification(ctx context.Context, req s
 		return &DisbursementOutcome{
 			Disbursement: disbursement,
 			SellerID:     account.OwnerID,
+			OwnerType:    account.OwnerType,
 		}, nil
 	}
 
@@ -428,6 +438,7 @@ func (c *LedgerClient) HandleDisbursementNotification(ctx context.Context, req s
 	return &DisbursementOutcome{
 		Disbursement: disbursement,
 		SellerID:     account.OwnerID,
+		OwnerType:    account.OwnerType,
 		Booked:       true,
 	}, nil
 }

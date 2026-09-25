@@ -12,6 +12,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/Aturjadwal/singapay-ledger/domain"
@@ -218,6 +219,11 @@ type FakeProductTransactionRepository struct {
 	// beforeCAS, when set, runs once immediately before UpdateStatusIf compares. It is
 	// how a test lands a concurrent delivery inside the read-then-write window.
 	beforeCAS func()
+
+	// ledgerEntries is what GetPlatformIncomes sums the platform's credit from, the way
+	// the Postgres query reads ledger_entries. NewFakeRepositoryProvider wires it; a
+	// repository built on its own reports every credit as zero.
+	ledgerEntries *FakeLedgerEntryRepository
 }
 
 func NewFakeProductTransactionRepository() *FakeProductTransactionRepository {
@@ -274,6 +280,84 @@ func (f *FakeProductTransactionRepository) GetAllBySellerID(ctx context.Context,
 
 func (f *FakeProductTransactionRepository) GetBySellerAccountIDWithCursor(ctx context.Context, sellerAccountID string, cursor string, pageSize int, sortOrder string) ([]*domain.ProductTransaction, error) {
 	return nil, nil
+}
+
+// GetPlatformIncomes mirrors the Postgres query: paid transactions that are the platform's
+// own sale or carry a platform fee, each with the sum of the platform's entries for it, in
+// keyset order.
+func (f *FakeProductTransactionRepository) GetPlatformIncomes(ctx context.Context, platformAccountID string, after *domain.KeysetCursor, limit int, ascending bool) ([]*domain.PlatformIncome, error) {
+	var incomes []*domain.PlatformIncome
+	for _, tx := range f.transactions {
+		if tx.Status != domain.TransactionStatusCompleted && tx.Status != domain.TransactionStatusSettled {
+			continue
+		}
+		settledFee := int64(0)
+		if tx.SettledPlatformFeeMinor != nil {
+			settledFee = *tx.SettledPlatformFeeMinor
+		}
+		if tx.SellerAccountID != platformAccountID && tx.Fee.PlatformFee == 0 && settledFee == 0 {
+			continue
+		}
+
+		occurredAt := tx.CreatedAt
+		if tx.CompletedAt != nil {
+			occurredAt = *tx.CompletedAt
+		}
+		if !keysetAfter(occurredAt, tx.UUID, after, ascending) {
+			continue
+		}
+
+		var amount int64
+		if f.ledgerEntries != nil {
+			for _, e := range f.ledgerEntries.entries {
+				if e.AccountUUID == platformAccountID && e.SourceType == domain.SourceTypeProductTransaction && e.SourceID == tx.UUID {
+					amount += e.Amount
+				}
+			}
+		}
+
+		incomes = append(incomes, &domain.PlatformIncome{Transaction: detach(tx), PlatformAmount: amount})
+	}
+
+	sort.Slice(incomes, func(i, j int) bool {
+		return keysetBefore(platformIncomeKey(incomes[i]), incomes[i].Transaction.UUID,
+			platformIncomeKey(incomes[j]), incomes[j].Transaction.UUID, ascending)
+	})
+	if len(incomes) > limit {
+		incomes = incomes[:limit]
+	}
+	return incomes, nil
+}
+
+func platformIncomeKey(income *domain.PlatformIncome) time.Time {
+	if income.Transaction.CompletedAt != nil {
+		return *income.Transaction.CompletedAt
+	}
+	return income.Transaction.CreatedAt
+}
+
+// keysetBefore orders two rows by (at, id) the way the repositories do, with id compared
+// byte-wise.
+func keysetBefore(atA time.Time, idA string, atB time.Time, idB string, ascending bool) bool {
+	if !atA.Equal(atB) {
+		if ascending {
+			return atA.Before(atB)
+		}
+		return atA.After(atB)
+	}
+	if ascending {
+		return idA < idB
+	}
+	return idA > idB
+}
+
+// keysetAfter reports whether a row lies strictly past the cursor in the given order. A nil
+// cursor is the start of the list, which every row is past.
+func keysetAfter(at time.Time, id string, cursor *domain.KeysetCursor, ascending bool) bool {
+	if cursor == nil {
+		return true
+	}
+	return keysetBefore(cursor.At, cursor.ID, at, id, ascending)
 }
 
 func (f *FakeProductTransactionRepository) Save(ctx context.Context, tx *domain.ProductTransaction) error {
@@ -605,7 +689,7 @@ var _ repo.RepositoryProvider = (*FakeRepositoryProvider)(nil)
 var _ repo.Tx = (*FakeRepositoryProvider)(nil)
 
 func NewFakeRepositoryProvider() *FakeRepositoryProvider {
-	return &FakeRepositoryProvider{
+	fakes := &FakeRepositoryProvider{
 		accountRepo:                NewFakeAccountRepository(),
 		ledgerEntryRepo:            NewFakeLedgerEntryRepository(),
 		productTransactionRepo:     NewFakeProductTransactionRepository(),
@@ -614,6 +698,8 @@ func NewFakeRepositoryProvider() *FakeRepositoryProvider {
 		disbursementRepo:           NewFakeDisbursementRepository(),
 		paymentRequestRepo:         NewFakePaymentRequestRepository(),
 	}
+	fakes.productTransactionRepo.ledgerEntries = fakes.ledgerEntryRepo
+	return fakes
 }
 
 func (f *FakeRepositoryProvider) Account() domain.AccountRepository {

@@ -28,6 +28,7 @@ separate copies of the same rules, and the copies drift.
 ```
 .                          # package ledger — the public surface
 ├── ledger.go              # LedgerClient: accounts, balances, withdrawal, platform-fee transfer
+├── platform.go            # The platform account: its balance, statement and payout
 ├── payment.go             # Payment creation and channel routing
 ├── webhook.go             # Inbound webhook verification and booking
 ├── settlement.go          # Settlement inbox + the per-transaction settling pass
@@ -57,7 +58,7 @@ Dependency direction: `singapay/` and `domain/` know nothing above them; `repo/`
 GeneratePayment      -> product_transactions PENDING + payment_requests (instrument issued)
 money-in webhook     -> PENDING -> COMPLETED, funds credited to the PENDING bucket
 settlement pass      -> COMPLETED -> SETTLED, PENDING bucket moves to AVAILABLE
-Withdraw             -> AVAILABLE debited, disbursement sent
+Withdraw             -> AVAILABLE debited, disbursement sent (WithdrawFromPlatform: the same, from the platform account)
 platform-fee sweep   -> platform's cut transferred between Singapay sub-accounts
 ```
 

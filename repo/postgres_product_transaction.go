@@ -149,6 +149,82 @@ func (r *PostgresProductTransactionRepository) GetBySellerAccountIDWithCursor(ct
 	return r.scanMany(ctx, query, args...)
 }
 
+// GetPlatformIncomes lists the paid transactions that credited the platform account, each
+// with the sum of the platform's ledger entries for it. See the interface for the order.
+//
+// Which transactions: the platform's own sales (seller_account_id is the platform) and any
+// sale carrying a platform fee, either as priced or as settled — settlement can move the fee
+// away from the priced figure when the gateway charged something other than the estimate.
+// A sale with no fee either way wrote a zero-amount entry and nothing more, and is left out.
+//
+// The amount is a correlated subquery on idx_ledger_entries_source. It is not part of the
+// sort key, so PostgreSQL can defer it past the sort and limit and evaluate it for the
+// returned page rather than for every candidate.
+//
+// The tiebreak compares uuid under COLLATE "C" because the caller merges this list with
+// disbursements in Go, where strings compare byte-wise. Under a linguistic collation the
+// database and the merge could order two ids differently and a page would skip or repeat a
+// row.
+func (r *PostgresProductTransactionRepository) GetPlatformIncomes(ctx context.Context, platformAccountID string, after *domain.KeysetCursor, limit int, ascending bool) ([]*domain.PlatformIncome, error) {
+	comparison, direction := "<", "DESC"
+	if ascending {
+		comparison, direction = ">", "ASC"
+	}
+
+	args := []any{platformAccountID}
+	cursorClause := ""
+	if after != nil {
+		args = append(args, after.At, after.ID)
+		cursorClause = fmt.Sprintf(
+			`AND (COALESCE(pt.completed_at, pt.created_at), pt.uuid COLLATE "C") %s ($2::timestamp, $3::varchar)`,
+			comparison)
+	}
+	args = append(args, limit)
+
+	query := fmt.Sprintf(`
+		SELECT pt.uuid, pt.randid, pt.buyer_account_id, pt.seller_account_id, pt.product_id, pt.product_type, pt.invoice_number,
+		       pt.seller_price, pt.platform_fee, pt.gateway_fee, pt.total_charged, pt.seller_net_amount, pt.fee_model, pt.currency,
+		       pt.status, pt.created_at, pt.updated_at, pt.completed_at, pt.settled_at,
+		       pt.platform_fee_transferred, pt.platform_fee_transferred_at, pt.transfer_request_id, pt.metadata,
+		       pt.settled_platform_fee, pt.settled_gateway_fee, pt.platform_residual,
+		       (SELECT COALESCE(SUM(le.amount), 0)
+		          FROM ledger_entries le
+		         WHERE le.account_uuid = $1
+		           AND le.source_type = 'PRODUCT_TRANSACTION'
+		           AND le.source_id = pt.uuid) AS platform_amount
+		FROM product_transactions pt
+		WHERE pt.status IN ('COMPLETED', 'SETTLED')
+		  AND (pt.seller_account_id = $1
+		       OR pt.platform_fee <> 0
+		       OR COALESCE(pt.settled_platform_fee, 0) <> 0)
+		  %s
+		ORDER BY COALESCE(pt.completed_at, pt.created_at) %s, pt.uuid COLLATE "C" %s
+		LIMIT $%d
+	`, cursorClause, direction, direction, len(args))
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, ErrFailedQuerySQL.WithError(err)
+	}
+	defer rows.Close()
+
+	var incomes []*domain.PlatformIncome
+	for rows.Next() {
+		var platformAmount int64
+		tx, err := r.scanRowWith(rows, &platformAmount)
+		if err != nil {
+			return nil, err
+		}
+		incomes = append(incomes, &domain.PlatformIncome{Transaction: tx, PlatformAmount: platformAmount})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, ErrFailedQuerySQL.WithError(err)
+	}
+
+	return incomes, nil
+}
+
 func (r *PostgresProductTransactionRepository) GetPendingBySellerAccountID(ctx context.Context, sellerAccountID string) ([]*domain.ProductTransaction, error) {
 	query := `
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
@@ -369,6 +445,12 @@ func (r *PostgresProductTransactionRepository) scanMany(ctx context.Context, que
 
 // scanRow scans a single row into a ProductTransaction
 func (r *PostgresProductTransactionRepository) scanRow(rows *sql.Rows) (*domain.ProductTransaction, error) {
+	return r.scanRowWith(rows)
+}
+
+// scanRowWith is scanRow for a query that selects more columns after the product
+// transaction's own: extra receives them, in order.
+func (r *PostgresProductTransactionRepository) scanRowWith(rows *sql.Rows, extra ...any) (*domain.ProductTransaction, error) {
 	var row struct {
 		UUID                     string
 		RandId                   string
@@ -398,7 +480,7 @@ func (r *PostgresProductTransactionRepository) scanRow(rows *sql.Rows) (*domain.
 		PlatformResidualMinor    sql.NullInt64
 	}
 
-	err := rows.Scan(
+	dest := []any{
 		&row.UUID,
 		&row.RandId,
 		&row.BuyerAccountID,
@@ -425,7 +507,9 @@ func (r *PostgresProductTransactionRepository) scanRow(rows *sql.Rows) (*domain.
 		&row.SettledPlatformFeeMinor,
 		&row.SettledGatewayFeeMinor,
 		&row.PlatformResidualMinor,
-	)
+	}
+
+	err := rows.Scan(append(dest, extra...)...)
 	if err != nil {
 		return nil, ErrFailedScanSQL.WithError(err)
 	}

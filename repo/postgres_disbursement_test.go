@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"regexp"
 	"testing"
 	"time"
 
@@ -172,4 +173,54 @@ func TestGetPendingOlderThan_SurfacesRowsWithoutARequestID(t *testing.T) {
 	require.Len(t, disbursements, 1)
 	assert.Empty(t, disbursements[0].PayoutRequestID)
 	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// The first page has no position to continue from, so it carries no cursor predicate and
+// only the account and the limit as arguments.
+func TestGetByAccountIDAfter_FirstPageHasNoCursorPredicate(t *testing.T) {
+	repo, mock, closeDB := newMockRepo(t)
+	defer closeDB()
+
+	createdAt := time.Date(2026, 9, 20, 9, 0, 0, 0, time.UTC)
+
+	mock.ExpectQuery(`(?s)FROM disbursements\s+WHERE account_uuid = \$1\s+ORDER BY created_at DESC, uuid COLLATE "C" DESC\s+LIMIT \$2`).
+		WithArgs("acc-001", 3).
+		WillReturnRows(rowsFrom(disbursementRow("d-001", "COMPLETED", nil, "req-001", createdAt)))
+
+	disbursements, err := repo.GetByAccountIDAfter(context.Background(), "acc-001", nil, 3, false)
+
+	require.NoError(t, err)
+	require.Len(t, disbursements, 1)
+	assert.Equal(t, "d-001", disbursements[0].UUID)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// A later page continues strictly past the cursor's (created_at, uuid), in the direction of
+// the sort, comparing uuid byte-wise so the order matches the merge the caller does in Go.
+func TestGetByAccountIDAfter_ContinuesPastTheCursorInSortDirection(t *testing.T) {
+	cursor := &domain.KeysetCursor{At: time.Date(2026, 9, 20, 9, 0, 0, 0, time.UTC), ID: "d-009"}
+
+	cases := []struct {
+		ascending bool
+		predicate string
+		order     string
+	}{
+		{false, `(created_at, uuid COLLATE "C") < ($2::timestamp, $3::varchar)`, `ORDER BY created_at DESC, uuid COLLATE "C" DESC`},
+		{true, `(created_at, uuid COLLATE "C") > ($2::timestamp, $3::varchar)`, `ORDER BY created_at ASC, uuid COLLATE "C" ASC`},
+	}
+
+	for _, tc := range cases {
+		repo, mock, closeDB := newMockRepo(t)
+
+		mock.ExpectQuery(`(?s)WHERE account_uuid = \$1\s+AND `+regexp.QuoteMeta(tc.predicate)+
+			`\s+`+regexp.QuoteMeta(tc.order)+`\s+LIMIT \$4`).
+			WithArgs("acc-001", cursor.At, cursor.ID, 3).
+			WillReturnRows(sqlmock.NewRows(disbursementColumns))
+
+		_, err := repo.GetByAccountIDAfter(context.Background(), "acc-001", cursor, 3, tc.ascending)
+
+		require.NoError(t, err, "ascending=%v", tc.ascending)
+		assert.NoError(t, mock.ExpectationsWereMet(), "ascending=%v", tc.ascending)
+		closeDB()
+	}
 }

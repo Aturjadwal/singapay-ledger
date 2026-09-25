@@ -112,6 +112,16 @@ type ProductTransactionRepository interface {
 	// cursor: RandId of last item from previous page (empty for first page)
 	// sortOrder: "ASC" or "DESC" for created_at ordering
 	GetBySellerAccountIDWithCursor(ctx context.Context, sellerAccountID string, cursor string, pageSize int, sortOrder string) ([]*ProductTransaction, error)
+
+	// GetPlatformIncomes returns the paid transactions (COMPLETED or SETTLED) that credited
+	// the platform account — its own sales, and every sale that carries a platform fee —
+	// each with the sum of the platform's ledger entries for it.
+	//
+	// Ordered by when the payer paid (completed_at, or created_at for a row that predates
+	// it) and then by uuid, descending unless ascending is set. A non-nil after continues
+	// strictly past that position.
+	GetPlatformIncomes(ctx context.Context, platformAccountID string, after *KeysetCursor, limit int, ascending bool) ([]*PlatformIncome, error)
+
 	Save(ctx context.Context, tx *ProductTransaction) error
 	UpdateStatus(ctx context.Context, id string, status TransactionStatus, timestamp time.Time) error
 

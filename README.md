@@ -360,6 +360,55 @@ re-sending a used value returns the original transfer and moves nothing further 
 what makes a retry safe. A random value per attempt would forfeit that protection without
 raising any error.
 
+### Platform account — balance, statement, payout
+
+The platform's own account gets the seller's three operations, with the account resolved
+by type rather than by seller id. There is exactly one, provisioned by hand per environment;
+all three answer `ErrLedgerNotFound` until it exists.
+
+```go
+// Balance: the cached figures on the account row, as GetBalance reads for a seller.
+account, err := client.GetPlatformAccount(ctx)
+// account.AvailableBalance, account.PendingBalance, account.TotalWithdrawalAmount
+
+// Statement: money in and money out, interleaved, newest first.
+page, err := client.GetPlatformTransactions(ctx, ledger.PlatformTransactionsRequest{
+    Type:     "",               // or ledger.PlatformTransactionIncome / PlatformTransactionPayout
+    PageSize: 20,               // capped at 100
+    Cursor:   previous.NextCursor,
+})
+
+// Payout: Withdraw's money path, against the platform account.
+resp, err := client.WithdrawFromPlatform(ctx, &ledger.WithdrawRequest{
+    Amount:        1_000_000,
+    BankCode:      "CENAIDJA",  // SWIFT, for the reason given under Withdrawal
+    AccountNumber: "1234567890",
+    AccountName:   "PT Example",
+    Description:   "Monthly sweep",
+})
+```
+
+**An income line's amount is read off the platform's ledger entries**, not recomputed from
+the pricing columns: the PENDING credit while the sale awaits settlement, the AVAILABLE
+credit settlement booked once it has — which is the priced fee adjusted by whatever the
+gateway really took. `Income.Source` says whether the line is the fee on a seller's sale
+(`PLATFORM_FEE`) or the platform's own sale, a subscription (`PLATFORM_SALE`).
+
+**A `PLATFORM_FEE` credit is not in the platform's sub-account until it is swept.** The
+payer's money lands in the seller's sub-account, and only `ProcessPlatformFeeTransfer` moves
+the fee across; `Income.Transaction.PlatformFeeTransferred` says whether it has. A payout is
+reserved against the ledger's AVAILABLE balance, so one larger than the sub-account really
+holds is refused by Singapay (`SP003`) — which releases the reservation and books the payout
+`FAILED`, like any other refusal.
+
+**The statement cursor carries its own sort key.** Money in and money out live in different
+tables, so a page is a merge of both, ordered by `(OccurredAt, ID)`. A RandId cursor, which
+looks its row up again, cannot continue a list whose last row might be in either table.
+
+**A platform payout settles through the same webhook as a seller's.** `DisbursementOutcome`
+carries `OwnerType`; a caller that sends seller receipts must skip `OwnerTypePlatform`, whose
+`SellerID` is the platform account's owner id and names no user.
+
 ### Seller KYC verification — removed
 
 KYC belongs to the service that owns the user, not to the ledger. The upload helpers and
@@ -460,7 +509,7 @@ neither take a payment nor pay out, and the code refuses both explicitly.
 | `GeneratePayment` | virtual account, QRIS, e-wallet, or payment link — by channel |
 | `HandlePaymentSuccess` | `transaction_notif_url` webhook |
 | `ValidateBankAccount` | `POST /api/v2.0/disbursement/check-beneficiary` |
-| `Withdraw` | `POST /api/v2.0/disbursement/check-fee` then `.../transfer` |
+| `Withdraw`, `WithdrawFromPlatform` | `POST /api/v2.0/disbursement/check-fee` then `.../transfer` |
 | `RetryDisbursement` | `POST /api/v2.0/disbursement/inquiry-status` |
 | `HandleDisbursementNotification` | `disbursement_notif_url` webhook |
 | `ProcessPlatformFeeTransfer` | `POST /api/v1.0/account-transfer/{id}/transfer` |

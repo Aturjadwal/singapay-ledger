@@ -3,6 +3,7 @@ package repo
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"time"
 
 	"github.com/21strive/redifu"
@@ -146,6 +147,47 @@ func (r *PostgresDisbursementRepository) GetByAccountIDWithCursor(ctx context.Co
 		}
 		args = []any{accountID, cursor, pageSize}
 	}
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, ErrFailedQuerySQL.WithError(err)
+	}
+	defer rows.Close()
+
+	return r.scanDisbursements(rows)
+}
+
+// GetByAccountIDAfter lists an account's disbursements in (created_at, uuid) order,
+// continuing strictly past after when it is given. Served by
+// idx_disbursements_account_created.
+//
+// The tiebreak compares uuid under COLLATE "C" for the reason GetPlatformIncomes gives: the
+// caller merges this list with another in Go, where strings compare byte-wise.
+func (r *PostgresDisbursementRepository) GetByAccountIDAfter(ctx context.Context, accountID string, after *domain.KeysetCursor, limit int, ascending bool) ([]*domain.Disbursement, error) {
+	comparison, direction := "<", "DESC"
+	if ascending {
+		comparison, direction = ">", "ASC"
+	}
+
+	args := []any{accountID}
+	cursorClause := ""
+	if after != nil {
+		args = append(args, after.At, after.ID)
+		cursorClause = fmt.Sprintf(`AND (created_at, uuid COLLATE "C") %s ($2::timestamp, $3::varchar)`, comparison)
+	}
+	args = append(args, limit)
+
+	query := fmt.Sprintf(`
+		SELECT uuid, randid, account_uuid, amount, currency, status,
+		       bank_code, account_number, account_name,
+		       description, external_transaction_id, failure_reason,
+		       payout_request_id, gateway_fee, created_at, updated_at, processed_at
+		FROM disbursements
+		WHERE account_uuid = $1
+		  %s
+		ORDER BY created_at %s, uuid COLLATE "C" %s
+		LIMIT $%d
+	`, cursorClause, direction, direction, len(args))
 
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
