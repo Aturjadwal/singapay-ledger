@@ -215,6 +215,9 @@ func (f *fakeGateway) CreateEwalletOrder(context.Context, singapay.CreateEwallet
 func (f *fakeGateway) CreatePaymentLink(context.Context, string, singapay.CreatePaymentLinkRequest) (*singapay.PaymentLink, error) {
 	panic("fakeGateway.CreatePaymentLink: not scripted for this test")
 }
+func (f *fakeGateway) ListPaymentMethods(context.Context) ([]singapay.PaymentMethod, error) {
+	panic("fakeGateway.ListPaymentMethods: not scripted for this test")
+}
 func (f *fakeGateway) ListVATransactions(context.Context, string, singapay.SettlementWindow) ([]singapay.VATransaction, singapay.Pagination, error) {
 	panic("fakeGateway.ListVATransactions: not scripted for this test")
 }

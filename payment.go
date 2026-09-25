@@ -3,8 +3,10 @@ package ledger
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Aturjadwal/singapay-ledger/domain"
@@ -459,7 +461,8 @@ type paymentInstrument struct {
 // reports no fee anywhere — not on the webhook, not on the history row, not on any
 // endpoint. Fee reconciliation is built on that number, so pinning the channel is what
 // keeps it possible. A payment link is issued only when the caller names no channel, which
-// is a deliberate trade rather than a default.
+// is a deliberate trade rather than a default — or for a card, which has no other way in
+// that keeps the card number off our servers (see channelCard).
 func (c *LedgerClient) issuePaymentInstrument(ctx context.Context, req paymentInstrumentRequest) (*paymentInstrument, error) {
 	if req.AccountID == "" {
 		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest,
@@ -531,22 +534,9 @@ func (c *LedgerClient) issuePaymentInstrument(ctx context.Context, req paymentIn
 		}, nil
 
 	case channelPaymentLink:
-		maxUsage := 1
-		link, gwErr := c.gateway.CreatePaymentLink(ctx, req.AccountID, singapay.CreatePaymentLinkRequest{
-			ReffNo:      req.InvoiceNumber,
-			Description: req.Description,
-			Type:        singapay.PaymentLinkTotal,
-			TotalAmount: req.Amount,
-			MaxUsage:    &maxUsage,
-			// Absolute, not a lifetime in minutes: compute it before calling.
-			ExpiredAt: singapay.ISO8601Timestamp(req.ExpiresAt),
-			// Only accepted when the link resolves to single use, which it does here.
-			CustomerName:  req.CustomerName,
-			CustomerEmail: req.CustomerEmail,
-			CustomerPhone: req.CustomerPhone,
-		})
-		if gwErr != nil {
-			return nil, ledgererr.NewError(ledgererr.CodeGatewayAPIError, "failed to create payment link", gwErr)
+		link, err := c.createSingleUsePaymentLink(ctx, req, nil)
+		if err != nil {
+			return nil, err
 		}
 		return &paymentInstrument{
 			GatewayID:  strconv.FormatInt(link.ID, 10),
@@ -554,11 +544,96 @@ func (c *LedgerClient) issuePaymentInstrument(ctx context.Context, req paymentIn
 			Channel:    ChannelPaymentLink,
 		}, nil
 
+	case channelCard:
+		// Checked before the catalogue is read: Singapay would refuse the link anyway, with
+		// a validation error about the amount that says nothing about cards.
+		if req.Amount < minCardPayment {
+			return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest,
+				fmt.Sprintf("a card payment must be at least Rp%d; this one is Rp%d", minCardPayment, req.Amount), nil)
+		}
+		codes, err := c.cardPaymentMethodCodes(ctx)
+		if err != nil {
+			return nil, err
+		}
+		link, err := c.createSingleUsePaymentLink(ctx, req, codes)
+		if err != nil {
+			return nil, err
+		}
+		return &paymentInstrument{
+			GatewayID:  strconv.FormatInt(link.ID, 10),
+			PaymentURL: link.PaymentURL,
+			Channel:    ChannelCreditCard,
+		}, nil
+
 	default:
 		return nil, ledgererr.ErrUnsupportedPaymentChannel.WithError(
-			fmt.Errorf("payment channel %q is not a Singapay money-in product; expected QRIS, VA_*, EWALLET_*, or empty for a payment link", req.Channel),
+			fmt.Errorf("payment channel %q is not a Singapay money-in product; expected QRIS, VA_*, EWALLET_*, CREDIT_CARD, or empty for a payment link", req.Channel),
 		)
 	}
+}
+
+// createSingleUsePaymentLink issues a payment link for one invoice. An empty whitelist lets
+// the payer pick any channel active on the merchant; a non-empty one pins the link to it.
+func (c *LedgerClient) createSingleUsePaymentLink(ctx context.Context, req paymentInstrumentRequest, whitelist []string) (*singapay.PaymentLink, error) {
+	name, email, phone := paymentLinkCustomer(req)
+	maxUsage := 1
+	link, gwErr := c.gateway.CreatePaymentLink(ctx, req.AccountID, singapay.CreatePaymentLinkRequest{
+		ReffNo:      req.InvoiceNumber,
+		Description: req.Description,
+		Type:        singapay.PaymentLinkTotal,
+		TotalAmount: req.Amount,
+		MaxUsage:    &maxUsage,
+		// Absolute, not a lifetime in minutes: compute it before calling.
+		ExpiredAt:                singapay.ISO8601Timestamp(req.ExpiresAt),
+		WhitelistedPaymentMethod: whitelist,
+		// Only accepted when the link resolves to single use, which it does here.
+		CustomerName:  name,
+		CustomerEmail: email,
+		CustomerPhone: phone,
+	})
+	if gwErr != nil {
+		return nil, ledgererr.NewError(ledgererr.CodeGatewayAPIError, "failed to create payment link", gwErr)
+	}
+	return link, nil
+}
+
+// paymentLinkCustomer is the payer pre-fill for a payment link: all of it, or none of it.
+//
+// Singapay takes the customer fields only as a set. Once any of the three is sent, the name
+// and the email are both required, and a phone alone is refused. So a payer with no email —
+// which a booking may now have — gets no pre-fill at all, rather than a name the API would
+// refuse the whole link for. The hosted page asks the payer for whatever it still needs.
+func paymentLinkCustomer(req paymentInstrumentRequest) (name, email, phone string) {
+	if req.CustomerName == "" || req.CustomerEmail == "" {
+		return "", "", ""
+	}
+	return req.CustomerName, req.CustomerEmail, req.CustomerPhone
+}
+
+// cardPaymentMethodCodes returns the catalogue codes a card payment link is pinned to.
+//
+// Read per payment rather than cached. Card payments are few, and the catalogue is also the
+// check that cards are enabled at all: a merchant whose catalogue has no card group is
+// refused here, before a link is created, instead of being handed a link that would offer
+// the payer every other channel under a card label and a card price.
+func (c *LedgerClient) cardPaymentMethodCodes(ctx context.Context) ([]string, error) {
+	methods, err := c.gateway.ListPaymentMethods(ctx)
+	if err != nil {
+		return nil, ledgererr.NewError(ledgererr.CodeGatewayAPIError, "failed to read the payment method catalogue", err)
+	}
+
+	var codes []string
+	for _, method := range methods {
+		if strings.EqualFold(method.Group, singapay.PaymentMethodGroupCard) && method.Code != "" {
+			codes = append(codes, method.Code)
+		}
+	}
+	if len(codes) == 0 {
+		return nil, ledgererr.ErrUnsupportedPaymentChannel.WithError(
+			errors.New("card payments are not enabled for this merchant: the payment-link catalogue lists no card method"),
+		)
+	}
+	return codes, nil
 }
 
 // CalculateFeesForCustomer returns the fee breakdown without creating a transaction.
@@ -572,6 +647,10 @@ func (c *LedgerClient) issuePaymentInstrument(ctx context.Context, req paymentIn
 //   - >1 → platform fee multiplied by this value (e.g. installment with 2 due terms → 2)
 //
 // The gateway fee is never multiplied regardless of the multiplier value.
+//
+// A named channel with no active fee config is refused with ErrUnsupportedPaymentChannel,
+// the same answer GeneratePayment gives it. Pricing it instead would quote a gateway fee of
+// zero — a price for a payment that cannot be made, and a lower one than any real channel.
 func (c *LedgerClient) CalculateFeesForCustomer(ctx context.Context, sellerPrice int64, paymentChannel string, currency string, platformFeeMultiplier int) (*FeeCalculationResponse, error) {
 	feeConfigs, err := c.repoProvider.FeeConfig().GetAllActive(ctx)
 	if err != nil {
@@ -579,6 +658,11 @@ func (c *LedgerClient) CalculateFeesForCustomer(ctx context.Context, sellerPrice
 	}
 
 	feeCalc := domain.NewFeeCalculator(feeConfigs)
+	if paymentChannel != "" && !feeCalc.HasPaymentChannel(paymentChannel) {
+		return nil, ledgererr.ErrUnsupportedPaymentChannel.WithError(
+			fmt.Errorf("payment channel %q has no active fee config", paymentChannel),
+		)
+	}
 	cur := domain.Currency(currency)
 	opts := domain.FeeBreakdownOptions{
 		FeeModel:              domain.FeeModelGatewayOnCustomer,
@@ -713,14 +797,25 @@ func (c *LedgerClient) GetPaymentByInvoiceNumber(ctx context.Context, invoiceNum
 	}, nil
 }
 
-// GetPaymentChannelFeeConfigs returns all fee configurations excluding the PLATFORM config.
-// Use this to present available payment channels and their fee details to end users.
+// GetPaymentChannelFeeConfigs returns the active fee configurations, excluding the PLATFORM
+// config. Use this to present available payment channels and their fee details to end users.
+//
+// Active only, because an inactive row is a channel that cannot be paid: GeneratePayment and
+// CalculateFeesForCustomer both refuse it. Listing it offered payers a method whose estimate
+// and payment then failed — the inactive CREDIT_CARD row did exactly that.
 func (c *LedgerClient) GetPaymentChannelFeeConfigs(ctx context.Context) ([]*domain.FeeConfig, error) {
-	configs, err := c.repoProvider.FeeConfig().GetAllExcludingPlatform(ctx)
+	configs, err := c.repoProvider.FeeConfig().GetAllActive(ctx)
 	if err != nil {
 		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to get payment channel fee configs", err)
 	}
-	return configs, nil
+
+	channels := make([]*domain.FeeConfig, 0, len(configs))
+	for _, cfg := range configs {
+		if cfg.ConfigType != domain.FeeConfigTypePlatform {
+			channels = append(channels, cfg)
+		}
+	}
+	return channels, nil
 }
 
 // validateGenerateSubscriptionPaymentRequest validates the subscription payment request fields

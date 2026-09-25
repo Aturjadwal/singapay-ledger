@@ -29,6 +29,9 @@ type PaymentGateway interface {
 	GenerateQRIS(ctx context.Context, accountID string, req singapay.GenerateQRISRequest) (*singapay.QRISTransaction, error)
 	CreateEwalletOrder(ctx context.Context, req singapay.CreateEwalletOrderRequest) (*singapay.EwalletTransaction, error)
 	CreatePaymentLink(ctx context.Context, accountID string, req singapay.CreatePaymentLinkRequest) (*singapay.PaymentLink, error)
+	// ListPaymentMethods reads the payment-link catalogue. A card payment is a payment
+	// link pinned to the catalogue's card methods, and this is where their codes come from.
+	ListPaymentMethods(ctx context.Context) ([]singapay.PaymentMethod, error)
 
 	// Window listings. These predate the per-transaction settling pass, which reads one
 	// invoice at a time instead (see the per-transaction reads below) and never filters
@@ -85,24 +88,47 @@ const (
 	// reports no per-transaction fee anywhere, so anything paid through one cannot have
 	// its fee reconciled. See domain.SettledTransaction.FeeReported.
 	channelPaymentLink
+	// channelCard is a card payment, issued as a payment link pinned to the catalogue's card
+	// methods. Singapay's own card API is not used: it takes the card number and CVV in the
+	// request body, which would put them on the merchant's servers. The hosted page takes
+	// them instead, 3-D Secure included. The price is the payment link's blind spot — no
+	// per-transaction fee is reported, so a card payment's fee is never reconciled either.
+	channelCard
 )
 
 // ChannelPaymentLink is the channel recorded on a transaction whose payer chose the
 // channel themselves. It is not a Singapay code and is never sent to the API.
 const ChannelPaymentLink = "PAYMENT_LINK"
 
+// ChannelCreditCard is the fee-config channel for card payments, and what a card payment
+// records as its channel.
+//
+// Unlike the other channels it is not sent to Singapay as-is. The link is pinned to
+// whatever the catalogue files under the card group (see cardPaymentMethodCodes), because
+// which card methods a merchant is enabled for is Singapay's to say, and its hosted page
+// finds them by group rather than by one fixed code.
+const ChannelCreditCard = "CREDIT_CARD"
+
+// minCardPayment is the smallest card charge Singapay accepts, in rupiah. Its card product
+// states a minimum of IDR 10,000; a smaller link would be refused at creation with a
+// validation error that names nothing the payer can act on.
+const minCardPayment int64 = 10000
+
 // paymentChannelKind resolves a fee-config payment channel to the Singapay product that
 // issues it.
 //
 // The codes are Singapay's own, from GET /payment-link-manage/payment-methods, and they
 // are the only spellings any Singapay endpoint accepts. An empty channel means the caller
-// did not pin one, which routes to a payment link.
+// did not pin one, which routes to a payment link. CREDIT_CARD is ours, and routes to a
+// payment link pinned to the card methods; see ChannelCreditCard.
 func paymentChannelKind(channel string) channelKind {
 	switch {
 	case channel == "":
 		return channelPaymentLink
 	case channel == ChannelPaymentLink:
 		return channelPaymentLink
+	case channel == ChannelCreditCard:
+		return channelCard
 	case channel == "QRIS":
 		return channelQRIS
 	case strings.HasPrefix(channel, "VA_"):

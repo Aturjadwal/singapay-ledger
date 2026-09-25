@@ -10,11 +10,20 @@ import (
 // PaymentMethod is one channel from the payment-link catalogue.
 type PaymentMethod struct {
 	// Code is what goes in WhitelistedPaymentMethod, e.g. "VA_BRI", "QRIS".
-	Code  string `json:"code"`
-	Name  string `json:"name"`
+	Code string `json:"code"`
+	Name string `json:"name"`
+	// Group is the category the method is filed under: "va", "qris", "ewallet", "card".
 	Group string `json:"group"`
 	Desc  string `json:"desc"`
 }
+
+// PaymentMethodGroupCard is the catalogue group card methods are filed under.
+//
+// Cards are identified by group rather than by code because that is how Singapay's own
+// hosted payment page finds its card form: it looks for the method whose group is "card",
+// and knows several codes for it (CARD, CREDIT_CARD, NICEPAY_CARD) depending on the
+// acquirer behind it. The group is the stable part.
+const PaymentMethodGroupCard = "card"
 
 // ListPaymentMethods returns the active channel catalogue.
 //

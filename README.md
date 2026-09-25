@@ -173,6 +173,7 @@ reversible after the fact:**
 | `QRIS` | QRIS dynamic | yes — with the MDR rate itself |
 | `VA_BCA`, `VA_BNI`, `VA_BRI`, `VA_MANDIRI`, … | Virtual account | yes |
 | `EWALLET_DANA`, `EWALLET_OVO`, … | E-wallet native | yes |
+| `CREDIT_CARD` | Payment link pinned to the catalogue's `card` methods | **no — it is a payment link** |
 | *(empty)* | Payment link — the payer chooses | **no, nowhere in the API** |
 
 A payment link exposes no per-transaction fee on the webhook, on the history row, or on any
@@ -181,7 +182,12 @@ endpoint. Anything paid through one can never have its fee reconciled, so leavin
 you know it.
 
 The codes are Singapay's own, from `GET /payment-link-manage/payment-methods`, and no other
-spelling is accepted anywhere in the API.
+spelling is accepted anywhere in the API. `CREDIT_CARD` is the one exception, and it is
+never sent: it names the fee config, and the link is pinned to whatever the catalogue files
+under the `card` group. Singapay's card API is not used because it takes the card number and
+CVV in the request body; on the hosted page they never reach this ledger. A card payment
+must be at least Rp 10.000, and one is refused with `ErrUnsupportedPaymentChannel` when the
+catalogue has no card method — check with `go run ./cmd/singapay-smoke -step methods`.
 
 Two convenience wrappers set the fee model explicitly:
 
@@ -268,6 +274,10 @@ resp, err := client.CalculateFeesForCustomer(ctx, 100000, "QRIS", "IDR", 1)
 // Skip platform fee: multiplier=0. Multiply it (e.g. 2 installment terms): multiplier=2.
 configs, err := client.GetPaymentChannelFeeConfigs(ctx)
 ```
+
+A channel with no active fee config is refused with `ErrUnsupportedPaymentChannel`, the same
+as `GeneratePayment` refuses it, rather than priced with a gateway fee of zero.
+`GetPaymentChannelFeeConfigs` lists active channels only, for the same reason.
 
 ### Merchant balance management
 
@@ -506,7 +516,7 @@ neither take a payment nor pay out, and the code refuses both explicitly.
 | Operation | Singapay API |
 |---|---|
 | `CreateAccount` | `POST /api/v1.0/accounts` |
-| `GeneratePayment` | virtual account, QRIS, e-wallet, or payment link — by channel |
+| `GeneratePayment` | virtual account, QRIS, e-wallet, or payment link — by channel (a card is a payment link, after `GET /api/v1.0/payment-link-manage/payment-methods`) |
 | `HandlePaymentSuccess` | `transaction_notif_url` webhook |
 | `ValidateBankAccount` | `POST /api/v2.0/disbursement/check-beneficiary` |
 | `Withdraw`, `WithdrawFromPlatform` | `POST /api/v2.0/disbursement/check-fee` then `.../transfer` |

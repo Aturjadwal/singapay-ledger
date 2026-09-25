@@ -386,12 +386,22 @@ func stepMethods(ctx context.Context, c *singapay.Client) error {
 		return explain(err)
 	}
 	fmt.Printf("✔ %d payment method(s) active\n", len(methods))
+	var cards []string
 	for _, m := range methods {
 		fmt.Printf("    %-18s %-8s %s\n", m.Code, m.Group, m.Name)
+		if strings.EqualFold(m.Group, singapay.PaymentMethodGroupCard) {
+			cards = append(cards, m.Code)
+		}
 	}
 	fmt.Println()
 	fmt.Println("  These codes are what a fee table must key on — no other spelling")
 	fmt.Println("  are not accepted anywhere in this API.")
+	fmt.Println()
+	if len(cards) == 0 {
+		fmt.Println("  ⚠ no method in the card group: CREDIT_CARD payments will be refused.")
+	} else {
+		fmt.Printf("  CREDIT_CARD payment links will be pinned to: %s\n", strings.Join(cards, ", "))
+	}
 	return nil
 }
 

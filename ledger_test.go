@@ -207,6 +207,7 @@ func TestPaymentChannelKind(t *testing.T) {
 		{"EWALLET_DANA", channelEwallet},
 		{"", channelPaymentLink},
 		{ChannelPaymentLink, channelPaymentLink},
+		{ChannelCreditCard, channelCard},
 		{"VIRTUAL_ACCOUNT_MANDIRI", channelUnknown},
 		{"GOPAY", channelUnknown},
 	}

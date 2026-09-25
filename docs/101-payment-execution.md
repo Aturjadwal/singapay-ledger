@@ -13,7 +13,7 @@ sequenceDiagram
     %% Step 1: Create the payment instrument
     Payer->>Frontend: Select product & pay
     Frontend->>LedgerAPI: GeneratePayment (channel, amount, invoice)
-    Note right of LedgerAPI: The channel selects the product:<br/>QRIS / VA_* / EWALLET_* / payment link
+    Note right of LedgerAPI: The channel selects the product:<br/>QRIS / VA_* / EWALLET_* / payment link<br/>CREDIT_CARD = payment link pinned to the<br/>catalogue's card methods
     LedgerAPI->>Singapay: Create VA, QRIS, e-wallet order, or payment link
     Singapay-->>LedgerAPI: VA number, QR payload, or checkout URL
     LedgerAPI->>LedgerAPI: Save ProductTransaction (PENDING) + PaymentRequest

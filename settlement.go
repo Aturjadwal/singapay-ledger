@@ -389,14 +389,16 @@ func (c *LedgerClient) settleOne(ctx context.Context, tx *domain.ProductTransact
 // come from the money-in webhook and are the direct keys; RequestID and PaymentCode, from
 // instrument creation, are the fallbacks for rows that predate those columns. The fallback
 // differs per channel because the instrument and the transaction are the same entity for
-// QRIS and e-wallet and different entities for VA and payment link.
+// QRIS and e-wallet and different entities for VA and payment link (a card payment
+// included, since it is one).
 func (c *LedgerClient) readSettledTransaction(
 	ctx context.Context,
 	gatewayAccountID string,
 	tx *domain.ProductTransaction,
 	paymentReq *domain.PaymentRequest,
 ) (*domain.SettledTransaction, error) {
-	switch paymentChannelKind(paymentReq.PaymentChannel) {
+	kind := paymentChannelKind(paymentReq.PaymentChannel)
+	switch kind {
 
 	case channelVirtualAccount:
 		va, err := c.readVATransaction(ctx, gatewayAccountID, paymentReq)
@@ -493,7 +495,9 @@ func (c *LedgerClient) readSettledTransaction(
 			},
 		}, nil
 
-	case channelPaymentLink:
+	// A card payment is a payment link pinned to the card methods, so it settles as one:
+	// same history row, same absent fee. Only the channel it is booked under differs.
+	case channelPaymentLink, channelCard:
 		history, err := c.readPaymentLinkHistory(ctx, gatewayAccountID, tx, paymentReq)
 		if err != nil {
 			return nil, err
@@ -510,11 +514,15 @@ func (c *LedgerClient) readSettledTransaction(
 		// construction is only zero if both sides are counted in the same unit.
 		gross := history.Amount.Minor()
 		feeMinor := domain.RupiahToMinor(tx.Fee.GatewayFee)
+		channel := ChannelPaymentLink
+		if kind == channelCard {
+			channel = ChannelCreditCard
+		}
 		return &domain.SettledTransaction{
 			MerchantReference:    tx.InvoiceNumber,
 			GatewayTransactionID: strconv.FormatInt(history.ID, 10),
 			GatewayAccountID:     gatewayAccountID,
-			PaymentChannel:       ChannelPaymentLink,
+			PaymentChannel:       channel,
 			GrossMinor:           gross,
 			NetMinor:             gross - feeMinor,
 			FeeMinor:             feeMinor,

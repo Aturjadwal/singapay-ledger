@@ -4,6 +4,55 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added — card payments
+
+`GeneratePayment` takes `PaymentChannel: "CREDIT_CARD"` (`ledger.ChannelCreditCard`). It
+issues a single-use payment link pinned to every method Singapay's payment-link catalogue
+files under the `card` group; the payer enters the card, and passes 3-D Secure, on
+Singapay's hosted page. The response carries the link in `PaymentURL`, as for any payment
+link, and `PaymentChannel` is `CREDIT_CARD`.
+
+Why not Singapay's card API (`POST /api/v2.0/card/{account_id}/payment`): it takes the card
+number, expiry and CVV in the request body, so they would pass through the consuming
+service and this ledger — card data on our servers, and everything that comes with it. It
+also documents no money-in webhook and no settlement status. The hosted page has neither
+problem; Singapay's own page finds its card form by the `card` group, which is why the
+whitelist is read from the catalogue rather than hard-coded.
+
+- A card payment is refused with `CodeInvalidRequest` below Rp 10.000, Singapay's card
+  minimum, before anything is created: "a card payment must be at least Rp10000; this one
+  is Rp…".
+- A catalogue with no card method refuses it with `ErrUnsupportedPaymentChannel`, before a
+  link is created. Unpinned, the link would offer every other channel at a card price.
+- Webhook and settlement need nothing new: the payment-link confirmation books it, and the
+  settling pass reads it back from the payment-link history, booked under `CREDIT_CARD`.
+- **Its fee is never reconciled**, like any payment link's: none is reported, so settlement
+  books the priced fee with `FeeReported = false`.
+- `PaymentGateway` gains `ListPaymentMethods`, which `*singapay.Client` already had.
+  Out-of-tree implementations must add it.
+- Migration **029** activates the `CREDIT_CARD` fee config that 020 loaded inactive. Apply
+  it after deploying this version; its header says what to check first.
+
+### Changed — the fee estimate refuses a channel that cannot be paid
+
+`CalculateFeesForCustomer` returns `ErrUnsupportedPaymentChannel` for a named channel with no
+active fee config. It used to price it with a gateway fee of zero — a quote for a payment
+`GeneratePayment` then refused, and cheaper than any channel that works.
+
+### Changed — the payment channel list is active channels only
+
+`GetPaymentChannelFeeConfigs` returned inactive rows too, so the inactive `CREDIT_CARD` row
+reached payers as a payment method whose estimate and payment both failed. It now reads the
+active configs and leaves out `PLATFORM`, as before.
+
+### Fixed — a payment link's customer pre-fill is sent whole or not at all
+
+Singapay's spec for `POST /api/v2.0/payment-link/{account_id}` requires the name and the
+email together once any customer field is sent, and a phone alone is not enough. A payer
+with no email — possible since the email became optional — was sent a name only, which that
+rule refuses with a 422. Such a payer now gets no pre-fill, and the hosted page asks for
+what it needs. Affects subscription payments too.
+
 ### Added — the platform account can be read and paid out of
 
 `GetPlatformAccount`, `GetPlatformTransactions` and `WithdrawFromPlatform`, plus `OwnerType`
