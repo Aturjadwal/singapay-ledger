@@ -147,6 +147,24 @@ seller would receive less than nothing — the transaction is **left in `COMPLET
 person. It keeps appearing in `GetAwaitingSettlement` and keeps pushing up the oldest-awaiting
 age, which is the loud failure rather than the silent one.
 
+## One transaction, on demand
+
+`CheckTransactionSettlement` is the pass for a single transaction, for an operator who wants
+to know where a payment stands at Singapay now and to have the ledger follow if it has
+settled — without waiting for the next pass or a webhook.
+
+It reuses both halves above: the read is the point lookup in *Reading one transaction back*
+(`readGatewayTransaction`, which also returns the unsettled answer) and the write is
+*Booking* (`bookSettlement`). So a transaction settled on demand is booked exactly as the pass
+would have booked it, and a check that races a pass loses the compare-and-set and writes
+nothing (`ALREADY_SETTLED`).
+
+Only a `COMPLETED` transaction is booked. Singapay is asked whatever the status, read only, and
+its answer comes back beside the ledger's — a `SETTLED` transaction Singapay calls unsettled,
+or a `PENDING` one it calls paid, is worth seeing; neither is corrected by a check (the first
+would need a reversal, the second the money-in webhook). A blocked fee is reported as
+`BLOCKED` with the reason and left `COMPLETED`, as the pass leaves it.
+
 ## Cost
 
 One call per open invoice, instead of N accounts × up to 4 product lists × pagination per

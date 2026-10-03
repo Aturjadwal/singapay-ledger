@@ -599,8 +599,18 @@ func (f *FakeJournalRepository) GetByID(ctx context.Context, id string) (*domain
 	return nil, repo.ErrNotFound
 }
 
+// GetBySourceID returns the journals booked against one source, newest first, the way the
+// Postgres query orders them. GetTransactionDetail reads it, so a stub answering nothing
+// would pass a test that should not.
 func (f *FakeJournalRepository) GetBySourceID(ctx context.Context, sourceType domain.SourceType, sourceID string) ([]*domain.Journal, error) {
-	return nil, nil
+	var result []*domain.Journal
+	for _, j := range f.journals {
+		if j.SourceType == sourceType && j.SourceID == sourceID {
+			result = append(result, j)
+		}
+	}
+	sort.SliceStable(result, func(i, k int) bool { return result[i].CreatedAt.After(result[k].CreatedAt) })
+	return result, nil
 }
 
 func (f *FakeJournalRepository) GetByEventType(ctx context.Context, eventType domain.EventType, page, pageSize int) ([]*domain.Journal, error) {

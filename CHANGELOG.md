@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added — check one transaction's settlement on demand
+
+`CheckTransactionSettlement(ctx, productTransactionUUID)` asks Singapay whether one
+transaction's funds have settled and, if they have and the ledger has not booked it yet,
+books the settlement. It is the settling pass's work for a single transaction, for an
+operator who wants the answer now rather than at the next daily pass.
+
+- **Not a second settlement path.** The read is the pass's point lookup and the write is the
+  pass's `bookSettlement`: the same entries, the same fee rules
+  (`docs/104-fee-mismatch-reconciliation.md`), and the same conditional
+  `COMPLETED → SETTLED` move, so a check racing a pass settles the transaction once.
+- **Only a `COMPLETED` transaction is settled.** Singapay is asked whatever the status, read
+  only, and its answer is returned beside the ledger's (`SettlementCheckResult.Gateway`:
+  `has_settle`, `settle_at`, Singapay's status, ids, and gross/net/fee in sen). A `PENDING`
+  transaction Singapay calls paid is reported, not booked — that needs the money-in webhook.
+- **Outcomes:** `SETTLED` (booked by this check), `ALREADY_SETTLED` (before the check, or a
+  pass got there first), `NOT_SETTLED`, `BLOCKED` (fee cannot be absorbed; `BlockedReason`
+  says why, and the transaction stays `COMPLETED` as the pass leaves it), `NOT_APPLICABLE`
+  (`PENDING`, `FAILED`, `REFUNDED`).
+- **Errors** mean the question could not be answered and nothing was written:
+  `CodeProductTransactionNotFound`, `CodePaymentRequestNotFound`, `CodeInvalidRequest` (the
+  seller has no Singapay sub-account), `CodeGatewayAPIError` (Singapay could not be read),
+  `CodeDatabaseError`.
+
+`GetTransactionDetail(ctx, productTransactionUUID)` is the read beside it: the transaction,
+its payment request, and every journal and ledger entry booked against it, oldest first,
+with the accounts the entries name — so a consumer can explain a payment end to end without
+SQL of its own against these tables. It asks Singapay nothing.
+
+Internals: `readSettledTransaction` is now a wrapper over `readGatewayTransaction`, which
+also reports the unsettled answer (found, `has_settle`, status, `settle_at`). The pass's
+behaviour is unchanged. `bookSettlement` now tells a lost race (`settleOutcomeAlreadySettled`)
+apart from its own settlement; the pass still counts both as settled.
+
 ### Added — card payments
 
 `GeneratePayment` takes `PaymentChannel: "CREDIT_CARD"` (`ledger.ChannelCreditCard`). It

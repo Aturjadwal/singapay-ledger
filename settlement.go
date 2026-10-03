@@ -286,7 +286,9 @@ func (c *LedgerClient) ProcessSettlementNotifications(ctx context.Context, batch
 		}
 
 		switch outcome {
-		case settleOutcomeSettled:
+		// A transaction another pass settled first is settled all the same; the pass
+		// counts what is settled, not which caller wrote it.
+		case settleOutcomeSettled, settleOutcomeAlreadySettled:
 			result.Settled++
 		case settleOutcomeNotYet:
 			result.StillOpen++
@@ -348,6 +350,11 @@ const (
 	settleOutcomeNotYet settleOutcome = iota
 	settleOutcomeSettled
 	settleOutcomeBlocked
+	// settleOutcomeAlreadySettled is bookSettlement losing the race to another caller: the
+	// transaction is settled, and this call wrote nothing. The pass counts it as settled;
+	// CheckTransactionSettlement reports it apart, because "this check settled it" and
+	// "it was already settled" are different answers to the person who pressed the button.
+	settleOutcomeAlreadySettled
 )
 
 // settleOne asks Singapay about one open invoice and, if the funds have settled, books it.
@@ -385,18 +392,58 @@ func (c *LedgerClient) settleOne(ctx context.Context, tx *domain.ProductTransact
 // readSettledTransaction returns the settled gateway row for a transaction, or nil when
 // the funds have not settled yet.
 //
-// Key selection is the interesting part. GatewayTransactionID and GatewayTransactionRef
-// come from the money-in webhook and are the direct keys; RequestID and PaymentCode, from
-// instrument creation, are the fallbacks for rows that predate those columns. The fallback
-// differs per channel because the instrument and the transaction are the same entity for
-// QRIS and e-wallet and different entities for VA and payment link (a card payment
-// included, since it is one).
+// It is readGatewayTransaction with everything short of a settlement folded into nil:
+// the settling pass has no use for a payment that has not settled, only for one that has.
 func (c *LedgerClient) readSettledTransaction(
 	ctx context.Context,
 	gatewayAccountID string,
 	tx *domain.ProductTransaction,
 	paymentReq *domain.PaymentRequest,
 ) (*domain.SettledTransaction, error) {
+	reading, err := c.readGatewayTransaction(ctx, gatewayAccountID, tx, paymentReq)
+	if err != nil {
+		return nil, err
+	}
+	if !reading.Found || !reading.HasSettle {
+		return nil, nil
+	}
+	settled := reading.Settled
+	return &settled, nil
+}
+
+// gatewayReading is what one point lookup at Singapay said about a transaction, whether
+// or not its funds have settled.
+//
+// Settled carries the figures exactly as a settlement would book them. They are only
+// booked when HasSettle is true: before that, a QRIS row has no settled-to-merchant amount
+// yet, so its net and fee are not figures to act on.
+type gatewayReading struct {
+	// Found is false when Singapay holds no payment against the instrument: a virtual
+	// account nobody has paid into, a payment link with no attempt.
+	Found bool
+	// HasSettle is Singapay's has_settle: the funds have reached the merchant balance.
+	HasSettle bool
+	// Status is Singapay's own status for the payment, as it wrote it.
+	Status string
+	// SettleAt is Singapay's settle_at, nil when it reported none.
+	SettleAt *time.Time
+	Settled  domain.SettledTransaction
+}
+
+// readGatewayTransaction reads one transaction back from Singapay.
+//
+// Key selection is the interesting part. GatewayTransactionID and GatewayTransactionRef
+// come from the money-in webhook and are the direct keys; RequestID and PaymentCode, from
+// instrument creation, are the fallbacks for rows that predate those columns. The fallback
+// differs per channel because the instrument and the transaction are the same entity for
+// QRIS and e-wallet and different entities for VA and payment link (a card payment
+// included, since it is one).
+func (c *LedgerClient) readGatewayTransaction(
+	ctx context.Context,
+	gatewayAccountID string,
+	tx *domain.ProductTransaction,
+	paymentReq *domain.PaymentRequest,
+) (*gatewayReading, error) {
 	kind := paymentChannelKind(paymentReq.PaymentChannel)
 	switch kind {
 
@@ -405,25 +452,31 @@ func (c *LedgerClient) readSettledTransaction(
 		if err != nil {
 			return nil, err
 		}
-		if va == nil || !va.HasSettle {
-			return nil, nil
+		if va == nil {
+			return &gatewayReading{}, nil
 		}
 		// The VA fee is a single reported figure, so net is derived rather than read.
 		gross := va.Amount.Minor()
 		fee := va.Fees.Amount.Minor()
-		return &domain.SettledTransaction{
-			MerchantReference:    va.MerchantReffNo,
-			GatewayTransactionID: va.TransactionID,
-			GatewayAccountID:     gatewayAccountID,
-			PaymentChannel:       paymentReq.PaymentChannel,
-			GrossMinor:           gross,
-			NetMinor:             gross - fee,
-			FeeMinor:             fee,
-			FeeReported:          true,
-			Raw: map[string]string{
-				"transaction_id": va.TransactionID,
-				"va_number":      va.VANumber,
-				"status":         string(va.Status),
+		return &gatewayReading{
+			Found:     true,
+			HasSettle: va.HasSettle,
+			Status:    string(va.Status),
+			SettleAt:  millisTimePtr(va.SettleAt),
+			Settled: domain.SettledTransaction{
+				MerchantReference:    va.MerchantReffNo,
+				GatewayTransactionID: va.TransactionID,
+				GatewayAccountID:     gatewayAccountID,
+				PaymentChannel:       paymentReq.PaymentChannel,
+				GrossMinor:           gross,
+				NetMinor:             gross - fee,
+				FeeMinor:             fee,
+				FeeReported:          true,
+				Raw: map[string]string{
+					"transaction_id": va.TransactionID,
+					"va_number":      va.VANumber,
+					"status":         string(va.Status),
+				},
 			},
 		}, nil
 
@@ -436,9 +489,6 @@ func (c *LedgerClient) readSettledTransaction(
 		if err != nil {
 			return nil, fmt.Errorf("failed to read the QRIS transaction: %w", err)
 		}
-		if !qr.HasSettle {
-			return nil, nil
-		}
 		// Derive the fee from the net rather than by summing MDRCost, VendorFee and
 		// OurMargin. How those three relate to the net is not documented, and Singapay's
 		// own field examples do not add up to it — 150 + 50 against a 250 difference. The
@@ -446,21 +496,27 @@ func (c *LedgerClient) readSettledTransaction(
 		// one to trust until the decomposition is confirmed against a sandbox.
 		gross := qr.TotalAmount.Minor()
 		net := qr.SettledToMerchant.Minor()
-		return &domain.SettledTransaction{
-			MerchantReference:    qr.MerchantReffNo,
-			GatewayTransactionID: strconv.FormatInt(qr.ID, 10),
-			GatewayAccountID:     gatewayAccountID,
-			PaymentChannel:       paymentReq.PaymentChannel,
-			GrossMinor:           gross,
-			NetMinor:             net,
-			FeeMinor:             gross - net,
-			FeeReported:          true,
-			Raw: map[string]string{
-				"reff_no":    qr.ReffNo,
-				"status":     string(qr.Status),
-				"mdr_cost":   strconv.FormatInt(qr.MDRCost.Minor(), 10),
-				"vendor_fee": strconv.FormatInt(qr.VendorFee.Minor(), 10),
-				"our_margin": strconv.FormatInt(qr.OurMargin.Minor(), 10),
+		return &gatewayReading{
+			Found:     true,
+			HasSettle: qr.HasSettle,
+			Status:    string(qr.Status),
+			SettleAt:  isoTimePtr(qr.SettleAt),
+			Settled: domain.SettledTransaction{
+				MerchantReference:    qr.MerchantReffNo,
+				GatewayTransactionID: strconv.FormatInt(qr.ID, 10),
+				GatewayAccountID:     gatewayAccountID,
+				PaymentChannel:       paymentReq.PaymentChannel,
+				GrossMinor:           gross,
+				NetMinor:             net,
+				FeeMinor:             gross - net,
+				FeeReported:          true,
+				Raw: map[string]string{
+					"reff_no":    qr.ReffNo,
+					"status":     string(qr.Status),
+					"mdr_cost":   strconv.FormatInt(qr.MDRCost.Minor(), 10),
+					"vendor_fee": strconv.FormatInt(qr.VendorFee.Minor(), 10),
+					"our_margin": strconv.FormatInt(qr.OurMargin.Minor(), 10),
+				},
 			},
 		}, nil
 
@@ -476,22 +532,25 @@ func (c *LedgerClient) readSettledTransaction(
 		if err != nil {
 			return nil, fmt.Errorf("failed to read the e-wallet transaction: %w", err)
 		}
-		if !ew.HasSettle {
-			return nil, nil
-		}
-		return &domain.SettledTransaction{
-			MerchantReference:    ew.MerchantReffNo,
-			GatewayTransactionID: strconv.FormatInt(ew.ID, 10),
-			GatewayAccountID:     gatewayAccountID,
-			PaymentChannel:       paymentReq.PaymentChannel,
-			GrossMinor:           ew.TotalAmount.Minor(),
-			NetMinor:             ew.NetAmount.Minor(),
-			FeeMinor:             ew.MerchantFee.Minor(),
-			FeeReported:          true,
-			Raw: map[string]string{
-				"reff_no": ew.ReffNo,
-				"status":  string(ew.Status),
-				"vendor":  ew.Vendor,
+		return &gatewayReading{
+			Found:     true,
+			HasSettle: ew.HasSettle,
+			Status:    string(ew.Status),
+			SettleAt:  isoTimePtr(ew.SettleAt),
+			Settled: domain.SettledTransaction{
+				MerchantReference:    ew.MerchantReffNo,
+				GatewayTransactionID: strconv.FormatInt(ew.ID, 10),
+				GatewayAccountID:     gatewayAccountID,
+				PaymentChannel:       paymentReq.PaymentChannel,
+				GrossMinor:           ew.TotalAmount.Minor(),
+				NetMinor:             ew.NetAmount.Minor(),
+				FeeMinor:             ew.MerchantFee.Minor(),
+				FeeReported:          true,
+				Raw: map[string]string{
+					"reff_no": ew.ReffNo,
+					"status":  string(ew.Status),
+					"vendor":  ew.Vendor,
+				},
 			},
 		}, nil
 
@@ -502,8 +561,8 @@ func (c *LedgerClient) readSettledTransaction(
 		if err != nil {
 			return nil, err
 		}
-		if history == nil || !history.HasSettle {
-			return nil, nil
+		if history == nil {
+			return &gatewayReading{}, nil
 		}
 		// A payment link reports no fee anywhere — not in the list, not in the detail.
 		// The expected fee is used so the delta is zero by construction, and FeeReported
@@ -518,25 +577,49 @@ func (c *LedgerClient) readSettledTransaction(
 		if kind == channelCard {
 			channel = ChannelCreditCard
 		}
-		return &domain.SettledTransaction{
-			MerchantReference:    tx.InvoiceNumber,
-			GatewayTransactionID: strconv.FormatInt(history.ID, 10),
-			GatewayAccountID:     gatewayAccountID,
-			PaymentChannel:       channel,
-			GrossMinor:           gross,
-			NetMinor:             gross - feeMinor,
-			FeeMinor:             feeMinor,
-			FeeReported:          false,
-			Raw: map[string]string{
-				"reff_no":              history.ReffNo,
-				"payment_link_reff_no": history.PaymentLinkReffNo,
-				"status":               string(history.Status),
+		return &gatewayReading{
+			Found:     true,
+			HasSettle: history.HasSettle,
+			Status:    string(history.Status),
+			SettleAt:  isoTimePtr(history.SettleAt),
+			Settled: domain.SettledTransaction{
+				MerchantReference:    tx.InvoiceNumber,
+				GatewayTransactionID: strconv.FormatInt(history.ID, 10),
+				GatewayAccountID:     gatewayAccountID,
+				PaymentChannel:       channel,
+				GrossMinor:           gross,
+				NetMinor:             gross - feeMinor,
+				FeeMinor:             feeMinor,
+				FeeReported:          false,
+				Raw: map[string]string{
+					"reff_no":              history.ReffNo,
+					"payment_link_reff_no": history.PaymentLinkReffNo,
+					"status":               string(history.Status),
+				},
 			},
 		}, nil
 
 	default:
 		return nil, fmt.Errorf("payment channel %q is not a Singapay money-in product", paymentReq.PaymentChannel)
 	}
+}
+
+// millisTimePtr and isoTimePtr turn Singapay's optional timestamps into nil when absent,
+// so "not reported" never reads as the zero time.
+func millisTimePtr(t singapay.MillisTime) *time.Time {
+	if !t.Set {
+		return nil
+	}
+	v := t.Time
+	return &v
+}
+
+func isoTimePtr(t singapay.ISOTime) *time.Time {
+	if !t.Set {
+		return nil
+	}
+	v := t.Time
+	return &v
 }
 
 // readVATransaction reads the VA payment for a transaction.
@@ -759,13 +842,13 @@ func (c *LedgerClient) bookSettlement(
 	})
 
 	if errors.Is(err, errAlreadySettled) {
-		// Another pass got there first. Nothing was written here, and the caller's
-		// question — is this settled? — is answered yes.
+		// Another pass, or an on-demand check, got there first. Nothing was written here,
+		// and the caller's question — is this settled? — is answered yes.
 		c.logger.InfoContext(ctx, "Transaction was already settled by another pass",
 			"product_transaction_uuid", tx.UUID,
 			"invoice_number", tx.InvoiceNumber,
 		)
-		return settleOutcomeSettled, nil
+		return settleOutcomeAlreadySettled, nil
 	}
 	if err != nil {
 		return settleOutcomeNotYet, fmt.Errorf("failed to write the settlement: %w", err)

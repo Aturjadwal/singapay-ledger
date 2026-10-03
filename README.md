@@ -465,6 +465,30 @@ absorbed the transaction is left `COMPLETED` for a person.
 
 Full detail: [`docs/102-settlement-reconciliation.md`](./docs/102-settlement-reconciliation.md).
 
+**One transaction can be checked on demand.** `CheckTransactionSettlement` does the pass's
+work for a single transaction, for an operator who wants the answer now rather than at the
+next pass: it asks Singapay about that one payment and, if the funds have settled and the
+transaction is `COMPLETED`, books the settlement through the pass's own `bookSettlement` —
+same entries, same fee rules, same compare-and-set, so it cannot double-book against a pass
+running alongside it. Singapay is asked whatever the status (read only), and the result puts
+its answer beside the ledger's:
+
+```go
+result, err := client.CheckTransactionSettlement(ctx, productTransactionUUID)
+// result.Outcome: SETTLED (booked by this check), ALREADY_SETTLED, NOT_SETTLED,
+//                 BLOCKED (fee cannot be absorbed; BlockedReason says why),
+//                 NOT_APPLICABLE (PENDING, FAILED or REFUNDED: nothing to settle)
+// result.PreviousStatus / result.Status: the ledger's status before and after
+// result.Gateway: Singapay's has_settle, settle_at, status, ids and figures (sen)
+```
+
+An error means the question could not be answered — `CodeGatewayAPIError` when Singapay
+could not be read — and nothing was written.
+
+`GetTransactionDetail` is the read beside it: the transaction, its payment request, and every
+journal and ledger entry booked against it with the accounts they name. It asks Singapay
+nothing.
+
 **Still open: `settlement.refunded`.** It can pull back funds that have already become
 `AVAILABLE` and may already have been withdrawn. This ledger has no negative-balance policy,
 so refund deliveries are stored as `NEEDS_REVIEW` and left for a person. That is a business
