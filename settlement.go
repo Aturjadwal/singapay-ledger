@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Aturjadwal/singapay-ledger/domain"
@@ -521,7 +522,7 @@ func (c *LedgerClient) readGatewayTransaction(
 		}, nil
 
 	case channelEwallet:
-		key := paymentReq.GatewayTransactionID
+		key := storedGatewayTransactionID(paymentReq)
 		if key == "" {
 			key = paymentReq.RequestID
 		}
@@ -676,8 +677,8 @@ func (c *LedgerClient) readPaymentLinkHistory(
 	tx *domain.ProductTransaction,
 	paymentReq *domain.PaymentRequest,
 ) (*singapay.PaymentLinkHistory, error) {
-	if paymentReq.GatewayTransactionID != "" {
-		id, err := strconv.ParseInt(paymentReq.GatewayTransactionID, 10, 64)
+	if stored := storedGatewayTransactionID(paymentReq); stored != "" {
+		id, err := strconv.ParseInt(stored, 10, 64)
 		if err == nil {
 			history, err := c.gateway.GetPaymentLinkHistory(ctx, gatewayAccountID, id)
 			if err != nil {
@@ -708,7 +709,7 @@ func (c *LedgerClient) readPaymentLinkHistory(
 // gatewayNumericID resolves the numeric transaction id for the channels whose detail
 // endpoint takes one, preferring the webhook-sourced value over the creation-time one.
 func gatewayNumericID(paymentReq *domain.PaymentRequest) (int64, error) {
-	raw := paymentReq.GatewayTransactionID
+	raw := storedGatewayTransactionID(paymentReq)
 	if raw == "" {
 		raw = paymentReq.RequestID
 	}
@@ -722,6 +723,20 @@ func gatewayNumericID(paymentReq *domain.PaymentRequest) (int64, error) {
 	}
 
 	return id, nil
+}
+
+// storedGatewayTransactionID is the webhook-sourced payment id, or "" when none was
+// stored. A "0" counts as none: the money-in webhook writes its numeric id as given, and a
+// delivery without one — a card paid through a payment link is the case seen in
+// production — leaves "0", which no Singapay endpoint resolves. Read as a real id it sent
+// every lookup to history_id 0 and a 404, so the transaction never settled; read as
+// absent, the lookup takes its fallback key like any row that predates the column.
+func storedGatewayTransactionID(paymentReq *domain.PaymentRequest) string {
+	raw := strings.TrimSpace(paymentReq.GatewayTransactionID)
+	if id, err := strconv.ParseInt(raw, 10, 64); err == nil && id <= 0 {
+		return ""
+	}
+	return raw
 }
 
 // bookSettlement writes the ledger entries for one settled transaction.

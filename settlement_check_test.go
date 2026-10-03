@@ -403,6 +403,37 @@ func TestGetTransactionDetail_UnknownTransaction(t *testing.T) {
 		"the code a consumer switches on is the outer one")
 }
 
+// The stuck card payment, end to end: a stored "0" no longer sends the check to a 404,
+// and the settlement is booked from the history found by invoice.
+func TestCheckTransactionSettlement_CardWithAStoredZeroIdSettles(t *testing.T) {
+	gw := &paymentLinkHistories{
+		fakeGateway: &fakeGateway{},
+		rows: []singapay.PaymentLinkHistory{{
+			ID: 77, PaymentLinkReffNo: "INV-CHECK-1", Amount: singapay.NewAmount(24169, "IDR"), HasSettle: true, Status: "paid",
+		}},
+	}
+	f := newCheckFixture(t, gw, domain.TransactionStatusCompleted)
+	ctx := context.Background()
+	paymentReq, err := f.fakes.PaymentRequest().GetByProductTransactionID(ctx, f.tx.UUID)
+	require.NoError(t, err)
+	paymentReq.PaymentChannel = ChannelCreditCard
+	paymentReq.GatewayTransactionID = "0"
+	require.NoError(t, f.fakes.PaymentRequest().Update(ctx, paymentReq))
+
+	result, err := f.client.CheckTransactionSettlement(ctx, f.tx.UUID)
+
+	require.NoError(t, err)
+	assert.Equal(t, SettlementCheckSettled, result.Outcome)
+	assert.Equal(t, domain.TransactionStatusSettled, result.Status)
+	assert.Equal(t, "77", result.Gateway.GatewayTransactionID)
+	assert.False(t, result.Gateway.FeeReported, "a card reports no fee; the priced one stands")
+	assert.Equal(t, int64(16900), result.Gateway.FeeMinor)
+
+	_, available, err := f.fakes.LedgerEntry().GetAllBalances(ctx, f.seller.UUID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(20000), available)
+}
+
 // A settlement the old DOKU batch reconciler booked sits under a SETTLEMENT_BATCH journal,
 // whose source is the batch, not the transaction. Its entries still name the transaction,
 // and the detail shows them under the journal that booked them.

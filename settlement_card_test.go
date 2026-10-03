@@ -69,3 +69,43 @@ func TestReadSettledTransaction_AnUnsettledCardIsNotSettledYet(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, settled)
 }
+
+// The production case: the card payment's money-in webhook carried no numeric id, so "0"
+// was stored, and every settling pass asked Singapay for history 0 and got a 404 — the
+// transaction never settled. A "0" is no id: the lookup must take the fallback, the
+// history listing matched on the invoice, and never ask for history 0.
+func TestReadSettledTransaction_AStoredZeroIdFallsBackToTheInvoice(t *testing.T) {
+	client, tx, paymentReq := cardSettlementFixture(true)
+	paymentReq.GatewayTransactionID = "0"
+	// paymentLinkHistories does not script GetPaymentLinkHistory: reaching it panics.
+
+	settled, err := client.readSettledTransaction(context.Background(), "01SELLERACCOUNTULID", tx, paymentReq)
+
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, "77", settled.GatewayTransactionID)
+	assert.Equal(t, ChannelCreditCard, settled.PaymentChannel)
+}
+
+func TestStoredGatewayTransactionID(t *testing.T) {
+	for stored, want := range map[string]string{
+		"":         "",
+		"0":        "",
+		" 0 ":      "",
+		"-1":       "",
+		"524493":   "524493",
+		"VA-ABC-1": "VA-ABC-1", // not numeric: a business id, kept as given
+	} {
+		got := storedGatewayTransactionID(&domain.PaymentRequest{GatewayTransactionID: stored})
+		assert.Equal(t, want, got, "stored %q", stored)
+	}
+}
+
+// QRIS reads by the numeric id; a stored "0" must fall back to the instrument id, which
+// for QRIS is the same entity.
+func TestGatewayNumericID_AStoredZeroFallsBackToTheRequestID(t *testing.T) {
+	id, err := gatewayNumericID(&domain.PaymentRequest{GatewayTransactionID: "0", RequestID: "361677"})
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(361677), id)
+}

@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — a stored gateway id of 0 no longer blocks settlement
+
+The money-in webhook stores Singapay's numeric payment id as given, and a delivery without
+one leaves `"0"` in `payment_requests.gateway_transaction_id`. A card payment (a
+card-pinned payment link) did exactly that in production, and every settling pass then
+asked Singapay for payment-link history `0`, got a 404, and failed the transaction:
+`failed to read the payment link history: singapay: http 404: No result for account_id: …
+with history_id: 0`. It never settled.
+
+A stored `"0"` (or any non-positive number) now counts as no id. The read takes the same
+fallback as a row that predates the column: the payment-link history listing matched on the
+invoice number, and the instrument's `request_id` for QRIS and e-wallet. Rows already stuck
+this way settle on the next pass, or on an on-demand check.
+
 ### Added — check one transaction's settlement on demand
 
 `CheckTransactionSettlement(ctx, productTransactionUUID)` asks Singapay whether one
