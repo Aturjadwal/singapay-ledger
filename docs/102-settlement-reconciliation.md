@@ -99,15 +99,16 @@ failure mode a success/failure counter cannot see.
 
 ## Reading one transaction back
 
-The read is a point lookup, not a search: the channel says which endpoint, the payment request
-says which key.
+The read is about one transaction: the channel says which endpoint, the payment request says
+which key. It is a point lookup wherever a key is stored; a payment link without one is searched
+for, once.
 
 | Channel | Endpoint | Key, in order of preference |
 |---|---|---|
 | Virtual account | `GetVATransaction` | `GatewayTransactionRef`, else lookup by `PaymentCode` (the VA number) |
 | QRIS | QRIS detail | `GatewayTransactionID`, else `RequestID` |
 | E-wallet | E-wallet detail | `GatewayTransactionID`, else `RequestID` |
-| Payment link | `GetPaymentLinkHistory` | `GatewayTransactionID`, else `RequestID` |
+| Payment link, card | `GetPaymentLinkHistory` | `GatewayTransactionID` (the attempt's history id), else the history listing filtered on `GatewayTransactionRef` (the attempt's `reff_no`), else a scan of the history — see [Payment links](#payment-links) |
 
 `GatewayTransactionID` and `GatewayTransactionRef` come from the money-in webhook
 ([101](./101-payment-execution.md)) and are the direct keys. `RequestID` and `PaymentCode`, recorded at
@@ -115,7 +116,77 @@ instrument creation, are the fallbacks for rows that predate those columns — a
 differs per channel because **the instrument and the transaction are the same entity for QRIS
 and e-wallet, and different entities for VA and payment link**. A VA is a container; the
 payment that arrives in it has its own business id. A payment link can carry several attempts,
-each with its own.
+each with its own, and its `RequestID` — the link's id — is no key for any of them.
+
+A stored `GatewayTransactionID` of `"0"`, or any other non-positive number, counts as no id. It is
+what a money-in webhook without a numeric id left behind, and no Singapay endpoint resolves it.
+
+### Payment links
+
+Singapay reads a payment-link payment back by `payment_link_histories.id`, the id of one
+**attempt**. Creating the link returns the link's id, which that endpoint does not accept, and a
+payment-link webhook carries no numeric id. A card payment is a payment link pinned to the card
+methods, so all of this applies to it. `readPaymentLinkHistory` takes three routes, cheapest
+first:
+
+1. **A stored attempt id**: `GetPaymentLinkHistory`, a point lookup. The row is checked against the
+   invoice (`payment_link_reff_no` or `reff_no` equals the invoice number) before anything is read
+   from it, and a mismatch is an error: nothing is booked. An id that pointed at another payment
+   would book that payment's amount.
+2. **A stored attempt reference**: the history listing filtered on
+   `reff_no=<GatewayTransactionRef>`, matched exactly. A payment-link webhook reports the attempt's
+   reference as `transaction.reff_no`. That it is the same value as the history row's `reff_no` has
+   not been confirmed against Singapay, so a miss proves nothing and falls through to the scan.
+3. **A scan** of the seller's whole history: unfiltered, newest first, `per_page=100`, matched on
+   `payment_link_reff_no`, which payment creation sets to the invoice number.
+
+**The trap the scan replaces.** v0.7.0 filtered the listing on `reff_no=<invoice>`. Singapay's
+`reff_no` filter does not look at `payment_link_reff_no`; production showed that. By every sign
+it matches a row's **own** `reff_no`, the reference of one attempt, which never holds the
+invoice. The filter found nothing, every time, and the empty answer was read as "Singapay holds
+no payment". Card and payment-link
+transactions stayed `COMPLETED` while Singapay had settled them. `INV-20260925161538-SWIMLQ`,
+settled by Singapay on 1 October, was found only by an unfiltered listing on 8 October. The tests
+passed because the fake gateway ignored the filter; the fake now filters, pages and orders the
+way Singapay does.
+
+**Which attempt.** A link can carry several attempts — a QRIS code generated and abandoned, a VA
+paid after it — and only one of them took the money. The scan returns the first attempt at the
+link that is `paid` or has `has_settle`. An attempt that is neither is kept, and is the answer
+only if the history runs out without a paid one.
+
+**When the scan concludes.** "Not found" is an answer: the pass reads it as "not settled yet" and a
+check reports `found = false`. So it has to be proven, and the scan stops with it only on:
+
+- a page with no rows: the history is exhausted;
+- the last page by Singapay's own `total_pages`;
+- a page whose dated rows were all created before the transaction, less an hour of clock
+  tolerance. The history is newest first and an attempt cannot predate its link, which is created
+  with the transaction, so nothing further down can be its payment. Rows without `created_at` are
+  no evidence either way, and a page of only such rows proves nothing.
+
+A page shorter than `per_page` is not the last page: Singapay may cap `per_page`. The scan walks
+page numbers, so a capped page costs calls but never skips a row.
+
+**When the scan cannot conclude, it is an error.** That covers twenty pages without one of the
+stops above (2,000 attempts on the seller's sub-account since the transaction was created), a
+failed call, and the context's deadline mid-scan; the monoservice's on-demand check runs under 45
+seconds. None of them is "not found". In the pass the transaction is counted as failed, logged,
+and tried again on the next pass. In `CheckTransactionSettlement` it is `CodeGatewayAPIError`, and
+nothing is written.
+
+**What a search finds is stored.** When route 2 or 3 finds the attempt that took the payment,
+`RecordGatewayTransaction` writes its history id and `reff_no` to `payment_requests`, so the next
+read is route 1. The write is one conditional `UPDATE`:
+
+- an id is written only over `NULL`, an empty string, or a value that is not a positive integer
+  (the old `"0"`);
+- a reference is written only over `NULL` or a blank value;
+- a valid value is never replaced.
+
+The write happens whether or not the payment has settled. A card settles days after it is paid,
+and without the write the pass would scan for it every day until then. The write is best-effort:
+if it fails, a warning is logged and the settlement still books.
 
 `domain.SettledTransaction` flattens the four channel shapes into one so the settling logic
 carries no per-channel branches beyond key selection. It is a value type: no table, no
@@ -165,6 +236,9 @@ or a `PENDING` one it calls paid, is worth seeing; neither is corrected by a che
 would need a reversal, the second the money-in webhook). A blocked fee is reported as
 `BLOCKED` with the reason and left `COMPLETED`, as the pass leaves it.
 
+For a payment link, `found = false` is the scan's proven answer. A scan that cannot conclude is
+not `NOT_SETTLED`: it is a `CodeGatewayAPIError`, the same as Singapay failing to answer.
+
 ## Cost
 
 One call per open invoice, instead of N accounts × up to 4 product lists × pagination per
@@ -172,6 +246,9 @@ settlement. The work set is "what is still `COMPLETED`", which shrinks as the pa
 rather than growing with the size of the merchant. A pass is resumable by construction: what a
 truncated pass did not reach is simply still there on the next tick, oldest first.
 `defaultSettlementBatchSize` (200) bounds one pass.
+
+The exception is a payment link with no attempt id stored. It costs one scan, at most 20 calls,
+the first time it is read; after that its id is stored and it costs one call like the rest.
 
 ## What is still open
 

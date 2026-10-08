@@ -217,7 +217,10 @@ type SettlementWindow struct {
 	SettleTo   string
 	// Settled, when set, filters on whether funds have settled at all.
 	Settled *bool
-	// ReffNo matches partially.
+	// ReffNo matches partially. On payment-link histories it does not match
+	// payment_link_reff_no — a filter on a link's reference found nothing in production —
+	// and by every sign reads each row's own reff_no, the reference of one attempt. It
+	// cannot find a payment by the reference the link was created with.
 	ReffNo  string
 	Status  string
 	Page    int
@@ -261,8 +264,9 @@ func withQuery(path string, q url.Values) string {
 //
 // Note the id: this is payment_link_histories.id, the id of one ATTEMPT, not the id of the
 // payment link it belongs to. Creating a link returns the latter, so a caller holding only
-// a created link cannot reach this endpoint — use ListPaymentLinkHistories filtered on
-// ReffNo instead, which is why that filter exists.
+// a created link cannot reach this endpoint. Nor does ListPaymentLinkHistories filtered on
+// ReffNo find the link's attempts by the link's reference: that filter does not read
+// payment_link_reff_no. What does is listing without it and matching PaymentLinkReffNo.
 func (c *Client) GetPaymentLinkHistory(ctx context.Context, accountID string, historyID int64) (*PaymentLinkHistory, error) {
 	var out PaymentLinkHistory
 	path := "/api/v1.0/payment-link-histories/" + accountID + "/" + strconv.FormatInt(historyID, 10)

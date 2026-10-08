@@ -53,7 +53,8 @@ const (
 // GatewaySettlementStatus is what Singapay said about a transaction when it was asked.
 type GatewaySettlementStatus struct {
 	// Found is false when Singapay holds no payment against the instrument yet: a virtual
-	// account nobody has paid into, a payment link with no attempt.
+	// account nobody has paid into, a payment link with no attempt. For a payment link that
+	// is a search's proven answer; a search that could not conclude is an error instead.
 	Found bool `json:"found"`
 	// Settled is Singapay's has_settle: the funds have reached the merchant balance.
 	Settled bool `json:"settled"`
@@ -117,7 +118,8 @@ type SettlementCheckResult struct {
 //
 // An error means the question could not be answered: the transaction or its instrument is
 // unknown, the seller has no Singapay sub-account, Singapay could not be read
-// (CodeGatewayAPIError), or the settlement could not be written. None of those leaves
+// (CodeGatewayAPIError — a payment-link search that ran out of pages or time before it
+// could conclude included), or the settlement could not be written. None of those leaves
 // anything half-booked; bookSettlement writes in one database transaction.
 func (c *LedgerClient) CheckTransactionSettlement(ctx context.Context, productTransactionID string) (*SettlementCheckResult, error) {
 	if productTransactionID == "" {

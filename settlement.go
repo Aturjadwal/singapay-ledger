@@ -36,7 +36,9 @@ import (
 //
 // No window is ever used to select rows, so no window can be misread. The cost is one call
 // per open invoice instead of one call per account per product — bounded by work that is
-// shrinking rather than by the size of the merchant.
+// shrinking rather than by the size of the merchant. (A payment link with no identifier
+// stored costs a search of its account's history the first time; see
+// readPaymentLinkHistory.)
 //
 // The webhook is therefore an optimisation for latency, not a correctness dependency: a
 // delivery that never arrives delays settlement to the next floor-age tick rather than
@@ -360,9 +362,10 @@ const (
 
 // settleOne asks Singapay about one open invoice and, if the funds have settled, books it.
 //
-// The read is a point lookup, not a search: the channel says which endpoint, and the
-// payment request says which key. Nothing about a settlement batch enters into it, which
-// is what makes the result independent of how the batch's window is interpreted.
+// The read is about this one transaction: the channel says which endpoint, and the payment
+// request says which key — or, for a payment link with none stored yet, what to look for in
+// the account's history. Nothing about a settlement batch enters into it, which is what
+// makes the result independent of how the batch's window is interpreted.
 func (c *LedgerClient) settleOne(ctx context.Context, tx *domain.ProductTransaction) (settleOutcome, error) {
 	paymentReq, err := c.repoProvider.PaymentRequest().GetByProductTransactionID(ctx, tx.UUID)
 	if err != nil {
@@ -438,7 +441,9 @@ type gatewayReading struct {
 // instrument creation, are the fallbacks for rows that predate those columns. The fallback
 // differs per channel because the instrument and the transaction are the same entity for
 // QRIS and e-wallet and different entities for VA and payment link (a card payment
-// included, since it is one).
+// included, since it is one). A payment link has no creation-time key for its payment at
+// all, so without a stored one the attempt is searched for — readPaymentLinkHistory — and
+// what the search finds is stored, so it is only searched for once.
 func (c *LedgerClient) readGatewayTransaction(
 	ctx context.Context,
 	gatewayAccountID string,
@@ -558,12 +563,17 @@ func (c *LedgerClient) readGatewayTransaction(
 	// A card payment is a payment link pinned to the card methods, so it settles as one:
 	// same history row, same absent fee. Only the channel it is booked under differs.
 	case channelPaymentLink, channelCard:
-		history, err := c.readPaymentLinkHistory(ctx, gatewayAccountID, tx, paymentReq)
+		history, route, err := c.readPaymentLinkHistory(ctx, gatewayAccountID, tx, paymentReq)
 		if err != nil {
 			return nil, err
 		}
 		if history == nil {
 			return &gatewayReading{}, nil
+		}
+		// Remembered whether or not it has settled yet: a card settles days after it is
+		// paid, and the pass would otherwise search for the same attempt every day until then.
+		if route != paymentLinkByStoredID && tookPayment(history) {
+			c.rememberPaymentLinkAttempt(ctx, tx, paymentReq, history, route)
 		}
 		// A payment link reports no fee anywhere — not in the list, not in the detail.
 		// The expected fee is used so the delta is zero by construction, and FeeReported
@@ -665,45 +675,260 @@ func (c *LedgerClient) readVATransaction(
 	}
 }
 
-// readPaymentLinkHistory reads the settled attempt against a payment link.
+// The bounds of the payment-link history scan in scanPaymentLinkHistories.
+const (
+	// paymentLinkScanPerPage is the page size asked for. Singapay may answer with fewer,
+	// which costs pages but never rows: the scan walks page numbers, not offsets.
+	paymentLinkScanPerPage = 100
+	// paymentLinkScanMaxPages caps one scan at 2,000 attempts on the seller's sub-account
+	// since the transaction was created. A scan that reaches it without an answer is an
+	// error, never a "not found".
+	paymentLinkScanMaxPages = 20
+	// paymentLinkScanMargin is the clock tolerance between Singapay and the database when
+	// deciding the history has gone back past the transaction.
+	paymentLinkScanMargin = time.Hour
+)
+
+// paymentLinkRoute names how readPaymentLinkHistory reached an attempt: for the log line,
+// and for knowing whether the attempt's identifiers are already stored.
+type paymentLinkRoute string
+
+const (
+	paymentLinkByStoredID  paymentLinkRoute = "stored_id"
+	paymentLinkByStoredRef paymentLinkRoute = "stored_reference"
+	paymentLinkByScan      paymentLinkRoute = "scan"
+)
+
+// readPaymentLinkHistory finds the attempt that paid a transaction's payment link.
 //
-// The direct route needs payment_link_histories.id, which is the id of one ATTEMPT and is
-// only known from the money-in webhook. What creation returns is the LINK's id, which this
-// endpoint does not accept — so without a stored attempt id the only route is to list the
-// account's history and match on the reference we set at creation.
+// Singapay reads a payment-link payment back by payment_link_histories.id, the id of one
+// ATTEMPT. Creation returns the LINK's id, which that endpoint does not accept, and a
+// payment-link webhook carries no numeric id — so the attempt is reached by one of three
+// routes, cheapest first:
+//
+//  1. A stored attempt id: a point lookup. The row is checked against the invoice before
+//     anything is read from it, and a mismatch is an error — an id that points at another
+//     payment would book that payment's amount here.
+//  2. A stored attempt reference, which the payment-link webhook reports as
+//     transaction.reff_no: the history listing filtered on reff_no, matched exactly. A miss
+//     proves nothing — that the webhook's reference is the history row's reff_no has not
+//     been confirmed against Singapay — so it falls through to the scan.
+//  3. The scan: the account's whole history, newest first, matched on
+//     payment_link_reff_no, the reference payment creation set to the invoice number. See
+//     scanPaymentLinkHistories.
+//
+// The listing is NOT filtered on the invoice number. v0.7.0 did that, and it never matched:
+// Singapay's reff_no filter does not select on payment_link_reff_no — production showed
+// that — and by every sign selects on a row's own reff_no, the attempt's reference, which
+// never holds the invoice. Its empty answer was then read as "Singapay holds no payment",
+// and no card or payment-link transaction ever settled.
+//
+// A nil attempt with no error means the scan proved there is none. Anything short of proof
+// is an error.
 func (c *LedgerClient) readPaymentLinkHistory(
 	ctx context.Context,
 	gatewayAccountID string,
 	tx *domain.ProductTransaction,
 	paymentReq *domain.PaymentRequest,
-) (*singapay.PaymentLinkHistory, error) {
+) (*singapay.PaymentLinkHistory, paymentLinkRoute, error) {
+	ref := strings.TrimSpace(paymentReq.GatewayTransactionRef)
+
 	if stored := storedGatewayTransactionID(paymentReq); stored != "" {
-		id, err := strconv.ParseInt(stored, 10, 64)
-		if err == nil {
+		if id, err := strconv.ParseInt(stored, 10, 64); err == nil {
 			history, err := c.gateway.GetPaymentLinkHistory(ctx, gatewayAccountID, id)
 			if err != nil {
-				return nil, fmt.Errorf("failed to read the payment link history: %w", err)
+				return nil, "", fmt.Errorf("failed to read the payment link history: %w", err)
 			}
-			return history, nil
+			if !historyBelongsTo(history, tx.InvoiceNumber, ref) {
+				return nil, "", fmt.Errorf("payment link history %d belongs to %q, not %q: refusing to read this transaction's payment from it",
+					id, historyOwner(history), tx.InvoiceNumber)
+			}
+			return history, paymentLinkByStoredID, nil
 		}
 	}
 
-	rows, _, err := c.gateway.ListPaymentLinkHistories(ctx, gatewayAccountID, singapay.SettlementWindow{
-		ReffNo:  tx.InvoiceNumber,
-		PerPage: 25,
-	})
+	if ref != "" {
+		rows, _, err := c.gateway.ListPaymentLinkHistories(ctx, gatewayAccountID, singapay.SettlementWindow{
+			ReffNo:  ref,
+			PerPage: 25,
+		})
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to list payment link histories by attempt reference %q: %w", ref, err)
+		}
+		// The filter matches partially, so the comparison is made exactly here.
+		for i := range rows {
+			if rows[i].ReffNo == ref && historyBelongsTo(&rows[i], tx.InvoiceNumber, ref) {
+				return &rows[i], paymentLinkByStoredRef, nil
+			}
+		}
+	}
+
+	history, err := c.scanPaymentLinkHistories(ctx, gatewayAccountID, tx, ref)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list payment link histories: %w", err)
+		return nil, "", err
 	}
+	return history, paymentLinkByScan, nil
+}
 
-	// ReffNo matches partially, so an exact comparison still has to be made here.
-	for i := range rows {
-		if rows[i].PaymentLinkReffNo == tx.InvoiceNumber || rows[i].ReffNo == tx.InvoiceNumber {
-			return &rows[i], nil
+// scanPaymentLinkHistories walks a sub-account's payment-link history, newest first, for
+// the attempt that paid a transaction's link.
+//
+// A link can carry several attempts — a QRIS code generated and abandoned, then a VA that
+// was paid — and only one of them took the money. An attempt that did (tookPayment) ends
+// the scan; one that did not is kept, and is the answer only if the history runs out
+// without a paid one.
+//
+// "Not found" is an answer, so it has to be proven: the pass reads it as "not settled yet"
+// and an operator's check shows it as such. The scan concludes only on evidence that
+// nothing further down could be this transaction's:
+//
+//   - a page with no rows: the history is exhausted;
+//   - the last page by Singapay's own total_pages;
+//   - a page whose dated rows were all created before the transaction, less
+//     paymentLinkScanMargin. The list is newest first and an attempt cannot predate the
+//     link, which is created with the transaction, so everything after such a page is
+//     older still. A row without a created_at is no evidence either way, and a page with
+//     none dated proves nothing.
+//
+// A short page is not on that list: Singapay may cap per_page, so fewer rows than asked for
+// does not make it the last page. Running out of pages without one of the above is an
+// error, as is any failed call — the context's deadline included, which the on-demand
+// check sets.
+func (c *LedgerClient) scanPaymentLinkHistories(
+	ctx context.Context,
+	gatewayAccountID string,
+	tx *domain.ProductTransaction,
+	ref string,
+) (*singapay.PaymentLinkHistory, error) {
+	cutoff := tx.CreatedAt.Add(-paymentLinkScanMargin)
+	var unpaid *singapay.PaymentLinkHistory
+
+	for page := 1; page <= paymentLinkScanMaxPages; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("stopped scanning the payment link history for %s before page %d: %w", tx.InvoiceNumber, page, err)
+		}
+		rows, pagination, err := c.gateway.ListPaymentLinkHistories(ctx, gatewayAccountID, singapay.SettlementWindow{
+			Page:    page,
+			PerPage: paymentLinkScanPerPage,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan the payment link history for %s at page %d: %w", tx.InvoiceNumber, page, err)
+		}
+
+		for i := range rows {
+			if !historyBelongsTo(&rows[i], tx.InvoiceNumber, ref) {
+				continue
+			}
+			if tookPayment(&rows[i]) {
+				return &rows[i], nil
+			}
+			if unpaid == nil {
+				unpaid = &rows[i]
+			}
+		}
+
+		lastPage := pagination.TotalPages > 0 && page >= pagination.TotalPages
+		if len(rows) == 0 || lastPage || datedRowsAllBefore(rows, cutoff) {
+			return unpaid, nil
 		}
 	}
 
-	return nil, nil
+	return nil, fmt.Errorf(
+		"the payment link history scan for %s was inconclusive: %d pages of up to %d attempts did not reach back to the transaction's creation (%s), and none of them paid it",
+		tx.InvoiceNumber, paymentLinkScanMaxPages, paymentLinkScanPerPage, tx.CreatedAt.UTC().Format(time.RFC3339))
+}
+
+// historyBelongsTo reports whether a payment-link history row is an attempt at this
+// transaction's link.
+//
+// payment_link_reff_no is the link's reference, which payment creation sets to the invoice
+// number. reff_no is the attempt's own reference, not the invoice; it is still compared, as
+// v0.7.0 compared it, because an invoice found there would be no less this transaction's.
+// A row that matches nothing but the stored attempt reference is taken only when it names
+// no link reference at all: one that names another invoice is that invoice's, whatever its
+// reff_no says.
+func historyBelongsTo(h *singapay.PaymentLinkHistory, invoiceNumber, ref string) bool {
+	if invoiceNumber != "" && (h.PaymentLinkReffNo == invoiceNumber || h.ReffNo == invoiceNumber) {
+		return true
+	}
+	return ref != "" && h.ReffNo == ref && h.PaymentLinkReffNo == ""
+}
+
+// historyOwner is the reference a history row says it belongs to, for an error message.
+func historyOwner(h *singapay.PaymentLinkHistory) string {
+	if h.PaymentLinkReffNo != "" {
+		return h.PaymentLinkReffNo
+	}
+	return h.ReffNo
+}
+
+// tookPayment reports whether an attempt is the one that took the money: Singapay marked it
+// paid, or has already settled it.
+func tookPayment(h *singapay.PaymentLinkHistory) bool {
+	return h.Status == singapay.PaymentPaid || h.HasSettle
+}
+
+// datedRowsAllBefore reports whether a page proves the history has gone back past t: it
+// holds at least one row with a created_at, and every such row was created before t.
+func datedRowsAllBefore(rows []singapay.PaymentLinkHistory, t time.Time) bool {
+	dated := false
+	for i := range rows {
+		if !rows[i].CreatedAt.Set {
+			continue
+		}
+		if !rows[i].CreatedAt.Time.Before(t) {
+			return false
+		}
+		dated = true
+	}
+	return dated
+}
+
+// rememberPaymentLinkAttempt stores the identifiers of an attempt a search found, so the
+// next read of the transaction is the point lookup rather than another search.
+//
+// Only the attempt that took the payment is passed here: an abandoned attempt's id, once
+// stored, would be read back as the payment from then on. The write is
+// RecordGatewayTransaction's conditional one, which fills what is missing and never
+// replaces a valid identifier. And it is best-effort — the read has already succeeded, and
+// a settlement is not failed because a shortcut could not be written; the next read simply
+// searches again.
+func (c *LedgerClient) rememberPaymentLinkAttempt(
+	ctx context.Context,
+	tx *domain.ProductTransaction,
+	paymentReq *domain.PaymentRequest,
+	history *singapay.PaymentLinkHistory,
+	route paymentLinkRoute,
+) {
+	var id string
+	if history.ID > 0 {
+		id = strconv.FormatInt(history.ID, 10)
+	}
+	ref := strings.TrimSpace(history.ReffNo)
+	if id == "" && ref == "" {
+		return
+	}
+
+	recorded, err := c.repoProvider.PaymentRequest().RecordGatewayTransaction(ctx, paymentReq.UUID, id, ref)
+	if err != nil {
+		c.logger.WarnContext(ctx, "Could not store the payment link attempt a search found; the next read searches again",
+			"product_transaction_uuid", tx.UUID,
+			"invoice_number", tx.InvoiceNumber,
+			"payment_link_history_id", id,
+			"found_by", string(route),
+			"error", err,
+		)
+		return
+	}
+	if recorded {
+		c.logger.InfoContext(ctx, "Stored the payment link attempt a search found",
+			"product_transaction_uuid", tx.UUID,
+			"invoice_number", tx.InvoiceNumber,
+			"payment_link_history_id", id,
+			"payment_link_attempt_reference", ref,
+			"found_by", string(route),
+		)
+	}
 }
 
 // gatewayNumericID resolves the numeric transaction id for the channels whose detail
@@ -725,12 +950,12 @@ func gatewayNumericID(paymentReq *domain.PaymentRequest) (int64, error) {
 	return id, nil
 }
 
-// storedGatewayTransactionID is the webhook-sourced payment id, or "" when none was
-// stored. A "0" counts as none: the money-in webhook writes its numeric id as given, and a
-// delivery without one — a card paid through a payment link is the case seen in
-// production — leaves "0", which no Singapay endpoint resolves. Read as a real id it sent
-// every lookup to history_id 0 and a 404, so the transaction never settled; read as
-// absent, the lookup takes its fallback key like any row that predates the column.
+// storedGatewayTransactionID is the stored payment id, or "" when there is none. A "0"
+// counts as none: the money-in webhook stored its numeric id as given, and a delivery
+// without one — a card paid through a payment link is the case seen in production — left
+// "0", which no Singapay endpoint resolves. Read as a real id it sent every lookup to
+// history_id 0 and a 404, so the transaction never settled; read as absent, the lookup
+// takes its fallback like any row that predates the column.
 func storedGatewayTransactionID(paymentReq *domain.PaymentRequest) string {
 	raw := strings.TrimSpace(paymentReq.GatewayTransactionID)
 	if id, err := strconv.ParseInt(raw, 10, 64); err == nil && id <= 0 {

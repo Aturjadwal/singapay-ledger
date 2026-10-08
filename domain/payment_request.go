@@ -63,6 +63,15 @@ type PaymentRequestRepository interface {
 	GetByProductTransactionID(ctx context.Context, productTransactionID string) (*PaymentRequest, error)
 	Save(ctx context.Context, pr *PaymentRequest) error
 	Update(ctx context.Context, pr *PaymentRequest) error
+
+	// RecordGatewayTransaction fills in gateway identifiers the ledger found for itself —
+	// settlement locating a payment-link attempt by searching for it — and reports whether
+	// the row changed. It only fills what is missing: an id is written over NULL, an empty
+	// string or a value that is not a positive integer (the "0" a payment-link webhook
+	// used to leave), a ref only over NULL or an empty string, and an empty argument
+	// writes nothing. A valid identifier is never replaced, and an unknown id changes
+	// nothing and is not an error.
+	RecordGatewayTransaction(ctx context.Context, paymentRequestID, id, ref string) (bool, error)
 }
 
 // NewPaymentRequest creates a payment request for a freshly issued instrument.

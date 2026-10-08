@@ -4,6 +4,53 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — card and payment-link payments are found by scanning the history, and settle
+
+The entry below for v0.7.0 says rows stuck with a stored `"0"` "settle on the next pass, or on
+an on-demand check". That was wrong: none did. Its fallback listed the payment-link history
+filtered on `reff_no=<invoice>`, but Singapay's `reff_no` filter does not look at
+`payment_link_reff_no`, where the invoice is. By every sign it matches a row's **own**
+`reff_no`, the reference of one payment attempt, which never holds the invoice. It returned
+nothing, and the empty answer was read as "Singapay holds no payment". So every card and payment-link transaction without a
+stored attempt id — all of them, since a payment-link webhook carries none — stayed
+`COMPLETED` after Singapay had settled it: the seller's share sat in the pending balance and
+the platform-fee sweep never ran. `INV-20260925161538-SWIMLQ`, settled by Singapay on
+1 October, is the production case. v0.7.0's tests passed because the fake gateway ignored the
+filter; the fake now filters, pages and orders the way Singapay does, and the old code fails
+against it.
+
+Reading a payment link (a card payment is one) now takes three routes, cheapest first:
+
+- **The stored attempt id**, read directly and now **checked against the invoice**. An id whose
+  attempt belongs to another invoice is an error and nothing is booked; it used to be trusted
+  blindly.
+- **The stored attempt reference** (`gateway_transaction_ref`): the history filtered on it,
+  matched exactly. A miss falls through rather than meaning "not found".
+- **A scan** of the seller's history: unfiltered, newest first, 100 per page, matched on
+  `payment_link_reff_no`. Of several attempts at one link, the one Singapay marked `paid` (or
+  settled) is taken.
+
+"Not found" now has to be proven. The scan answers it only on an empty page, the last page by
+Singapay's `total_pages`, or a page whose dated rows were all created more than an hour before
+the transaction. Anything short of that is an error: 20 pages without a conclusion, a failed
+call, or the context's deadline. **Operators see that as `CodeGatewayAPIError` from
+`CheckTransactionSettlement`** (in the monoservice, the 424 "Singapay could not be read"), where
+v0.7.0 would have said `NOT_SETTLED`. The pass counts it as failed and tries again next time.
+`found = false` now means Singapay holds no attempt at the link.
+
+What a search finds is stored. The attempt's id and `reff_no` go to `payment_requests` through
+the new `PaymentRequestRepository.RecordGatewayTransaction`, so the next read is a point lookup
+— and a card, which settles days after it is paid, is not searched for every day until then.
+It is one conditional `UPDATE`: an id is written only over NULL, an empty string or a value
+that is not a positive integer, a reference only over NULL or blank, and a valid value is never
+replaced. It is best-effort: a failed write is logged as a warning and the settlement still
+books. Out-of-tree implementations of `PaymentRequestRepository` must add the method.
+
+Rows already stuck are read again by the next pass (they are past the 24-hour floor) or by an
+on-demand check. Unlike v0.7.0's, that claim has been tested against a fake that behaves like
+Singapay, but it is a claim about Singapay's API until a production check confirms it. No
+schema change; `bookSettlement`, the fee rules and the state machine are untouched.
+
 ### Fixed — a stored gateway id of 0 no longer blocks settlement
 
 The money-in webhook stores Singapay's numeric payment id as given, and a delivery without

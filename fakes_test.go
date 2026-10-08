@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/Aturjadwal/singapay-ledger/domain"
@@ -626,6 +627,11 @@ type FakePaymentRequestRepository struct {
 	// updates counts Update calls, so a duplicate delivery can be shown to have written
 	// nothing rather than merely to have returned nil.
 	updates int
+
+	// recorded counts RecordGatewayTransaction calls that changed a row; recordErr fails
+	// every such call, to show settlement does not depend on it.
+	recorded  int
+	recordErr error
 }
 
 func NewFakePaymentRequestRepository() *FakePaymentRequestRepository {
@@ -678,6 +684,46 @@ func (f *FakePaymentRequestRepository) Update(ctx context.Context, pr *domain.Pa
 	f.byID[pr.UUID] = pr
 	f.byProduct[pr.ProductTransactionUUID] = pr
 	return nil
+}
+
+// RecordGatewayTransaction mirrors the Postgres statement: each identifier is filled only
+// where the row has no valid one, and the answer says whether anything changed.
+func (f *FakePaymentRequestRepository) RecordGatewayTransaction(ctx context.Context, paymentRequestID, id, ref string) (bool, error) {
+	if f.recordErr != nil {
+		return false, f.recordErr
+	}
+	pr, ok := f.byID[paymentRequestID]
+	if !ok {
+		return false, nil
+	}
+
+	id, ref = strings.TrimSpace(id), strings.TrimSpace(ref)
+	changed := false
+	if positiveInteger(id) && !positiveInteger(pr.GatewayTransactionID) {
+		pr.GatewayTransactionID = id
+		changed = true
+	}
+	if ref != "" && strings.TrimSpace(pr.GatewayTransactionRef) == "" {
+		pr.GatewayTransactionRef = ref
+		changed = true
+	}
+	if changed {
+		f.recorded++
+	}
+	return changed, nil
+}
+
+// positiveInteger is '^[1-9][0-9]*$', the rule the Postgres statement applies.
+func positiveInteger(s string) bool {
+	if s == "" || s[0] == '0' {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // FakeRepositoryProvider implements repo.RepositoryProvider interface

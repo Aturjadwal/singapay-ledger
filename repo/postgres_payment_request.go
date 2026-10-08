@@ -3,6 +3,7 @@ package repo
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"time"
 
 	"github.com/21strive/redifu"
@@ -131,6 +132,74 @@ func (r *PostgresPaymentRequestRepository) Update(ctx context.Context, pr *domai
 	}
 
 	return nil
+}
+
+// recordGatewayTransactionSQL fills each identifier only where the row has none: an id over
+// NULL, an empty string or anything that is not a positive integer, a ref over NULL or
+// blank. The WHERE repeats both conditions so a row with nothing to fill is not touched at
+// all, updated_at included, and RowsAffected says whether anything was written. The
+// parameters are cast because each is used more than once, and Postgres refuses a
+// parameter whose uses deduce different types.
+const recordGatewayTransactionSQL = `
+		UPDATE payment_requests SET
+			gateway_transaction_id = CASE
+				WHEN $2::text <> '' AND COALESCE(gateway_transaction_id, '') !~ '^[1-9][0-9]*$' THEN $2::text
+				ELSE gateway_transaction_id
+			END,
+			gateway_transaction_ref = CASE
+				WHEN $3::text <> '' AND btrim(COALESCE(gateway_transaction_ref, '')) = '' THEN $3::text
+				ELSE gateway_transaction_ref
+			END,
+			updated_at = $4
+		WHERE uuid = $1
+		  AND (
+			($2::text <> '' AND COALESCE(gateway_transaction_id, '') !~ '^[1-9][0-9]*$')
+			OR ($3::text <> '' AND btrim(COALESCE(gateway_transaction_ref, '')) = '')
+		  )
+	`
+
+// RecordGatewayTransaction fills in the identifiers settlement found for itself, where the
+// row has none (see domain.PaymentRequestRepository).
+//
+// One conditional statement rather than Update from an in-memory copy: a copy read before
+// the money-in webhook stored its identifiers would write them back to empty, and the row,
+// not a copy, is what knows whether a valid id is already there. An id that is not a
+// positive integer is no id, and is not written.
+func (r *PostgresPaymentRequestRepository) RecordGatewayTransaction(ctx context.Context, paymentRequestID, id, ref string) (bool, error) {
+	id = strings.TrimSpace(id)
+	if !isPositiveInteger(id) {
+		id = ""
+	}
+	ref = strings.TrimSpace(ref)
+	if id == "" && ref == "" {
+		return false, nil
+	}
+
+	result, err := r.db.ExecContext(ctx, recordGatewayTransactionSQL, paymentRequestID, id, ref, time.Now().UTC())
+	if err != nil {
+		return false, ErrFailedInsertSQL.WithError(err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, ErrFailedQuerySQL.WithError(err)
+	}
+
+	return rowsAffected > 0, nil
+}
+
+// isPositiveInteger is the Go side of the '^[1-9][0-9]*$' the statement above matches: a
+// positive integer as strconv.FormatInt writes one.
+func isPositiveInteger(s string) bool {
+	if s == "" || s[0] == '0' {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // scanOne scans a single row into a PaymentRequest
