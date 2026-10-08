@@ -1,8 +1,11 @@
 package ledger
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 
@@ -90,7 +93,9 @@ func newWebhookFixture(t *testing.T) *webhookFixture {
 
 // vaPaidBody is a virtual-account payment confirmation. VA is the channel that carries its
 // own fee, and it puts the merchant reference in reff_no rather than merchant_reff_no —
-// both of which the parser has to get right for any of this to match an invoice.
+// both of which the parser has to get right for any of this to match an invoice. Like
+// Singapay's documented VA sample it carries no numeric transaction.id: the business id in
+// transaction_id is the payment's only identifier.
 func vaPaidBody(charged int64) []byte {
 	return []byte(fmt.Sprintf(`{
 		"status": 200,
@@ -98,7 +103,6 @@ func vaPaidBody(charged int64) []byte {
 		"event": "va-transaction",
 		"data": {
 			"transaction": {
-				"id": 991,
 				"reff_no": %q,
 				"transaction_id": "SP-TX-991",
 				"type": "va",
@@ -118,12 +122,77 @@ func vaPaidBody(charged int64) []byte {
 	}`, webhookInvoice, charged, charged, webhookGatewayFee))
 }
 
+// qrisPaidBody is a QRIS payment confirmation: the numeric transaction.id is its key, and
+// the invoice rides in merchant_reff_no.
+func qrisPaidBody() []byte {
+	return []byte(fmt.Sprintf(`{
+		"status": 200,
+		"success": true,
+		"event": "qris-acquirer-transaction",
+		"data": {
+			"transaction": {
+				"id": 42,
+				"reff_no": "6601K62BH34X445J046C4W5249E6",
+				"merchant_reff_no": %q,
+				"type": "qris",
+				"status": "paid",
+				"amount": %d,
+				"total_amount": %d
+			},
+			"payment": {"method": "qris"}
+		}
+	}`, webhookInvoice, webhookTotal, webhookTotal))
+}
+
+// paymentLinkPaidBody is a payment-link confirmation — a card payment's included — shaped
+// like Singapay's documented sample: no event field, no transaction.id, no transaction_id.
+// The invoice rides on the link; transaction.reff_no is the reference of the attempt that
+// paid, and an empty attempt leaves it out altogether.
+func paymentLinkPaidBody(attempt string) []byte {
+	reffNo := ""
+	if attempt != "" {
+		reffNo = fmt.Sprintf(`"reff_no": %q,`, attempt)
+	}
+	return []byte(fmt.Sprintf(`{
+		"status": 200,
+		"success": true,
+		"data": {
+			"transaction": {
+				%s
+				"type": "pl",
+				"status": "paid",
+				"amount": {"value": "%d.00", "currency": "IDR"}
+			},
+			"payment": {
+				"method": "payment_link",
+				"additional_info": {"payment_link": {"id": 98465, "reff_no": %q}}
+			}
+		}
+	}`, reffNo, webhookTotal, webhookInvoice))
+}
+
 func webhookRequest(body []byte) singapay.WebhookRequest {
 	return singapay.WebhookRequest{
 		Endpoint:  "/singapay/notification",
 		Body:      body,
 		Signature: "scripted",
 	}
+}
+
+// paymentRequest reads back the payment request the delivery wrote its identifiers to.
+func (f *webhookFixture) paymentRequest(t *testing.T) *domain.PaymentRequest {
+	t.Helper()
+	pr, err := f.fakes.paymentRequestRepo.GetByProductTransactionID(context.Background(), f.productTx.UUID)
+	require.NoError(t, err)
+	return pr
+}
+
+// captureWarnings swaps the fixture's logger for one that keeps warnings and errors, so a
+// test can read what the delivery reported.
+func (f *webhookFixture) captureWarnings() *bytes.Buffer {
+	var logs bytes.Buffer
+	f.client.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	return &logs
 }
 
 // balances sums the entries actually written, which is the only number that can prove a
@@ -324,6 +393,69 @@ func TestHandlePaymentSuccess_MatchesAPaymentLinkByItsLinkReference(t *testing.T
 	require.NoError(t, f.client.HandlePaymentSuccess(context.Background(), webhookRequest(body)))
 
 	assert.Equal(t, webhookSellerNet, f.balances(t, f.seller.UUID))
+}
+
+// The production case behind this: a card payment's webhook carries no numeric id and no
+// transaction_id, so the payment request was left with id "0" and no reference, and
+// settlement had nothing to find the payment by. What the delivery does carry is the
+// attempt's reff_no — the value payment_link_histories.reff_no holds — and that is kept.
+func TestHandlePaymentSuccess_APaymentLinkKeepsItsAttemptReference(t *testing.T) {
+	f := newWebhookFixture(t)
+	logs := f.captureWarnings()
+
+	require.NoError(t, f.client.HandlePaymentSuccess(context.Background(),
+		webhookRequest(paymentLinkPaidBody("18917720251110094037705"))))
+
+	assert.Equal(t, webhookSellerNet, f.balances(t, f.seller.UUID))
+	pr := f.paymentRequest(t)
+	assert.Empty(t, pr.GatewayTransactionID, "no id was sent, and a 0 is not one — stored as NULL")
+	assert.Equal(t, "18917720251110094037705", pr.GatewayTransactionRef)
+	assert.NotContains(t, logs.String(), "carries no attempt reference")
+}
+
+// A virtual account is read back by its business id, which it keeps; its webhook carries no
+// numeric id either, so none is stored rather than "0".
+func TestHandlePaymentSuccess_AVirtualAccountKeepsItsBusinessIdAndNoZeroId(t *testing.T) {
+	f := newWebhookFixture(t)
+
+	require.NoError(t, f.client.HandlePaymentSuccess(context.Background(), webhookRequest(vaPaidBody(webhookTotal))))
+
+	pr := f.paymentRequest(t)
+	assert.Empty(t, pr.GatewayTransactionID)
+	assert.Equal(t, "SP-TX-991", pr.GatewayTransactionRef)
+}
+
+// QRIS is unchanged: its numeric id is the key its detail endpoint takes.
+func TestHandlePaymentSuccess_AQRISPaymentKeepsItsNumericId(t *testing.T) {
+	f := newWebhookFixture(t)
+
+	require.NoError(t, f.client.HandlePaymentSuccess(context.Background(), webhookRequest(qrisPaidBody())))
+
+	assert.Equal(t, webhookSellerNet, f.balances(t, f.seller.UUID))
+	pr := f.paymentRequest(t)
+	assert.Equal(t, "42", pr.GatewayTransactionID)
+	assert.Empty(t, pr.GatewayTransactionRef)
+}
+
+// A payment-link delivery without an attempt reference is still a payment, so it is
+// booked. The missing handle is reported, because settlement will have to search for this
+// payment instead of reading it back — and reported once: the redelivery books nothing.
+func TestHandlePaymentSuccess_APaymentLinkWithoutAnAttemptReferenceIsBookedAndReported(t *testing.T) {
+	f := newWebhookFixture(t)
+	logs := f.captureWarnings()
+	ctx := context.Background()
+
+	require.NoError(t, f.client.HandlePaymentSuccess(ctx, webhookRequest(paymentLinkPaidBody(""))))
+	require.NoError(t, f.client.HandlePaymentSuccess(ctx, webhookRequest(paymentLinkPaidBody(""))))
+
+	assert.Equal(t, webhookSellerNet, f.balances(t, f.seller.UUID), "booked, once")
+	pr := f.paymentRequest(t)
+	assert.Empty(t, pr.GatewayTransactionID)
+	assert.Empty(t, pr.GatewayTransactionRef)
+
+	assert.Equal(t, 1, strings.Count(logs.String(), "Payment-link money-in webhook carries no attempt reference"))
+	assert.Contains(t, logs.String(), webhookInvoice)
+	assert.Contains(t, logs.String(), f.productTx.UUID)
 }
 
 // A verified delivery naming an invoice this ledger has never issued is a 404, not a

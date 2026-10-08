@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — payment-link webhooks keep the attempt reference and no longer store a fake id 0
+
+`HandlePaymentSuccess` stored `transaction.id`, formatted as a number, in
+`payment_requests.gateway_transaction_id` and `transaction.transaction_id` in
+`gateway_transaction_ref`, whatever the channel. A payment-link webhook — a card payment's
+included — carries neither: the id was stored as `"0"` and the reference was left empty, while
+`transaction.reff_no`, the one attribute that identifies the payment (the reference of the
+attempt that paid, the same value `payment_link_histories.reff_no` holds), was thrown away.
+`INV-20260925161538-SWIMLQ` is the production case: id `"0"`, no reference, and nothing for
+settlement to find the payment by.
+
+What a booked webhook now stores, per channel:
+
+| Webhook | `gateway_transaction_id` | `gateway_transaction_ref` |
+|---|---|---|
+| Virtual account | empty — none is sent (was `"0"`) | `transaction.transaction_id` (unchanged) |
+| QRIS, e-wallet | `transaction.id` (unchanged) | empty (unchanged) |
+| Payment link, card | empty — none is sent (was `"0"`) | `transaction.reff_no` (was empty) |
+
+- `singapay.MoneyInNotification.GatewayTransactionIdentifiers()` decides this, and
+  `HandlePaymentSuccess` stores what it returns. Nothing else about booking changes: the
+  invoice match, the amount check, the `PENDING → COMPLETED` compare-and-set, the journal, the
+  entries and the answer to Singapay are as they were.
+- `PaymentRequest.SetGatewayTransaction` ignores an id that reads as a whole number of zero or
+  less, so `"0"` cannot be stored through any caller. Values are trimmed of surrounding spaces.
+- A payment-link webhook without `transaction.reff_no` is still booked, and logs a warning
+  once the booking commits: "Payment-link money-in webhook carries no attempt reference —
+  settlement will have to scan for it", with `invoice_number` and `product_tx_id`.
+- The webhook makes no extra call to Singapay. No migration.
+
+Rows booked before this change keep what they hold: `"0"` on VA and payment-link rows —
+harmless for VA, which is read back by its reference, and read as no id by settlement since
+"a stored gateway id of 0 no longer blocks settlement" — and no reference on payment-link
+rows. The webhook body is not kept anywhere, so those references cannot be recovered from
+it; settlement finds those payments by scanning the account's payment-link history instead,
+and stores the attempt's id and reference when it does (the entry below). A consumer that
+displays `gateway_transaction_id` sees it empty rather than `"0"` on new VA rows, and on new
+payment-link and card rows until settlement has found the attempt and stored its history id.
+
 ### Fixed — card and payment-link payments are found by scanning the history, and settle
 
 The entry below for v0.7.0 says rows stuck with a stored `"0"` "settle on the next pass, or on

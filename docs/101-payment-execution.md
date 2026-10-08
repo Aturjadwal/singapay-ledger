@@ -64,10 +64,16 @@ sequenceDiagram
   - **Platform entry**: `+PlatformFee` into **PENDING**
   - **Gateway entry**: `+GatewayFee` into **PENDING**
 - **Gateway identifiers recorded**: the webhook is the first moment the PAYMENT exists at
-  Singapay for every channel, so `SetGatewayTransaction` stores both
-  `gateway_transaction_id` (numeric) and `gateway_transaction_ref` (business id) on the
-  payment request, in the same database transaction as the status move. Settlement reads the
-  transaction back with them — see [102](./102-settlement-reconciliation.md).
+  Singapay for every channel, so `SetGatewayTransaction` stores the identifiers that channel's
+  webhook carries on the payment request, in the same database transaction as the status
+  move. `MoneyInNotification.GatewayTransactionIdentifiers` says which:
+  `gateway_transaction_id` is the numeric `transaction.id` (QRIS, e-wallet), and
+  `gateway_transaction_ref` is the VA's business id (`transaction.transaction_id`) or, for a
+  payment link or card, the reference of the attempt that paid (`transaction.reff_no`). VA
+  and payment-link webhooks carry no numeric id, so the webhook leaves theirs empty — never
+  `"0"`, which `SetGatewayTransaction` refuses. Settlement reads the transaction back with
+  them, and for a payment link stores the attempt's history id once it has found the attempt
+  — see [102](./102-settlement-reconciliation.md#payment-links).
 - **Why pending?** Singapay holds the funds until settlement. Nothing is withdrawable yet.
 
 ## Three things about Singapay that shape this
@@ -88,8 +94,9 @@ never match a payment link to its invoice.
 created, names the instrument — and for VA and payment link that is a different entity from
 the transaction: a VA is a container, and the payment arriving in it has its own business id;
 a payment link can carry several attempts. So the webhook's identifiers are stored separately,
-and settlement uses those. Two of them, because the four detail endpoints disagree about which
-one they take.
+and settlement uses those. Two of them, because the four channels disagree about which one
+they report: a numeric id for QRIS and e-wallet, a business id for VA, and for a payment link
+only the attempt's `reff_no`.
 
 **The amounts booked come from the transaction as priced, not from the webhook.** The fee
 Singapay actually took is not final until settlement. If the webhook reports a charged amount

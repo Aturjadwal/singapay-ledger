@@ -168,12 +168,12 @@ yang dipakai untuk membaca pembayaran itu kembali dari Singapay. Satu `PaymentRe
 | `product_transaction_uuid` | VARCHAR(255) FK | Transaksi yang ditautkan |
 | `request_id` | VARCHAR(100) UNIQUE | ID **instrumen** dari Singapay (ULID VA, id QRIS/link, id e-wallet) |
 | `payment_code` | TEXT | Nomor VA, atau payload EMVCo QRIS lengkap yang di-scan pembeli |
-| `payment_channel` | VARCHAR(50) | `QRIS`, `VA_BCA`, `VA_BRI`, `VA_MANDIRI`, `VA_BNI`, `EWALLET_*`, `PAYMENT_LINK` |
+| `payment_channel` | VARCHAR(50) | `QRIS`, `VA_BCA`, `VA_BRI`, `VA_MANDIRI`, `VA_BNI`, `EWALLET_*`, `PAYMENT_LINK`, `CREDIT_CARD` |
 | `payment_url` | TEXT | URL bagi buyer untuk menyelesaikan pembayaran |
 | `amount` | BIGINT | Total yang dibebankan ke buyer |
 | `currency` | VARCHAR(3) | `IDR` atau `USD` |
-| `gateway_transaction_id` | VARCHAR(100) | Id numerik **pembayaran** dari money-in webhook |
-| `gateway_transaction_ref` | VARCHAR(100) | Id bisnis **pembayaran** dari money-in webhook |
+| `gateway_transaction_id` | VARCHAR(100) | Id numerik **pembayaran** dari money-in webhook (`transaction.id`): QRIS dan e-wallet. Webhook tidak mengisinya untuk VA dan payment link/kartu; untuk payment link/kartu, settlement mengisinya dengan id percobaan (`payment_link_histories.id`) setelah menemukannya. Baris lama bisa berisi `"0"` — lihat di bawah |
+| `gateway_transaction_ref` | VARCHAR(100) | Referensi **pembayaran** dari money-in webhook: id bisnis (`transaction.transaction_id`) untuk VA; referensi percobaan bayar (`transaction.reff_no`) untuk payment link/kartu |
 | `expires_at` | TIMESTAMP | Kadaluarsa yang diminta ke Singapay saat instrumen dibuat |
 | `created_at` | TIMESTAMP | Waktu pembuatan |
 | `updated_at` | TIMESTAMP | Waktu update terakhir |
@@ -187,10 +187,33 @@ satu payment link bisa menampung beberapa percobaan, masing-masing dengan id sen
 
 `gateway_transaction_id` dan `gateway_transaction_ref` diisi dari money-in webhook — momen
 pertama transaksinya benar-benar ada di Singapay untuk semua channel. Dua kolom karena keempat
-endpoint detail tidak sepakat: id numerik untuk QRIS, e-wallet dan payment link; id bisnis
-untuk VA. Keduanya datang di webhook yang sama, jadi menyimpan dua-duanya menghilangkan
-tebakan per-channel dari jalur baca settlement. Kosong pada baris yang lebih tua dari kolom
-ini, dan pembacanya memperlakukan itu sebagai "pakai lookup per-channel", bukan error.
+channel tidak sepakat soal pengenal mana yang dikirim webhook-nya:
+
+| Channel | `gateway_transaction_id` | `gateway_transaction_ref` |
+|---|---|---|
+| VA | kosong — webhook VA tidak membawa `transaction.id` | `transaction.transaction_id`: id bisnis, yang diterima endpoint detail VA |
+| QRIS, e-wallet | `transaction.id`: id numerik, yang diterima endpoint detail | kosong |
+| Payment link, kartu (`PAYMENT_LINK`, `CREDIT_CARD`) | kosong dari webhook — webhook payment link tidak membawa `transaction.id`. Settlement mengisinya dengan `payment_link_histories.id` setelah menemukan percobaan yang membayar | `transaction.reff_no`: referensi **satu percobaan bayar**, nilai yang sama dengan kolom `reff_no` di `payment_link_histories` |
+
+Pembagian ini diputuskan oleh `MoneyInNotification.GatewayTransactionIdentifiers`. Untuk
+payment link, `reff_no` di level transaksi **bukan** referensi yang kita kirim saat membuat link
+(itu ada di objek `payment_link` dan dipakai untuk mencocokkan invoice), tetapi justru satu-satunya
+atribut yang menamai percobaan yang membayar. Kosong pada baris yang lebih tua dari kolom ini,
+dan pembacanya memperlakukan itu sebagai "pakai lookup per-channel", bukan error.
+
+**Riwayat nilai `"0"`.** Sebelum perbaikan ini, webhook menyimpan `transaction.id` apa adanya
+untuk semua channel. Webhook VA dan payment link tidak membawa id itu, jadi baris VA dan
+payment link/kartu yang dibukukan sebelumnya berisi `gateway_transaction_id = "0"`, dan baris
+payment link/kartu tidak punya `gateway_transaction_ref` sama sekali karena
+`transaction.reff_no` dibuang. `"0"` bukan id pembayaran mana pun: pembaca settlement
+(`storedGatewayTransactionID`) menganggap id ≤ 0 sebagai tidak ada, dan sekarang
+`SetGatewayTransaction` menolak menyimpannya dari pemanggil mana pun. Untuk VA nilai itu tidak
+merusak apa-apa (VA dibaca lewat `gateway_transaction_ref`), tetapi menyesatkan. Body webhook
+tidak disimpan di ledger (metadata jurnal hanya mencatat `transaction_id`) dan sengaja tidak
+di-log oleh monoservice, jadi referensi percobaan pada baris lama tidak bisa dipulihkan dari
+webhook. Settlement mencari pembayaran itu di riwayat payment link Singapay, lalu menyimpan id
+dan `reff_no` percobaannya ke kedua kolom ini, hanya di kolom yang masih kosong atau berisi
+`"0"` (lihat [102](./102-settlement-reconciliation.md#payment-links)).
 
 ### Tentang `expires_at`
 

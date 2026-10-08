@@ -4,6 +4,8 @@ import (
 	"github.com/21strive/redifu"
 
 	"context"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -31,13 +33,26 @@ type PaymentRequest struct {
 	// arrives in it has its own business id; a payment link can carry several attempts,
 	// each with its own. So neither can be used to read a settled transaction back.
 	//
-	// Two fields because the four detail endpoints disagree about which identifier they
-	// take — the numeric id for QRIS, e-wallet and payment link, the business id for VA.
-	// Both arrive in the same webhook, so storing both removes a per-channel guess from
-	// the settlement read path. Empty on rows that predate the columns, which the reader
-	// treats as "fall back to a per-channel lookup", not as an error.
-	GatewayTransactionID  string // MoneyInTransaction.ID — numeric primary key
-	GatewayTransactionRef string // MoneyInTransaction.TransactionID — business id
+	// Two fields because the channels disagree about which identifier their webhook
+	// carries and which one reads the payment back. What each channel stores is decided
+	// by singapay.MoneyInNotification.GatewayTransactionIdentifiers:
+	//
+	//	QRIS, e-wallet      ID  = transaction.id, the numeric id their detail endpoints take
+	//	virtual account     Ref = transaction.transaction_id, the business id its detail
+	//	                    endpoint takes
+	//	payment link, card  Ref = transaction.reff_no, the reference of the attempt that
+	//	                    paid: payment_link_histories.reff_no
+	//
+	// VA and payment-link webhooks carry no numeric id, so the webhook leaves ID empty for
+	// them. A payment link's is filled in later, by settlement: once it has found the
+	// attempt that paid, it stores the attempt's payment_link_histories.id here (and its
+	// reff_no in Ref, if that was empty) through RecordGatewayTransaction. ID is never "0"
+	// (see SetGatewayTransaction), but VA and payment-link rows booked before that rule
+	// may hold "0" there, which the settlement reader treats as absent. Empty on rows that
+	// predate the columns, which the reader treats as "fall back to a per-channel lookup",
+	// not as an error.
+	GatewayTransactionID  string // QRIS/e-wallet: MoneyInTransaction.ID; payment link/card: the attempt's history id, once settlement finds it; else empty
+	GatewayTransactionRef string // VA: MoneyInTransaction.TransactionID; payment link / card: MoneyInTransaction.ReffNo
 	PaymentChannel        string // Payment method (QRIS, VA_BCA, etc.)
 	PaymentURL            string // URL for user to complete payment
 	Amount                int64  // Total charged to buyer
@@ -105,17 +120,30 @@ func (pr *PaymentRequest) SetPaymentCode(code string) {
 // SetGatewayTransaction records the gateway's identifiers for the payment itself.
 //
 // Called when the money-in webhook is booked, which is the first moment the transaction
-// exists at Singapay for every channel. Both values are stored as sent; neither is
-// validated, because an identifier we do not recognise is still the identifier Singapay
-// will quote back in a dispute.
+// exists at Singapay for every channel. An empty value leaves its field as it was.
+//
+// So does an id that reads as a whole number of zero or less. No Singapay payment has one,
+// and storing it is how a payment link came to be read back as history 0: its webhook
+// carries no numeric id, the caller formatted the missing value as "0", and every
+// settlement lookup asked for history 0 and got a 404. Refusing it here keeps it out
+// whichever caller supplies it. Anything else is stored as given, apart from surrounding
+// spaces, and is not otherwise validated — an identifier we do not recognise is still the
+// identifier Singapay will quote back in a dispute.
 func (pr *PaymentRequest) SetGatewayTransaction(id, ref string) {
-	if id != "" {
+	if id = strings.TrimSpace(id); id != "" && !isNonPositiveInteger(id) {
 		pr.GatewayTransactionID = id
 	}
-	if ref != "" {
+	if ref = strings.TrimSpace(ref); ref != "" {
 		pr.GatewayTransactionRef = ref
 	}
 	pr.UpdatedAt = time.Now()
+}
+
+// isNonPositiveInteger reports whether s reads as a whole number of zero or less. A value
+// that is not a number at all — a business id — is not one.
+func isNonPositiveInteger(s string) bool {
+	n, err := strconv.ParseInt(s, 10, 64)
+	return err == nil && n <= 0
 }
 
 // SetPaymentURL sets the URL for user to complete payment

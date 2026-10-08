@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/Aturjadwal/singapay-ledger/domain"
@@ -241,6 +240,8 @@ func (c *LedgerClient) HandlePaymentSuccess(ctx context.Context, req singapay.We
 	}
 	completedAt := time.Now()
 
+	gatewayID, gatewayRef := notification.GatewayTransactionIdentifiers()
+
 	err = c.txProvider.Transact(ctx, func(tx repo.Tx) error {
 		// First, and conditionally: this is the row lock that serialises two deliveries
 		// arriving at once. Everything after it is written only by the delivery that
@@ -260,12 +261,11 @@ func (c *LedgerClient) HandlePaymentSuccess(ctx context.Context, req singapay.We
 
 		// The gateway's own identifiers for the PAYMENT, which this is the first moment
 		// to learn for every channel. They are what lets settlement read this transaction
-		// back as a point lookup later: the instrument id recorded at creation is a
-		// different entity for VA and payment link. See PaymentRequest.GatewayTransactionID.
-		paymentReq.SetGatewayTransaction(
-			strconv.FormatInt(notification.Data.Transaction.ID, 10),
-			notification.Data.Transaction.TransactionID,
-		)
+		// back later: the instrument id recorded at creation is a different entity for VA
+		// and payment link. Which identifiers a delivery carries depends on the channel —
+		// a payment link sends no numeric id and names its attempt in reff_no — and
+		// GatewayTransactionIdentifiers sorts that out. See PaymentRequest.GatewayTransactionID.
+		paymentReq.SetGatewayTransaction(gatewayID, gatewayRef)
 
 		if err := tx.PaymentRequest().Update(ctx, paymentReq); err != nil {
 			return err
@@ -287,6 +287,17 @@ func (c *LedgerClient) HandlePaymentSuccess(ctx context.Context, req singapay.We
 	if err != nil {
 		c.logger.ErrorContext(ctx, "Failed to persist payment success", "invoice_number", invoiceNumber, "error", err)
 		return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to persist payment success transaction", err)
+	}
+
+	if gatewayRef == "" && notification.Kind() == singapay.EventPaymentLink {
+		// Booked all the same: the payment is real and its invoice matched. What is missing
+		// is only the handle settlement reads a payment link back by, so it will have to
+		// search the account's payment-link history for this one instead. Logged after the
+		// commit, so a redelivery that books nothing does not repeat it.
+		c.logger.WarnContext(ctx, "Payment-link money-in webhook carries no attempt reference — settlement will have to scan for it",
+			"invoice_number", invoiceNumber,
+			"product_tx_id", productTx.UUID,
+		)
 	}
 
 	c.logger.InfoContext(ctx, "Payment success booked",

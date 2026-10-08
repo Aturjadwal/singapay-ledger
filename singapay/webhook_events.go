@@ -3,6 +3,8 @@ package singapay
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 )
 
 // MoneyInEvent identifies which product a money-in webhook came from. All four share one
@@ -42,6 +44,8 @@ type Customer struct {
 // versus gross. Do not treat the pair as interchangeable across channels; see
 // [MoneyInNotification.Charged].
 type MoneyInTransaction struct {
+	// ID is the numeric id QRIS and e-wallet report. VA and payment-link webhooks carry
+	// none, so it decodes as 0 there; see [MoneyInNotification.GatewayTransactionIdentifiers].
 	ID     int64  `json:"id"`
 	ReffNo string `json:"reff_no"`
 	// MerchantReffNo is present on QRIS and e-wallet. It is absent on VA — where
@@ -147,6 +151,30 @@ func (n *MoneyInNotification) MerchantReference() string {
 	}
 	// VA carries it directly in reff_no.
 	return n.Data.Transaction.ReffNo
+}
+
+// GatewayTransactionIdentifiers returns what this payment can be read back by at Singapay.
+//
+// id is transaction.id, only when Singapay sent a positive one: VA and payment-link webhooks
+// send none, and a zero is not an id. ref is transaction.transaction_id (the VA business id),
+// except on a payment link, where transaction.reff_no is the attempt reference — the value
+// payment_link_histories.reff_no holds. A card payment is a payment link pinned to the card
+// methods, so it takes the payment-link branch.
+//
+// On a payment link reff_no is the only candidate for ref, never transaction_id: the
+// payment-link history endpoints do not accept a transaction_id, and reff_no is the one
+// attribute that names the attempt that paid. It is the same trap MerchantReference avoids,
+// from the other side — the attempt reference is useless for matching an invoice and the
+// only handle for finding the payment again.
+func (n *MoneyInNotification) GatewayTransactionIdentifiers() (id, ref string) {
+	tx := n.Data.Transaction
+	if tx.ID > 0 {
+		id = strconv.FormatInt(tx.ID, 10)
+	}
+	if n.Kind() == EventPaymentLink {
+		return id, strings.TrimSpace(tx.ReffNo)
+	}
+	return id, strings.TrimSpace(tx.TransactionID)
 }
 
 // Charged returns the amount the customer actually paid.

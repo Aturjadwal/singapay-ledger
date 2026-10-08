@@ -1,6 +1,7 @@
 package singapay
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -135,6 +136,72 @@ func TestMerchantReference(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGatewayTransactionIdentifiers pins what each channel can be read back by. The two
+// rows that matter are the ones Singapay sends no numeric id on: VA and payment link used
+// to store "0" for it, and the payment link kept no reference at all, although its
+// transaction.reff_no is the only thing that names the attempt that paid.
+func TestGatewayTransactionIdentifiers(t *testing.T) {
+	const attempt = `"reff_no": "18917720251110094037705",`
+
+	tests := []struct {
+		name    string
+		body    string
+		wantID  string
+		wantRef string
+	}{
+		{"VA: the business id, no numeric id", vaWebhook, "", "3211120250926133543246"},
+		{"QRIS: the numeric id", qrisWebhook, "42", ""},
+		{"e-wallet: the numeric id", ewalletWebhook, "42", ""},
+		{"payment link: the attempt reference, no numeric id", paymentLinkWebhook, "", "18917720251110094037705"},
+
+		// The same payment link, routed by its event field instead of the payment method.
+		{"payment link with an event field",
+			replaceOnce(t, paymentLinkWebhook, `"status": 200, "success": true,`,
+				`"status": 200, "success": true, "event": "payment-link-transaction",`),
+			"", "18917720251110094037705"},
+		// A zero is not an id, whichever channel sends it.
+		{"payment link with id 0",
+			replaceOnce(t, paymentLinkWebhook, attempt, `"id": 0, `+attempt),
+			"", "18917720251110094037705"},
+		{"QRIS with id 0",
+			replaceOnce(t, qrisWebhook, `"id": 42,`, `"id": 0,`),
+			"", ""},
+		// The payment link's own transaction_id is never the reference: the history
+		// endpoints do not take it. Without reff_no there is nothing to keep.
+		{"payment link without reff_no",
+			replaceOnce(t, paymentLinkWebhook, attempt, ""),
+			"", ""},
+		{"payment link with a transaction_id but no reff_no",
+			replaceOnce(t, paymentLinkWebhook, attempt, `"transaction_id": "TX-NOT-A-HISTORY-KEY",`),
+			"", ""},
+		{"surrounding spaces are not part of a reference",
+			replaceOnce(t, paymentLinkWebhook, attempt, `"reff_no": " 18917720251110094037705 ",`),
+			"", "18917720251110094037705"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			n, err := ParseMoneyInNotification([]byte(tc.body))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			id, ref := n.GatewayTransactionIdentifiers()
+			if id != tc.wantID || ref != tc.wantRef {
+				t.Errorf("GatewayTransactionIdentifiers() = (%q, %q), want (%q, %q)", id, ref, tc.wantID, tc.wantRef)
+			}
+		})
+	}
+}
+
+// replaceOnce derives a variant from one of the documented samples, and fails rather than
+// quietly testing the unmodified sample when the text it expects is not there.
+func replaceOnce(t *testing.T, body, old, replacement string) string {
+	t.Helper()
+	if strings.Count(body, old) != 1 {
+		t.Fatalf("sample does not contain %q exactly once", old)
+	}
+	return strings.Replace(body, old, replacement, 1)
 }
 
 func TestPaymentLinkReferenceIsNotTheAttemptID(t *testing.T) {

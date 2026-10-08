@@ -286,9 +286,19 @@ CREATE TABLE IF NOT EXISTS payment_requests (
     -- Singapay's identifiers for the PAYMENT, not the instrument. Filled in from the
     -- money-in webhook (migration 023): request_id above names the instrument, which for
     -- VA and payment link is a different entity from the transaction, so neither can read
-    -- a settled transaction back. Two columns because the detail endpoints disagree about
-    -- which one they take -- the numeric id for QRIS, e-wallet and payment link, the
-    -- business id for VA.
+    -- a settled transaction back. Two columns because the channels disagree about which
+    -- identifier their webhook carries:
+    --   gateway_transaction_id   transaction.id, the numeric id -- QRIS and e-wallet. VA
+    --                            and payment-link webhooks carry none, so the webhook
+    --                            leaves it NULL for them; for payment link and card,
+    --                            settlement stores the attempt's payment_link_histories.id
+    --                            once it has found the attempt. Never '0'; rows booked
+    --                            before that rule may hold '0', which readers treat as
+    --                            absent.
+    --   gateway_transaction_ref  VA: transaction.transaction_id, the business id its detail
+    --                            endpoint takes. Payment link and card:
+    --                            transaction.reff_no, the reference of the attempt that paid
+    --                            (payment_link_histories.reff_no).
     gateway_transaction_id VARCHAR(100),
     gateway_transaction_ref VARCHAR(100),
     created_at TIMESTAMP NOT NULL,
