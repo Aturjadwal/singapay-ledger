@@ -569,18 +569,25 @@ func (r *PostgresProductTransactionRepository) scanRowWith(rows *sql.Rows, extra
 			FeeModel:        domain.FeeModel(row.FeeModel),
 			Currency:        domain.Currency(row.Currency),
 		},
-		Status:                   domain.TransactionStatus(row.Status),
-		Metadata:                 metadata,
-		CompletedAt:              completedAt,
-		SettledAt:                settledAt,
-		PlatformFeeTransferred:   row.PlatformFeeTransferred,
-		PlatformFeeTransferredAt: platformFeeTransferredAt,
-		TransferRequestID:        row.TransferRequestID.String,
-		SettledPlatformFeeMinor:  settledPlatformFeeMinor,
-		SettledGatewayFeeMinor:   settledGatewayFeeMinor,
-		PlatformResidualMinor:    platformResidualMinor,
+		Status:                 domain.TransactionStatus(row.Status),
+		Metadata:               metadata,
+		PlatformFeeTransferred: row.PlatformFeeTransferred,
+		TransferRequestID:      row.TransferRequestID.String,
 	}
 	redifu.InitRecord(tx)
+
+	// The nullable columns are set only now. InitRecord allocates every nil pointer field
+	// it finds, so set before it, a NULL completed_at came back as the zero time and a NULL
+	// settled fee as 0 — the very readings these fields promise never to give. A statement
+	// line then dated a payment to year 1, and the fee sweep took an unrecorded settled fee
+	// for a zero one instead of falling back to the priced fee.
+	tx.CompletedAt = completedAt
+	tx.SettledAt = settledAt
+	tx.PlatformFeeTransferredAt = platformFeeTransferredAt
+	tx.SettledPlatformFeeMinor = settledPlatformFeeMinor
+	tx.SettledGatewayFeeMinor = settledGatewayFeeMinor
+	tx.PlatformResidualMinor = platformResidualMinor
+
 	// Override auto-generated values with database values
 	tx.UUID = row.UUID
 	tx.RandId = row.RandId

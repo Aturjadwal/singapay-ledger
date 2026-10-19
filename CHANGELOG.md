@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — a NULL timestamp or settled fee is read back as absent, not as zero
+
+Every read of `product_transactions` (`scanRowWith`) built the transaction with its nullable
+fields and only then called `redifu.InitRecord`, which allocates every nil pointer field of
+the struct. So a NULL `completed_at`, `settled_at` or `platform_fee_transferred_at` came back
+as the zero time, and a NULL `settled_platform_fee`, `settled_gateway_fee` or
+`platform_residual` as 0 — the readings `ProductTransaction` documents as impossible ("nil
+means not recorded, never zero"). The nullable fields are now set after `InitRecord`.
+
+What it changes:
+
+- A statement line (`GetPlatformTransactions`) for a paid transaction without `completed_at`
+  is dated by `created_at`, as the repository orders it, instead of 0001-01-01 — which also
+  put a cursor at year 1 and could repeat or end a page early. Found by the PostgreSQL run of
+  the statistics scenario: its day's earnings disagreed with the statement by exactly that
+  line.
+- `ProcessPlatformFeeTransfer` falls back to the priced fee for a settled transaction whose
+  settled fee was never recorded, as its comment always said, instead of skipping it as a zero
+  fee. In production on 2026-10-16 no row is affected: the 8 SETTLED rows without a settled
+  fee are all transferred, and every paid row has `completed_at`.
+- `GetPaymentByInvoiceNumber`, `GetTransactionDetail` and the statement return `nil` for an
+  unset time rather than a pointer to the zero time (`omitempty` now omits it).
+  `aturjadwal-monoservice` already reads both shapes as "not recorded".
+
 ### Fixed — payment-link webhooks keep the attempt reference and no longer store a fake id 0
 
 `HandlePaymentSuccess` stored `transaction.id`, formatted as a number, in
