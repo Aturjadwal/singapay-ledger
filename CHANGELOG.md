@@ -47,6 +47,90 @@ depends on it, and before is better. Tests: fakes for every path (`account_creat
 and `account_create_postgres_test.go` against a real database, opt-in through
 `LEDGER_TEST_DATABASE_URL` (24 callers at once: one sub-account, one row; a refused holder; a
 timeout) — those fail on v0.7.1 (24 sub-accounts, 24 rows).
+### Added — the platform's earnings and the paid transactions, per day (v0.8.0)
+
+Two pure reads for a dashboard's daily charts (no gateway call), both dating a transaction by
+when the payer paid — `COALESCE(completed_at, created_at)`, the key the platform statement is
+ordered by — in a calendar zone the caller names:
+
+```go
+req := ledger.PlatformDailyRequest{From: firstDay0000, To: dayAfterLast0000, TimeZone: "Asia/Jakarta"}
+earnings, err := client.PlatformEarningsByDay(ctx, req) // []PlatformEarningsDayRow{Date, Source, Amount, AwaitingSettlement}
+paid, err := client.PaidTransactionsByDay(ctx, req)     // []PaidTransactionsDayRow{Date, ProductType, Count, Amount}
+```
+
+- **`PlatformEarningsByDay`** sums, per date and per `PlatformIncomeSource` (`PLATFORM_FEE`,
+  `PLATFORM_SALE`), the platform account's ledger entries for the paid transactions that
+  credited it. It reads the same transactions and the same entries as the statement's INCOME
+  lines — the SQL fragments are now shared (`paidSQL`, `creditsPlatformSQL`,
+  `platformEntriesSQL`, `paidAtSQL` in `repo/postgres_product_transaction.go`), and both name
+  the source through one function (`platformIncomeSource`) from the same test, seller = the
+  platform account — so the rows of any window add up to the INCOME lines whose `OccurredAt`
+  falls in it. A settled sale counts its settled figure, one
+  awaiting settlement its priced fee; `AwaitingSettlement` is that PENDING-bucket part.
+  `ErrLedgerNotFound` until the platform account exists.
+- **`PaidTransactionsByDay`** counts every paid transaction (`COMPLETED` or `SETTLED`) and sums
+  its `TotalCharged`, per date and `ProductType`, whatever it credited the platform. It needs
+  no platform account.
+- `PENDING` is never counted: an instrument that expires unpaid stays `PENDING`, and a
+  re-issue adds another row. `FAILED`/`REFUNDED` are never written.
+- `From`/`To` are a `[From, To)` window of instants; the repository sends them as UTC, since
+  PostgreSQL drops the offset of a value compared with a timestamp column. An empty or unknown
+  `TimeZone`, `"Local"`, a zero start or end, or `To` before `From` is `CodeInvalidRequest`;
+  rows are ordered by date, then source or product type; an empty window is an empty slice.
+  The zone must be known to Go's zone database (a consumer binary without system zoneinfo
+  needs `time/tzdata`) and to PostgreSQL's.
+- New repository methods `PlatformEarningsByDay` / `PaidTransactionsByDay` on
+  `domain.ProductTransactionRepository`, with `domain.DailyWindow`,
+  `domain.PlatformEarningsDay` and `domain.PaidTransactionsDay`. A consumer with its own
+  implementation of the interface must add them.
+- **Migration 030** (`030_product_transactions_paid_day_index.sql`):
+  `idx_product_transactions_paid_at ON product_transactions ((COALESCE(completed_at, created_at))) WHERE status IN ('COMPLETED','SETTLED')`,
+  `CONCURRENTLY`, one statement, **run by hand outside a transaction** (the file says how).
+  Apply it before the consumer deploys this version; without it the reads are correct but
+  scan every PENDING row ever issued. `schema.sql` carries it.
+- Tests: sqlmock for both queries (UTC parameters, the shared fragments verbatim, empty
+  window), and one scenario through the money-in webhook and settlement — 16:59:59Z and
+  17:00:00Z on two WIB dates and one UTC date, PENDING left out, a settled fee different from
+  the priced one, a platform sale, a legacy row dated by `created_at`, a product type the
+  ledger does not know, "a day's earnings are that day's INCOME lines" — run against the fakes
+  and, with `LEDGER_TEST_DATABASE_URL`, against PostgreSQL (README_TESTING.md).
+
+### Fixed — a NULL timestamp or settled fee is read back as absent, not as zero
+
+Every read of `product_transactions` (`scanRowWith`) built the transaction with its nullable
+fields and only then called `redifu.InitRecord`, which allocates every nil pointer field of
+the struct. So a NULL `completed_at`, `settled_at` or `platform_fee_transferred_at` came back
+as the zero time, and a NULL `settled_platform_fee`, `settled_gateway_fee` or
+`platform_residual` as 0 — the readings `ProductTransaction` documents as impossible ("nil
+means not recorded, never zero"). The nullable fields are now set after `InitRecord`.
+
+The write side had the same hole: `NewProductTransaction` set only `CompletedAt` and
+`SettledAt` back to nil after `InitRecord`, so every new row stored
+`platform_fee_transferred_at = 0001-01-01` (toNullTime writes NULL only for nil), and the
+settled-fee pointers of a new transaction pointed at 0. It now sets all six back to nil, so
+a new row stores NULL. Rows written before keep `0001-01-01` in that column — the 21 unswept
+rows of production on 2026-10-16 do — and read back as that date, which consumers already
+treat as "not yet" (`IsZero`); a clean-up in the style of migration 002 is optional.
+
+What it changes:
+
+- A statement line (`GetPlatformTransactions`) for a paid transaction without `completed_at`
+  is dated by `created_at`, as the repository orders it, instead of 0001-01-01 — which also
+  put a cursor at year 1 and could repeat or end a page early. Found by the PostgreSQL run of
+  the statistics scenario: its day's earnings disagreed with the statement by exactly that
+  line.
+- `ProcessPlatformFeeTransfer` falls back to the priced fee for a settled transaction whose
+  settled fee was never recorded, as its comment always said, instead of skipping it as a zero
+  fee. **This moves money** for such rows when the sweep next runs. In production on 2026-10-16
+  no row qualifies: the 8 SETTLED rows without a settled fee are all transferred, and every paid
+  row has `completed_at`. Check again right before the consumer deploys this version — it must
+  return 0, or someone decides about those rows first:
+  `SELECT count(*) FROM product_transactions WHERE status = 'SETTLED' AND NOT platform_fee_transferred AND platform_fee > 0 AND settled_platform_fee IS NULL;`
+- `GetPaymentByInvoiceNumber`, `GetTransactionDetail` and the statement return `nil` for a
+  NULL time rather than a pointer to the zero time (`omitempty` now omits it): `completed_at`
+  of an unpaid row, `settled_at` of an unsettled one. `aturjadwal-monoservice` already reads
+  both shapes as "not recorded".
 
 ### Fixed — payment-link webhooks keep the attempt reference and no longer store a fake id 0
 

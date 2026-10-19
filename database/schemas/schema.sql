@@ -263,6 +263,13 @@ CREATE INDEX idx_product_transactions_awaiting_settlement ON product_transaction
 WHERE
     status = 'COMPLETED';
 
+-- Serves the platform statistics (PlatformEarningsByDay, PaidTransactionsByDay): the paid
+-- transactions whose payment time falls in a date window. The expression and the predicate
+-- are the repository's own (paidAtSQL, paidSQL), so the planner matches them (migration 030).
+CREATE INDEX idx_product_transactions_paid_at ON product_transactions ((COALESCE(completed_at, created_at)))
+WHERE
+    status IN ('COMPLETED', 'SETTLED');
+
 -- payment_requests: PAYMENT GATEWAY INTEGRATION
 -- Purpose: records which payment instrument was issued for a transaction, and the keys
 --          that read the payment back from Singapay later.

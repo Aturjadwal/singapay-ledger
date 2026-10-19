@@ -1,6 +1,7 @@
 # Testing guide
 
-156 tests across five packages. No database and no network: every test runs with `go test ./...`.
+263 tests across five packages. No network, and no database unless you give it one: every test
+runs with `go test ./...`, and the few that need PostgreSQL skip themselves without it (below).
 
 ```bash
 GOTOOLCHAIN=go1.25.5 go test ./...
@@ -9,6 +10,22 @@ GOTOOLCHAIN=go1.25.5 go test ./repo/ -run TestInsertStatementsHaveMatchingArity
 gofmt -l .    # must print nothing
 ```
 
+## Against PostgreSQL
+
+The platform statistics read through SQL that only PostgreSQL can check — a time zone
+conversion, a `FILTER`, a join that must add up to the statement — so their scenario runs
+twice: against the fakes, always, and against a real database when one is named.
+
+```bash
+createdb ledger_test   # any empty database you may create schemas in
+LEDGER_TEST_DATABASE_URL="host=/var/run/postgresql dbname=ledger_test sslmode=disable" \
+  GOTOOLCHAIN=go1.25.5 go test . -run 'PlatformStatistics|PlatformDailyRequest' -v
+```
+
+Each run creates a schema of its own (`ledger_test_<nanoseconds>`), loads
+`database/schemas/schema.sql` into it, and drops it at the end, so runs do not see each
+other and leave nothing behind. Without the variable those tests report SKIP.
+
 ---
 
 ## Where the tests are, and what each layer proves
@@ -16,8 +33,9 @@ gofmt -l .    # must print nothing
 | Package | Files | What it covers |
 |---|---|---|
 | `.` (root) | `ledger_test.go`, `settlement_fee_test.go`, `webhook_test.go`, `balance_reservation_test.go`, `payout_idempotency_test.go`, `payout_request_log_test.go` | The money paths, against in-memory fakes |
-| `domain/` | `disbursement_test.go`, `fee_config_test.go` | Pure rules: state transitions, fee arithmetic |
-| `repo/` | `insert_arity_test.go`, `postgres_account_test.go`, `postgres_disbursement_test.go` | SQL, against `go-sqlmock` |
+| `.` (root) | `platform_statistics_test.go` | The platform statistics: one scenario through the money-in webhook and settlement, against the fakes and against PostgreSQL |
+| `domain/` | `disbursement_test.go`, `fee_config_test.go`, `product_transaction_test.go` | Pure rules: state transitions, fee arithmetic, a new transaction's unset fields |
+| `repo/` | `insert_arity_test.go`, `postgres_account_test.go`, `postgres_disbursement_test.go`, `postgres_product_transaction_test.go`, `postgres_platform_statistics_test.go` | SQL, against `go-sqlmock` |
 | `singapay/` | 8 files | The HTTP client: signatures, amounts, error classification, webhook parsing |
 | `ledgererr/` | `error_test.go` | Error wrapping and code matching |
 
@@ -101,8 +119,10 @@ looks reasonable and quietly moves the wrong amount of money.
 
 ## What is not covered
 
-- **No real database.** `repo/` uses `go-sqlmock`, which checks the SQL text and arguments,
-  not that PostgreSQL accepts them. Constraints, triggers and types are unproven here.
+- **Almost no real database.** `repo/` uses `go-sqlmock`, which checks the SQL text and
+  arguments, not that PostgreSQL accepts them. Constraints, triggers and types are unproven
+  here — except along the platform statistics' path (above), which runs the money-in webhook,
+  settlement and both reads against PostgreSQL when `LEDGER_TEST_DATABASE_URL` is set.
 - **No real transaction semantics.** See the fakes note above. Rollback and isolation are
   reasoned about, not exercised.
 - **No real concurrency.** Races on `UpdateStatusIf` are simulated through the `beforeCAS`

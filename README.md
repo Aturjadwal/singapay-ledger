@@ -429,6 +429,41 @@ looks its row up again, cannot continue a list whose last row might be in either
 carries `OwnerType`; a caller that sends seller receipts must skip `OwnerTypePlatform`, whose
 `SellerID` is the platform account's owner id and names no user.
 
+### Platform statistics — earnings and paid transactions per day
+
+Two daily series for a dashboard, both pure reads (no gateway call), both dated by when the
+payer paid — the key the platform statement is ordered by — in a zone the caller names:
+
+```go
+req := ledger.PlatformDailyRequest{
+    From:     time.Date(2026, 9, 20, 0, 0, 0, 0, wib), // the first day's 00:00 in that zone
+    To:       time.Date(2026, 10, 20, 0, 0, 0, 0, wib), // exclusive: the day after the last
+    TimeZone: "Asia/Jakarta",
+}
+
+// What the platform account was credited, per date and source (PLATFORM_FEE / PLATFORM_SALE).
+earnings, err := client.PlatformEarningsByDay(ctx, req)
+// earnings[i].Amount, earnings[i].AwaitingSettlement (the PENDING part, not settled yet)
+
+// How many transactions were paid, and what their payers were charged, per date and product type.
+paid, err := client.PaidTransactionsByDay(ctx, req)
+// paid[i].Count, paid[i].Amount (Σ TotalCharged)
+```
+
+**The earnings are the statement's INCOME lines, added up per day.** The same transactions
+(paid, and crediting the platform) and the same amount (the sum of the platform's ledger
+entries for each), so the rows of any window add up to the INCOME lines whose `OccurredAt`
+falls in it. A settled sale counts its settled figure; one awaiting settlement counts its
+priced fee, and that part is reported again as `AwaitingSettlement`.
+
+**A paid transaction is COMPLETED or SETTLED.** PENDING is never counted: an instrument that
+expires unpaid stays PENDING for good, and every re-issue adds another row.
+`PaidTransactionsByDay` counts every paid transaction, whatever it credited the platform.
+
+**The zone is the caller's.** An empty or unknown `TimeZone` is `CodeInvalidRequest`, and so
+is `"Local"`. `PlatformEarningsByDay` answers `ErrLedgerNotFound` until the platform account
+exists; `PaidTransactionsByDay` does not need it. Both rely on migration 030's index.
+
 ### Seller KYC verification — removed
 
 KYC belongs to the service that owns the user, not to the ledger. The upload helpers and
@@ -524,6 +559,10 @@ Removing the batch reconciler's tables is a **two-phase migration**, because
    — drops `settlement_batches`, `settlement_items`, `reconciliation_discrepancies` and the
    three `payment_requests` columns. Apply it **after** the rollout is complete and settled.
    **Irreversible** — read its first section first.
+
+[`030_product_transactions_paid_day_index.sql`](database/migrations/030_product_transactions_paid_day_index.sql)
+indexes the paid transactions by payment time for the platform statistics. It is one
+`CREATE INDEX CONCURRENTLY`: run it on its own, outside a transaction (the file says how).
 
 ### Migrating an existing database
 

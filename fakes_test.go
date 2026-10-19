@@ -351,6 +351,121 @@ func (f *FakeProductTransactionRepository) GetPlatformIncomes(ctx context.Contex
 	return incomes, nil
 }
 
+// PlatformEarningsByDay and PaidTransactionsByDay below apply the repository's rules in Go:
+// the paid statuses, the platform-income predicate, [From, To) on the payment time, and the
+// date in the window's zone. The fake keeps instants, where the table keeps UTC wall clocks,
+// so a date is the instant moved into the zone.
+
+func (f *FakeProductTransactionRepository) PlatformEarningsByDay(ctx context.Context, platformAccountID string, window domain.DailyWindow) ([]*domain.PlatformEarningsDay, error) {
+	location, err := time.LoadLocation(window.TimeZone)
+	if err != nil {
+		return nil, err
+	}
+
+	type key struct {
+		date         string
+		platformSale bool
+	}
+	sums := map[key]*domain.PlatformEarningsDay{}
+	var order []key
+	for _, tx := range f.transactions {
+		if !fakePaidInWindow(tx, window) {
+			continue
+		}
+		settledFee := int64(0)
+		if tx.SettledPlatformFeeMinor != nil {
+			settledFee = *tx.SettledPlatformFeeMinor
+		}
+		if tx.SellerAccountID != platformAccountID && tx.Fee.PlatformFee == 0 && settledFee == 0 {
+			continue
+		}
+
+		var amount, pending int64
+		entries := 0
+		if f.ledgerEntries != nil {
+			for _, e := range f.ledgerEntries.entries {
+				if e.AccountUUID == platformAccountID && e.SourceType == domain.SourceTypeProductTransaction && e.SourceID == tx.UUID {
+					entries++
+					amount += e.Amount
+					if e.BalanceBucket == domain.BalanceBucketPending {
+						pending += e.Amount
+					}
+				}
+			}
+		}
+		// The repository joins the entries: a transaction without one adds no row.
+		if entries == 0 {
+			continue
+		}
+
+		k := key{date: fakePaidAt(tx).In(location).Format("2006-01-02"), platformSale: tx.SellerAccountID == platformAccountID}
+		day, ok := sums[k]
+		if !ok {
+			day = &domain.PlatformEarningsDay{Date: k.date, PlatformSale: k.platformSale}
+			sums[k] = day
+			order = append(order, k)
+		}
+		day.Amount += amount
+		day.AwaitingSettlement += pending
+	}
+
+	days := []*domain.PlatformEarningsDay{}
+	for _, k := range order {
+		days = append(days, sums[k])
+	}
+	return days, nil
+}
+
+func (f *FakeProductTransactionRepository) PaidTransactionsByDay(ctx context.Context, window domain.DailyWindow) ([]*domain.PaidTransactionsDay, error) {
+	location, err := time.LoadLocation(window.TimeZone)
+	if err != nil {
+		return nil, err
+	}
+
+	type key struct{ date, productType string }
+	sums := map[key]*domain.PaidTransactionsDay{}
+	var order []key
+	for _, tx := range f.transactions {
+		if !fakePaidInWindow(tx, window) {
+			continue
+		}
+		k := key{date: fakePaidAt(tx).In(location).Format("2006-01-02"), productType: tx.ProductType}
+		day, ok := sums[k]
+		if !ok {
+			day = &domain.PaidTransactionsDay{Date: k.date, ProductType: k.productType}
+			sums[k] = day
+			order = append(order, k)
+		}
+		day.Count++
+		day.Amount += tx.Fee.TotalCharged
+	}
+
+	days := []*domain.PaidTransactionsDay{}
+	for _, k := range order {
+		days = append(days, sums[k])
+	}
+	return days, nil
+}
+
+// fakePaidAt is the payment time the repository dates and orders by: completed_at, or
+// created_at for a row without one.
+func fakePaidAt(tx *domain.ProductTransaction) time.Time {
+	if tx.CompletedAt != nil {
+		return *tx.CompletedAt
+	}
+	return tx.CreatedAt
+}
+
+// fakePaidInWindow is a paid transaction (COMPLETED or SETTLED) whose payment time is in
+// [From, To).
+func fakePaidInWindow(tx *domain.ProductTransaction, window domain.DailyWindow) bool {
+	if tx.Status != domain.TransactionStatusCompleted && tx.Status != domain.TransactionStatusSettled {
+		return false
+	}
+	paidAt := fakePaidAt(tx)
+	return !paidAt.Before(window.From) && paidAt.Before(window.To)
+}
+
 func platformIncomeKey(income *domain.PlatformIncome) time.Time {
 	if income.Transaction.CompletedAt != nil {
 		return *income.Transaction.CompletedAt

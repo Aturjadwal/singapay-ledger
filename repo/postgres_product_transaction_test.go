@@ -91,6 +91,42 @@ func TestGetByInvoiceNumber_ScansEveryColumnIntoItsField(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
+// A NULL column is absent, never zero. redifu.InitRecord allocates every nil pointer field
+// of the struct it is given, so a scan that called it after filling in the nullable fields
+// turned a NULL completed_at into the zero time — a statement line dated to year 1 — and a
+// NULL settled fee into 0, which the fee sweep reads as "nothing to move" instead of falling
+// back to the priced fee.
+func TestGetByID_ReadsNullColumnsAsAbsent(t *testing.T) {
+	repo, mock, closeDB := newMockProductTransactionRepo(t)
+	defer closeDB()
+
+	created := time.Date(2026, 3, 1, 8, 0, 0, 0, time.UTC)
+
+	mock.ExpectQuery(`(?s)SELECT uuid, randid.*FROM product_transactions\s+WHERE uuid = \$1`).
+		WithArgs("pt-legacy").
+		WillReturnRows(sqlmock.NewRows(productTransactionColumns).AddRow(
+			"pt-legacy", "rand-legacy", "buyer-1", "seller-1", "product-1", "SERVICE", "INV-LEGACY",
+			int64(100_000), int64(1_000), int64(2_000), int64(103_000), int64(100_000), "GATEWAY_ON_CUSTOMER", "IDR",
+			"SETTLED", created, created, nil, nil,
+			true, nil, nil, nil,
+			nil, nil, nil,
+		))
+
+	tx, err := repo.GetByID(context.Background(), "pt-legacy")
+
+	require.NoError(t, err)
+	assert.Nil(t, tx.CompletedAt, "a NULL completed_at is not the zero time")
+	assert.Nil(t, tx.SettledAt)
+	assert.Nil(t, tx.PlatformFeeTransferredAt)
+	assert.Nil(t, tx.SettledPlatformFeeMinor, "a NULL settled fee is not recorded, not zero")
+	assert.Nil(t, tx.SettledGatewayFeeMinor)
+	assert.Nil(t, tx.PlatformResidualMinor)
+	require.NotNil(t, tx.Record, "the record itself is still initialised")
+	assert.Equal(t, "pt-legacy", tx.UUID)
+	assert.True(t, created.Equal(tx.CreatedAt))
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
 func platformIncomeRow(uuid, sellerAccountID string, platformFee int64, status string, completedAt time.Time, platformAmount int64) []driver.Value {
 	return []driver.Value{
 		uuid, "randid-" + uuid, "buyer-1", sellerAccountID, "product-1", "SERVICE", "INV-" + uuid,

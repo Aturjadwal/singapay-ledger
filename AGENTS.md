@@ -29,6 +29,7 @@ separate copies of the same rules, and the copies drift.
 .                          # package ledger — the public surface
 ├── ledger.go              # LedgerClient: accounts, balances, withdrawal, platform-fee transfer
 ├── platform.go            # The platform account: its balance, statement and payout
+├── platform_statistics.go # The platform's earnings and the paid transactions, per day
 ├── payment.go             # Payment creation and channel routing
 ├── webhook.go             # Inbound webhook verification and booking
 ├── settlement.go          # Settlement inbox + the per-transaction settling pass
@@ -42,7 +43,7 @@ separate copies of the same rules, and the copies drift.
 ├── analytics/             # Read-side queries
 ├── database/
 │   ├── schemas/schema.sql # The current shape of the database
-│   └── migrations/        # Ordered: 001_*.sql .. 025_*.sql
+│   └── migrations/        # Ordered: 001_*.sql .. 030_*.sql
 ├── docs/                  # Reference docs — see §7
 └── cmd/singapay-smoke/    # Verifies a Singapay connection end to end
 ```

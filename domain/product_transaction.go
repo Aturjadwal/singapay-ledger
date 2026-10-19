@@ -122,6 +122,18 @@ type ProductTransactionRepository interface {
 	// strictly past that position.
 	GetPlatformIncomes(ctx context.Context, platformAccountID string, after *KeysetCursor, limit int, ascending bool) ([]*PlatformIncome, error)
 
+	// PlatformEarningsByDay sums, per date of the payment time and per kind of sale, what
+	// the transactions GetPlatformIncomes lists credited the platform account. A transaction
+	// counts on the date it was paid, in window.TimeZone, when that payment time falls in
+	// [window.From, window.To); the payment time is the one GetPlatformIncomes orders by.
+	// Only dates and kinds with at least one transaction are returned, in no set order.
+	PlatformEarningsByDay(ctx context.Context, platformAccountID string, window DailyWindow) ([]*PlatformEarningsDay, error)
+
+	// PaidTransactionsByDay counts the paid transactions (COMPLETED or SETTLED), and sums
+	// what their payers were charged, per date of the payment time and product type, over
+	// the same window rule. Only non-empty dates and types are returned, in no set order.
+	PaidTransactionsByDay(ctx context.Context, window DailyWindow) ([]*PaidTransactionsDay, error)
+
 	Save(ctx context.Context, tx *ProductTransaction) error
 	UpdateStatus(ctx context.Context, id string, status TransactionStatus, timestamp time.Time) error
 
@@ -227,10 +239,17 @@ func NewProductTransaction(
 
 	redifu.InitRecord(pt)
 
-	// CRITICAL FIX: redifu.InitRecord initializes pointer fields to zero time instead of nil
-	// Explicitly set timestamp fields to nil to prevent "0001-01-01" in database
+	// redifu.InitRecord allocates every nil pointer field, so each nullable one is set back
+	// to nil here: a pointer to the zero time is stored as "0001-01-01" (toNullTime only
+	// writes NULL for nil), and a pointer to 0 reads as a recorded zero fee. Every one of
+	// them, not only the two timestamps the first fix covered: platform_fee_transferred_at
+	// was still written as year 1 on every new row.
 	pt.CompletedAt = nil
 	pt.SettledAt = nil
+	pt.PlatformFeeTransferredAt = nil
+	pt.SettledPlatformFeeMinor = nil
+	pt.SettledGatewayFeeMinor = nil
+	pt.PlatformResidualMinor = nil
 
 	return pt
 }

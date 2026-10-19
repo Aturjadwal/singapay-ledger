@@ -1,0 +1,64 @@
+-- Migration: 030_product_transactions_paid_day_index.sql
+-- Purpose: serve the platform statistics' date window — the paid transactions whose payment
+--          time falls in it — from an index of the paid rows, instead of a scan of every row
+--          ever issued.
+-- Date: 2026-10-19
+--
+-- ---------------------------------------------------------------------------------------
+-- HOW TO APPLY — one statement, outside a transaction
+-- ---------------------------------------------------------------------------------------
+-- CREATE INDEX CONCURRENTLY keeps product_transactions writable while the index builds (a
+-- payment's webhook and the settling pass keep booking), and it cannot run inside a
+-- transaction block. So run this file on its own, with psql's autocommit and WITHOUT -1 /
+-- --single-transaction, and without wrapping it in BEGIN/COMMIT:
+--
+--   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/030_product_transactions_paid_day_index.sql
+--
+-- A CONCURRENTLY build that fails (a deadlock, a cancelled session) leaves an INVALID index
+-- behind, which the planner ignores and IF NOT EXISTS would then skip. Drop it and run the
+-- file again:
+--
+--   DROP INDEX CONCURRENTLY IF EXISTS idx_product_transactions_paid_at;
+--
+-- Check the result: indisvalid must be true.
+--
+--   SELECT indexrelid::regclass, indisvalid FROM pg_index
+--   WHERE indexrelid = 'idx_product_transactions_paid_at'::regclass;
+--
+-- Order: apply it before the consuming service deploys the ledger version that calls
+-- PlatformEarningsByDay / PaidTransactionsByDay (v0.8.0). Nothing else reads the index, so
+-- applying it earlier is harmless; deploying first is correct too, only slow — the two
+-- queries return the same rows with or without it.
+--
+-- ---------------------------------------------------------------------------------------
+-- WHY
+-- ---------------------------------------------------------------------------------------
+-- PlatformEarningsByDay and PaidTransactionsByDay both select
+--
+--     WHERE status IN ('COMPLETED', 'SETTLED')
+--       AND COALESCE(completed_at, created_at) >= $from
+--       AND COALESCE(completed_at, created_at) <  $to
+--
+-- — the paid transactions, dated by when the payer paid, the key the platform statement is
+-- ordered by. None of the existing indexes serves that:
+--
+--   idx_product_transactions_status               finds both statuses, then reads all of
+--                                                 them: the whole paid history, every call
+--   idx_product_transactions_awaiting_settlement  (completed_at) WHERE status = 'COMPLETED':
+--                                                 the unsettled backlog only
+--   idx_product_transactions_status_settled       (status, settled_at): keyed on the
+--                                                 settlement time, which the statistics
+--                                                 deliberately do not date by
+--
+-- And the rows the query must skip keep growing: an instrument that expires unpaid stays
+-- PENDING forever, and every re-issue of a payment adds another PENDING row. Without this
+-- index the planner's best plan is a scan of all of them.
+--
+-- The index holds the paid rows only, keyed on the payment time. Its expression and its
+-- predicate are written exactly as the repository writes them (paidAtSQL and paidSQL in
+-- repo/postgres_product_transaction.go): the planner matches an expression index, and
+-- proves a partial index's predicate, only against the same expression.
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_product_transactions_paid_at
+    ON product_transactions ((COALESCE(completed_at, created_at)))
+    WHERE status IN ('COMPLETED', 'SETTLED');
