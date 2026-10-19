@@ -101,6 +101,12 @@ const (
 	CodeLedgerNotFound      ErrorCode = 404001
 	CodeLedgerAlreadyExists ErrorCode = 409002
 
+	// CodeAccountCreationInProgress means another caller is creating the same seller's
+	// account — asking Singapay for its sub-account — and the caller's deadline ran out
+	// before that finished. Nothing was created on this caller's behalf; asking again later
+	// finds the account, or creates it if the other caller failed.
+	CodeAccountCreationInProgress ErrorCode = 409009
+
 	// ProductTransaction error codes
 	CodeProductTransactionNotFound      ErrorCode = 404002
 	CodeProductTransactionAlreadyExists ErrorCode = 409004
@@ -142,6 +148,9 @@ const (
 var (
 	ErrLedgerNotFound      = NewError(CodeLedgerNotFound, "ledger not found", nil)
 	ErrLedgerAlreadyExists = NewError(CodeLedgerAlreadyExists, "ledger already exists", nil)
+
+	// ErrAccountCreationInProgress: see CodeAccountCreationInProgress.
+	ErrAccountCreationInProgress = NewError(CodeAccountCreationInProgress, "the seller's account is being created by another request", nil)
 )
 
 // ProductTransaction errors

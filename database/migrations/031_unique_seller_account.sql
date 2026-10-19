@@ -1,0 +1,64 @@
+-- Migration: 031_unique_seller_account.sql
+-- Purpose: at most one SELLER account per owner, enforced by the database.
+-- Date: 2026-10-19
+--
+-- ---------------------------------------------------------------------------------------
+-- HOW TO APPLY — one check, then one statement outside a transaction
+-- ---------------------------------------------------------------------------------------
+-- 1. The index cannot be built while any seller has two rows. This must return no rows:
+--
+--      SELECT owner_id, count(*), array_agg(uuid ORDER BY created_at) AS accounts
+--      FROM ledger_accounts WHERE owner_type = 'SELLER'
+--      GROUP BY owner_id HAVING count(*) > 1;
+--
+--    If it returns any, STOP and resolve them by hand first: every extra row carries a
+--    Singapay sub-account of its own, and payments may already have landed on it (look for
+--    its product_transactions / ledger_entries). Deciding which row stays is not a
+--    migration's call.
+--
+-- 2. CREATE INDEX CONCURRENTLY keeps ledger_accounts writable while the index builds and
+--    cannot run inside a transaction block, so run this file on its own, with psql's
+--    autocommit and WITHOUT -1 / --single-transaction:
+--
+--      psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/031_unique_seller_account.sql
+--
+--    Through Supabase, use the session pooler (:5432) or a direct connection, never the
+--    transaction pooler (:6543).
+--
+-- 3. Check the result: indisvalid must be true.
+--
+--      SELECT indexrelid::regclass, indisvalid FROM pg_index
+--      WHERE indexrelid = 'idx_accounts_unique_seller'::regclass;
+--
+--    A CONCURRENTLY build that fails (a duplicate that slipped in, a cancelled session)
+--    leaves an INVALID index behind, which IF NOT EXISTS would then skip. Drop it and run
+--    the file again:
+--
+--      DROP INDEX CONCURRENTLY IF EXISTS idx_accounts_unique_seller;
+--
+-- Order: any time. Before the consuming service deploys the version of this package that
+-- creates accounts under a lock is better: from then on even a process still on an older
+-- version cannot write a second row for a seller — its insert fails, and it answers that one
+-- request with an error, instead of splitting the seller's payments across two sub-accounts.
+-- The new version reads such a failure as "the account exists" and carries on. Nothing in
+-- either version depends on the index being there.
+--
+-- ---------------------------------------------------------------------------------------
+-- WHY
+-- ---------------------------------------------------------------------------------------
+-- CreateAccount read the seller's row, asked Singapay for a sub-account when there was none,
+-- and inserted the row — with no lock and no unique index on (owner_type, owner_id). A
+-- seller's first bookings arriving together (a burst of 12 locally) each found no row, each
+-- opened a Singapay sub-account and each inserted a row: up to 8 rows for one seller, and
+-- GetByOwner / GetBySellerID — one row, no ORDER BY — then returned whichever row the plan
+-- happened to read first, so later payments were issued on different sub-accounts. The
+-- creation now runs under a per-seller advisory lock (CreateAccount); this index is the
+-- guarantee that holds whatever writes the table — an older binary mid-deploy, a hand insert.
+-- It also serves the owner lookups, which today scan the table.
+--
+-- Partial, like idx_accounts_unique_platform and idx_accounts_unique_payment_gateway: the
+-- other owner types are singletons with indexes of their own.
+
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_accounts_unique_seller
+    ON ledger_accounts (owner_id)
+    WHERE owner_type = 'SELLER';

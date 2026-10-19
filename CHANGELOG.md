@@ -4,6 +4,50 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — a seller's first payments arriving together open one Singapay sub-account, not several
+
+`CreateAccount` read the seller's row, asked Singapay for a sub-account when there was none and
+inserted the row, with no lock and no unique index on the owner. Callers arriving together each
+found no row, each opened a sub-account and each inserted a row — or, when one committed in
+between, failed with `ErrLedgerAlreadyExists`, which the consuming service answered with a 500.
+Locally, against the service's binary: 12 first bookings of a new seller at once left up to 8
+rows (and 8 sub-accounts) for that seller, 29 of 30 runs; two at once left 2, every run. The
+rows' owner lookups (`GetByOwner`, `GetBySellerID`) read one row with no `ORDER BY`, so later
+payments were issued on whichever sub-account a read returned. Production held 8 SELLER rows
+for 8 owners on 16 October: it has not happened there yet.
+
+- The creation runs in one transaction holding a per-seller advisory lock
+  (`AccountRepository.TryLockOwner`: `pg_try_advisory_xact_lock(hashtextextended(
+  'ledger_accounts:SELLER:<owner>', 0))`): the row is read again under the lock, Singapay is
+  asked, the row is inserted, and the commit releases the lock. Transaction-scoped, so it is
+  safe through a transaction-mode pooler (tested through Supavisor 2.9.13 in both modes).
+- A caller that finds the lock taken does not queue on it inside a transaction: it ends its
+  transaction at once and reads the row again every 25 ms, doubling to 400 ms, with nothing
+  held, until the row appears (`ErrLedgerAlreadyExists`, as for an account that existed), the
+  lock comes free with no row (the holder failed: this caller tries in its place) or its
+  deadline ends the wait — new `ErrAccountCreationInProgress` (code 409009), with nothing
+  created. Only the one creating caller holds a connection across the Singapay call, once in a
+  seller's life; finding an existing account takes no lock and no transaction.
+- The creating transaction sets `idle_in_transaction_session_timeout` (SET LOCAL) to the
+  caller's remaining deadline plus 30 s (2 minutes without one), so the server never ends it —
+  and the lock with it — while the Singapay call can still come back.
+- A failed Singapay call writes no row; the next caller asks again. A timed-out one may have
+  opened the sub-account anyway (Singapay has no idempotency key); the error log now says so,
+  with the name and the time the call started.
+- An insert refused by the new unique index (a row written without the lock, by an older
+  version mid-deploy or by hand) is answered `ErrLedgerAlreadyExists`, and the sub-account just
+  opened is logged CRITICAL for binding by hand, as before.
+- `CreatePaymentGatewayAccount` returns the account a concurrent caller created when its own
+  insert loses the singleton's unique index, instead of an error.
+
+Migration 031 (`idx_accounts_unique_seller`, partial unique index on `owner_id` where
+`owner_type = 'SELLER'`, `CONCURRENTLY`) makes one row per seller a database guarantee. Check
+for duplicates first (the query is in the file); apply it before or after deploying — nothing
+depends on it, and before is better. Tests: fakes for every path (`account_create_test.go`),
+and `account_create_postgres_test.go` against a real database, opt-in through
+`LEDGER_TEST_DATABASE_URL` (24 callers at once: one sub-account, one row; a refused holder; a
+timeout) — those fail on v0.7.1 (24 sub-accounts, 24 rows).
+
 ### Fixed — payment-link webhooks keep the attempt reference and no longer store a fake id 0
 
 `HandlePaymentSuccess` stored `transaction.id`, formatted as a number, in

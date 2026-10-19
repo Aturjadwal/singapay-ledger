@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"time"
 
 	"github.com/21strive/redifu"
 )
@@ -105,6 +106,20 @@ type AccountRepository interface {
 	// entries to land, then reads a balance that includes them.
 	GetByIDForUpdate(ctx context.Context, id string) (*Account, error)
 	GetByOwner(ctx context.Context, ownerType OwnerType, ownerID string) (*Account, error)
+
+	// TryLockOwner takes the lock that serialises creating one owner's account, without
+	// waiting, and must be called inside a transaction: false means another transaction
+	// holds it — it is creating that account right now. The lock is transaction-scoped
+	// (released at commit or rollback), never session-scoped, so it is safe behind a
+	// transaction-mode pooler, where a session's state stays with whichever server
+	// connection the pooler handed out.
+	//
+	// idle bounds how long the transaction may then sit idle in transaction. The holder
+	// waits on Singapay with nothing running, so the bound has to outlast that call — a
+	// server that ended the transaction mid-call would release the lock while the call can
+	// still succeed — and still end a holder that never comes back.
+	TryLockOwner(ctx context.Context, ownerType OwnerType, ownerID string, idle time.Duration) (bool, error)
+
 	// GetBySingapayAccountID resolves an account from the ULID Singapay puts on webhooks
 	// and transaction records. There is deliberately no lookup by account number: the
 	// number appears only as a transfer beneficiary, and accounts issued without one

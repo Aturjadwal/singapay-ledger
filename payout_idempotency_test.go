@@ -156,6 +156,11 @@ type fakeGateway struct {
 	// path that was not supposed to check a signature quietly returning "valid" is worse
 	// than a crash.
 	verifyWebhook func(singapay.WebhookRequest) error
+
+	// createAccount scripts sub-account creation (account_create_test.go); accountRequests
+	// records each request it was asked. Leaving it nil keeps the panic below.
+	createAccount   func(context.Context, singapay.CreateAccountRequest) (*singapay.Account, error)
+	accountRequests []singapay.CreateAccountRequest
 }
 
 var _ PaymentGateway = (*fakeGateway)(nil)
@@ -194,8 +199,12 @@ func (f *fakeGateway) InquiryDisbursement(ctx context.Context, accountID, refere
 	return nil, &singapay.Error{StatusCode: http.StatusNotFound, Code: singapay.CodeTransactionNotFound, Message: "transaction not found"}
 }
 
-func (f *fakeGateway) CreateAccount(context.Context, singapay.CreateAccountRequest) (*singapay.Account, error) {
-	panic("fakeGateway.CreateAccount: not scripted for this test")
+func (f *fakeGateway) CreateAccount(ctx context.Context, req singapay.CreateAccountRequest) (*singapay.Account, error) {
+	if f.createAccount == nil {
+		panic("fakeGateway.CreateAccount: not scripted for this test")
+	}
+	f.accountRequests = append(f.accountRequests, req)
+	return f.createAccount(ctx, req)
 }
 func (f *fakeGateway) GetAccount(context.Context, string) (*singapay.Account, error) {
 	panic("fakeGateway.GetAccount: not scripted for this test")

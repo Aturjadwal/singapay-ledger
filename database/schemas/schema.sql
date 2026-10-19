@@ -36,6 +36,12 @@ CREATE UNIQUE INDEX idx_accounts_unique_payment_gateway ON ledger_accounts(owner
 WHERE
     owner_type = 'PAYMENT_GATEWAY';
 
+-- One account per seller (migration 031). CreateAccount creates under a per-seller lock;
+-- this holds whatever else writes the table.
+CREATE UNIQUE INDEX idx_accounts_unique_seller ON ledger_accounts(owner_id)
+WHERE
+    owner_type = 'SELLER';
+
 -- Singapay identifiers (migration 016). Partial, because most rows legitimately have
 -- neither: the PAYMENT_GATEWAY expense account has no sub-account behind it, and a
 -- sub-account can be issued without a number.

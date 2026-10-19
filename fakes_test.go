@@ -33,6 +33,12 @@ type FakeAccountRepository struct {
 	// lockedForUpdate records every account the code took a row lock on, so a test can
 	// prove the withdrawal path locks before it reads the balance.
 	lockedForUpdate []string
+
+	// creationLocks records every TryLockOwner call ("ownerType:ownerID"); tryLockOwner
+	// scripts its answer (nil grants every lock) and saveErr a refused Save.
+	creationLocks []string
+	tryLockOwner  func(ownerType domain.OwnerType, ownerID string) (bool, error)
+	saveErr       func(account *domain.Account) error
 }
 
 func NewFakeAccountRepository() *FakeAccountRepository {
@@ -66,6 +72,16 @@ func (f *FakeAccountRepository) GetByOwner(ctx context.Context, ownerType domain
 	return nil, repo.ErrNotFound
 }
 
+// TryLockOwner has nothing to lock in memory; it records the call and answers what the test
+// scripted, so a test can play the part of a concurrent creator.
+func (f *FakeAccountRepository) TryLockOwner(ctx context.Context, ownerType domain.OwnerType, ownerID string, idle time.Duration) (bool, error) {
+	f.creationLocks = append(f.creationLocks, string(ownerType)+":"+ownerID)
+	if f.tryLockOwner != nil {
+		return f.tryLockOwner(ownerType, ownerID)
+	}
+	return true, nil
+}
+
 func (f *FakeAccountRepository) GetBySingapayAccountID(ctx context.Context, singapayAccountID string) (*domain.Account, error) {
 	for _, acc := range f.accounts {
 		if acc.SingapayAccountID != "" && acc.SingapayAccountID == singapayAccountID {
@@ -91,6 +107,11 @@ func (f *FakeAccountRepository) GetPaymentGatewayAccount(ctx context.Context) (*
 }
 
 func (f *FakeAccountRepository) Save(ctx context.Context, account *domain.Account) error {
+	if f.saveErr != nil {
+		if err := f.saveErr(account); err != nil {
+			return err
+		}
+	}
 	f.accounts[account.UUID] = account
 	key := string(account.OwnerType) + ":" + account.OwnerID
 	f.byOwner[key] = account

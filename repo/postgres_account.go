@@ -3,6 +3,8 @@ package repo
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"time"
 
 	"github.com/21strive/redifu"
 	"github.com/Aturjadwal/singapay-ledger/domain"
@@ -102,6 +104,29 @@ func (r *PostgresAccountRepository) GetByOwner(ctx context.Context, ownerType do
 
 	row := r.db.QueryRowContext(ctx, query, ownerType, ownerID)
 	return scanAccount(row)
+}
+
+// TryLockOwner takes pg_try_advisory_xact_lock on the owner and sets the transaction's
+// idle_in_transaction_session_timeout to idle (set_config with is_local true, i.e. SET
+// LOCAL), in one round trip. The key is a 64-bit hash of a string no other lock in the
+// database uses: the one-bigint key space is shared with every advisory lock the consuming
+// service takes in the same database.
+func (r *PostgresAccountRepository) TryLockOwner(ctx context.Context, ownerType domain.OwnerType, ownerID string, idle time.Duration) (bool, error) {
+	query := `
+		SELECT pg_try_advisory_xact_lock(hashtextextended('ledger_accounts:' || $1::text || ':' || $2::text, 0)),
+		       set_config('idle_in_transaction_session_timeout', $3::text, true)
+	`
+
+	// Rounded up: a bound below a millisecond must not become 0, which Postgres reads as none.
+	ms := (idle + time.Millisecond - 1) / time.Millisecond
+	var (
+		locked  bool
+		setting string
+	)
+	if err := r.db.QueryRowContext(ctx, query, string(ownerType), ownerID, fmt.Sprintf("%dms", ms)).Scan(&locked, &setting); err != nil {
+		return false, ErrFailedQuerySQL.WithError(err)
+	}
+	return locked, nil
 }
 
 // GetBySingapayAccountID looks an account up by its Singapay ULID.

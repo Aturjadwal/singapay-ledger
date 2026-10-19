@@ -173,3 +173,29 @@ func TestSaveWritesSingapayIdentifiers(t *testing.T) {
 	require.NoError(t, repo.Save(context.Background(), &account))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+func TestTryLockOwnerTakesTheTransactionLockAndBoundsTheIdleTime(t *testing.T) {
+	repo, mock, closeDB := newMockAccountRepo(t)
+	defer closeDB()
+
+	// pg_try_advisory_xact_lock, never the session-level pg_try_advisory_lock: behind a
+	// transaction-mode pooler a session lock stays with the server connection after the
+	// transaction ends, held for whoever is handed that connection next.
+	mock.ExpectQuery(`SELECT pg_try_advisory_xact_lock\(hashtextextended\('ledger_accounts:' \|\| \$1::text \|\| ':' \|\| \$2::text, 0\)\),\s+set_config\('idle_in_transaction_session_timeout', \$3::text, true\)`).
+		WithArgs("SELLER", "seller-001", "45001ms").
+		WillReturnRows(sqlmock.NewRows([]string{"pg_try_advisory_xact_lock", "set_config"}).AddRow(true, "45001ms"))
+	mock.ExpectQuery(`pg_try_advisory_xact_lock`).
+		WithArgs("SELLER", "seller-001", "1ms").
+		WillReturnRows(sqlmock.NewRows([]string{"pg_try_advisory_xact_lock", "set_config"}).AddRow(false, "1ms"))
+
+	locked, err := repo.TryLockOwner(context.Background(), domain.OwnerTypeSeller, "seller-001", 45*time.Second+500*time.Microsecond)
+	require.NoError(t, err)
+	assert.True(t, locked)
+
+	// Rounded up, so a bound under a millisecond does not become 0 — no bound at all.
+	locked, err = repo.TryLockOwner(context.Background(), domain.OwnerTypeSeller, "seller-001", time.Microsecond)
+	require.NoError(t, err)
+	assert.False(t, locked, "another transaction holds it")
+
+	require.NoError(t, mock.ExpectationsWereMet())
+}
