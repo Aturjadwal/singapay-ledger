@@ -1,6 +1,6 @@
 # Testing guide
 
-262 tests across five packages. No network, and no database unless you give it one: every test
+263 tests across five packages. No network, and no database unless you give it one: every test
 runs with `go test ./...`, and the few that need PostgreSQL skip themselves without it (below).
 
 ```bash
@@ -34,7 +34,7 @@ other and leave nothing behind. Without the variable those tests report SKIP.
 |---|---|---|
 | `.` (root) | `ledger_test.go`, `settlement_fee_test.go`, `webhook_test.go`, `balance_reservation_test.go`, `payout_idempotency_test.go`, `payout_request_log_test.go` | The money paths, against in-memory fakes |
 | `.` (root) | `platform_statistics_test.go` | The platform statistics: one scenario through the money-in webhook and settlement, against the fakes and against PostgreSQL |
-| `domain/` | `disbursement_test.go`, `fee_config_test.go` | Pure rules: state transitions, fee arithmetic |
+| `domain/` | `disbursement_test.go`, `fee_config_test.go`, `product_transaction_test.go` | Pure rules: state transitions, fee arithmetic, a new transaction's unset fields |
 | `repo/` | `insert_arity_test.go`, `postgres_account_test.go`, `postgres_disbursement_test.go`, `postgres_product_transaction_test.go`, `postgres_platform_statistics_test.go` | SQL, against `go-sqlmock` |
 | `singapay/` | 8 files | The HTTP client: signatures, amounts, error classification, webhook parsing |
 | `ledgererr/` | `error_test.go` | Error wrapping and code matching |
