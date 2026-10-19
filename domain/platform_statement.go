@@ -36,3 +36,45 @@ type PlatformIncome struct {
 	Transaction    *ProductTransaction
 	PlatformAmount int64
 }
+
+// DailyWindow is a [From, To) window of instants to be counted per calendar date of
+// TimeZone, an IANA zone name such as "Asia/Jakarta". From and To are compared with the
+// payment time as UTC instants; TimeZone only decides which date an instant falls on.
+type DailyWindow struct {
+	From     time.Time
+	To       time.Time
+	TimeZone string
+}
+
+// PlatformEarningsDay is what the platform account was credited by the transactions paid on
+// one date, from one kind of sale. It has no table of its own — a value type, like
+// PlatformIncome, and the same figures: Amount is the sum, over those transactions, of the
+// PlatformAmount a statement line shows.
+type PlatformEarningsDay struct {
+	// Date is the calendar date of the payment time in the window's zone, YYYY-MM-DD.
+	Date string
+
+	// PlatformSale is true for the platform's own sales (the platform is the seller) and false
+	// for the platform fee on a seller's sale.
+	PlatformSale bool
+
+	// Amount is the sum of the platform account's ledger entries for those transactions,
+	// whole rupiah.
+	Amount int64
+
+	// AwaitingSettlement is the part of Amount still in the PENDING bucket: the priced credit
+	// of transactions that have not settled. Settlement clears it and books the settled
+	// figure as AVAILABLE, so it is zero for a settled transaction.
+	AwaitingSettlement int64
+}
+
+// PaidTransactionsDay counts the transactions of one product type paid on one date.
+type PaidTransactionsDay struct {
+	// Date is the calendar date of the payment time in the window's zone, YYYY-MM-DD.
+	Date        string
+	ProductType string
+	Count       int64
+
+	// Amount is the sum of total_charged: what the payers were charged, whole rupiah.
+	Amount int64
+}

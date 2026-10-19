@@ -256,18 +256,13 @@ func platformIncomeLine(platformAccountUUID string, income *domain.PlatformIncom
 		occurredAt = *tx.CompletedAt
 	}
 
-	source := PlatformIncomeSourceFee
-	if tx.SellerAccountID == platformAccountUUID {
-		source = PlatformIncomeSourceSale
-	}
-
 	return &PlatformTransaction{
 		Type:       PlatformTransactionIncome,
 		ID:         tx.UUID,
 		OccurredAt: occurredAt,
 		Amount:     income.PlatformAmount,
 		Income: &PlatformIncomeDetail{
-			Source:      source,
+			Source:      platformIncomeSource(tx.SellerAccountID == platformAccountUUID),
 			Transaction: tx,
 		},
 	}

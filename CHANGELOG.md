@@ -4,6 +4,52 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added — the platform's earnings and the paid transactions, per day (v0.8.0)
+
+Two pure reads for a dashboard's daily charts (no gateway call), both dating a transaction by
+when the payer paid — `COALESCE(completed_at, created_at)`, the key the platform statement is
+ordered by — in a calendar zone the caller names:
+
+```go
+req := ledger.PlatformDailyRequest{From: firstDay0000, To: dayAfterLast0000, TimeZone: "Asia/Jakarta"}
+earnings, err := client.PlatformEarningsByDay(ctx, req) // []PlatformEarningsDayRow{Date, Source, Amount, AwaitingSettlement}
+paid, err := client.PaidTransactionsByDay(ctx, req)     // []PaidTransactionsDayRow{Date, ProductType, Count, Amount}
+```
+
+- **`PlatformEarningsByDay`** sums, per date and per `PlatformIncomeSource` (`PLATFORM_FEE`,
+  `PLATFORM_SALE`), the platform account's ledger entries for the paid transactions that
+  credited it. It reads the same transactions and the same entries as the statement's INCOME
+  lines — the SQL fragments are now shared (`paidSQL`, `creditsPlatformSQL`,
+  `platformEntriesSQL`, `paidAtSQL` in `repo/postgres_product_transaction.go`), and the source
+  rule is one function (`platformIncomeSource`) — so the rows of any window add up to the
+  INCOME lines whose `OccurredAt` falls in it. A settled sale counts its settled figure, one
+  awaiting settlement its priced fee; `AwaitingSettlement` is that PENDING-bucket part.
+  `ErrLedgerNotFound` until the platform account exists.
+- **`PaidTransactionsByDay`** counts every paid transaction (`COMPLETED` or `SETTLED`) and sums
+  its `TotalCharged`, per date and `ProductType`, whatever it credited the platform. It needs
+  no platform account.
+- `PENDING` is never counted: an instrument that expires unpaid stays `PENDING`, and a
+  re-issue adds another row. `FAILED`/`REFUNDED` are never written.
+- `From`/`To` are a `[From, To)` window of instants; the repository sends them as UTC, since
+  PostgreSQL drops the offset of a value compared with a timestamp column. An empty or unknown
+  `TimeZone`, `"Local"`, a zero end, or `To` before `From` is `CodeInvalidRequest`; rows are
+  ordered by date, then source or product type; an empty window is an empty slice.
+- New repository methods `PlatformEarningsByDay` / `PaidTransactionsByDay` on
+  `domain.ProductTransactionRepository`, with `domain.DailyWindow`,
+  `domain.PlatformEarningsDay` and `domain.PaidTransactionsDay`. A consumer with its own
+  implementation of the interface must add them.
+- **Migration 030** (`030_product_transactions_paid_day_index.sql`):
+  `idx_product_transactions_paid_at ON product_transactions ((COALESCE(completed_at, created_at))) WHERE status IN ('COMPLETED','SETTLED')`,
+  `CONCURRENTLY`, one statement, **run by hand outside a transaction** (the file says how).
+  Apply it before the consumer deploys this version; without it the reads are correct but
+  scan every PENDING row ever issued. `schema.sql` carries it.
+- Tests: sqlmock for both queries (UTC parameters, the shared fragments verbatim, empty
+  window), and one scenario through the money-in webhook and settlement — 16:59:59Z and
+  17:00:00Z on two WIB dates and one UTC date, PENDING left out, a settled fee different from
+  the priced one, a platform sale, a legacy row dated by `created_at`, a product type the
+  ledger does not know, "a day's earnings are that day's INCOME lines" — run against the fakes
+  and, with `LEDGER_TEST_DATABASE_URL`, against PostgreSQL (README_TESTING.md).
+
 ### Fixed — a NULL timestamp or settled fee is read back as absent, not as zero
 
 Every read of `product_transactions` (`scanRowWith`) built the transaction with its nullable

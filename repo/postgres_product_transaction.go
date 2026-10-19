@@ -149,13 +149,53 @@ func (r *PostgresProductTransactionRepository) GetBySellerAccountIDWithCursor(ct
 	return r.scanMany(ctx, query, args...)
 }
 
+// The SQL that decides what the platform earned, written once. The statement
+// (GetPlatformIncomes) and the daily figures (PlatformEarningsByDay, PaidTransactionsByDay)
+// are built from these fragments, so a day's figure is the sum of that day's statement lines
+// by construction rather than by two copies of one rule being kept in step. Every fragment
+// reads product_transactions as pt and ledger_entries as le, and $1 is the platform
+// account's uuid wherever it appears.
+const (
+	// paidAtSQL is when the payer paid: completed_at, stamped by the money-in webhook, or
+	// created_at for a row older than that column. The statement orders by it and the
+	// daily figures date by it. Migration 030 indexes exactly this expression, and the
+	// planner only matches an index expression written the same way.
+	paidAtSQL = `COALESCE(pt.completed_at, pt.created_at)`
+
+	// paidSQL selects the paid transactions: COMPLETED (paid, awaiting settlement) and
+	// SETTLED. PENDING is an instrument nobody has paid, or one that expired unpaid and
+	// stays PENDING forever; FAILED and REFUNDED are never written. It is also the
+	// predicate of migration 030's partial index, so it is written as the index has it.
+	paidSQL = `pt.status IN ('COMPLETED', 'SETTLED')`
+
+	// creditsPlatformSQL selects the paid transactions that credited the platform: its own
+	// sales (seller_account_id is the platform) and any sale carrying a platform fee, either
+	// as priced or as settled — settlement can move the fee away from the priced figure when
+	// the gateway charged something other than the estimate. A sale with no fee either way
+	// wrote a zero-amount entry and nothing more, and is left out.
+	creditsPlatformSQL = `(pt.seller_account_id = $1
+		       OR pt.platform_fee <> 0
+		       OR COALESCE(pt.settled_platform_fee, 0) <> 0)`
+
+	// platformEntriesSQL matches the platform account's ledger entries for a transaction,
+	// through idx_ledger_entries_source. Their sum is what the transaction credited the
+	// platform: the priced fee in PENDING until it settles, the settled figure in AVAILABLE
+	// after.
+	platformEntriesSQL = `le.account_uuid = $1
+		           AND le.source_type = 'PRODUCT_TRANSACTION'
+		           AND le.source_id = pt.uuid`
+)
+
+// paidDateSQL is the calendar date of the payment time in the zone named by the parameter
+// zoneParam, as YYYY-MM-DD. The columns are timestamps without a zone holding UTC, so the
+// value is read as UTC first and only then moved into the zone.
+func paidDateSQL(zoneParam string) string {
+	return `to_char((` + paidAtSQL + ` AT TIME ZONE 'UTC' AT TIME ZONE ` + zoneParam + `::text)::date, 'YYYY-MM-DD')`
+}
+
 // GetPlatformIncomes lists the paid transactions that credited the platform account, each
-// with the sum of the platform's ledger entries for it. See the interface for the order.
-//
-// Which transactions: the platform's own sales (seller_account_id is the platform) and any
-// sale carrying a platform fee, either as priced or as settled — settlement can move the fee
-// away from the priced figure when the gateway charged something other than the estimate.
-// A sale with no fee either way wrote a zero-amount entry and nothing more, and is left out.
+// with the sum of the platform's ledger entries for it. See the interface for the order, and
+// creditsPlatformSQL for which transactions.
 //
 // The amount is a correlated subquery on idx_ledger_entries_source. It is not part of the
 // sort key, so PostgreSQL can defer it past the sort and limit and evaluate it for the
@@ -176,8 +216,8 @@ func (r *PostgresProductTransactionRepository) GetPlatformIncomes(ctx context.Co
 	if after != nil {
 		args = append(args, after.At, after.ID)
 		cursorClause = fmt.Sprintf(
-			`AND (COALESCE(pt.completed_at, pt.created_at), pt.uuid COLLATE "C") %s ($2::timestamp, $3::varchar)`,
-			comparison)
+			`AND (%s, pt.uuid COLLATE "C") %s ($2::timestamp, $3::varchar)`,
+			paidAtSQL, comparison)
 	}
 	args = append(args, limit)
 
@@ -189,18 +229,14 @@ func (r *PostgresProductTransactionRepository) GetPlatformIncomes(ctx context.Co
 		       pt.settled_platform_fee, pt.settled_gateway_fee, pt.platform_residual,
 		       (SELECT COALESCE(SUM(le.amount), 0)
 		          FROM ledger_entries le
-		         WHERE le.account_uuid = $1
-		           AND le.source_type = 'PRODUCT_TRANSACTION'
-		           AND le.source_id = pt.uuid) AS platform_amount
+		         WHERE %s) AS platform_amount
 		FROM product_transactions pt
-		WHERE pt.status IN ('COMPLETED', 'SETTLED')
-		  AND (pt.seller_account_id = $1
-		       OR pt.platform_fee <> 0
-		       OR COALESCE(pt.settled_platform_fee, 0) <> 0)
+		WHERE %s
+		  AND %s
 		  %s
-		ORDER BY COALESCE(pt.completed_at, pt.created_at) %s, pt.uuid COLLATE "C" %s
+		ORDER BY %s %s, pt.uuid COLLATE "C" %s
 		LIMIT $%d
-	`, cursorClause, direction, direction, len(args))
+	`, platformEntriesSQL, paidSQL, creditsPlatformSQL, cursorClause, paidAtSQL, direction, direction, len(args))
 
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -223,6 +259,106 @@ func (r *PostgresProductTransactionRepository) GetPlatformIncomes(ctx context.Co
 	}
 
 	return incomes, nil
+}
+
+// PlatformEarningsByDay sums the platform's credit per date of the payment time and per kind
+// of sale. See the interface.
+//
+// It reads the transactions GetPlatformIncomes lists — paidSQL and creditsPlatformSQL, the
+// same fragments — and sums the same entries, platformEntriesSQL, joined rather than in a
+// correlated subquery. So for any window, the amounts here add up to the PlatformAmount of
+// the statement lines whose payment time falls in it. The PENDING part of each sum is the
+// credit still awaiting settlement.
+//
+// The window is matched on paidAtSQL, the expression migration 030 indexes for exactly
+// these two statuses; without that index the scan reads every PENDING row ever issued.
+func (r *PostgresProductTransactionRepository) PlatformEarningsByDay(ctx context.Context, platformAccountID string, window domain.DailyWindow) ([]*domain.PlatformEarningsDay, error) {
+	query := fmt.Sprintf(`
+		SELECT %s AS day,
+		       pt.seller_account_id = $1 AS platform_sale,
+		       COALESCE(SUM(le.amount), 0)::bigint AS amount,
+		       COALESCE(SUM(le.amount) FILTER (WHERE le.balance_bucket = 'PENDING'), 0)::bigint AS awaiting_settlement
+		FROM product_transactions pt
+		JOIN ledger_entries le
+		  ON %s
+		WHERE %s
+		  AND %s
+		  AND %s >= $2
+		  AND %s < $3
+		GROUP BY 1, 2
+	`, paidDateSQL("$4"), platformEntriesSQL, paidSQL, creditsPlatformSQL, paidAtSQL, paidAtSQL)
+
+	from, to := windowBounds(window)
+	rows, err := r.db.QueryContext(ctx, query, platformAccountID, from, to, window.TimeZone)
+	if err != nil {
+		return nil, ErrFailedQuerySQL.WithError(err)
+	}
+	defer rows.Close()
+
+	days := []*domain.PlatformEarningsDay{}
+	for rows.Next() {
+		day := &domain.PlatformEarningsDay{}
+		if err := rows.Scan(&day.Date, &day.PlatformSale, &day.Amount, &day.AwaitingSettlement); err != nil {
+			return nil, ErrFailedScanSQL.WithError(err)
+		}
+		days = append(days, day)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, ErrFailedQuerySQL.WithError(err)
+	}
+
+	return days, nil
+}
+
+// PaidTransactionsByDay counts the paid transactions and sums what their payers were
+// charged, per date of the payment time and product type. See the interface.
+//
+// Every paid transaction counts, whether or not it credited the platform: this is the
+// volume the gateway processed, not the platform's share of it. The window is matched as in
+// PlatformEarningsByDay, on the expression migration 030 indexes.
+func (r *PostgresProductTransactionRepository) PaidTransactionsByDay(ctx context.Context, window domain.DailyWindow) ([]*domain.PaidTransactionsDay, error) {
+	query := fmt.Sprintf(`
+		SELECT %s AS day,
+		       pt.product_type,
+		       COUNT(*) AS n,
+		       COALESCE(SUM(pt.total_charged), 0)::bigint AS amount
+		FROM product_transactions pt
+		WHERE %s
+		  AND %s >= $1
+		  AND %s < $2
+		GROUP BY 1, 2
+	`, paidDateSQL("$3"), paidSQL, paidAtSQL, paidAtSQL)
+
+	from, to := windowBounds(window)
+	rows, err := r.db.QueryContext(ctx, query, from, to, window.TimeZone)
+	if err != nil {
+		return nil, ErrFailedQuerySQL.WithError(err)
+	}
+	defer rows.Close()
+
+	days := []*domain.PaidTransactionsDay{}
+	for rows.Next() {
+		day := &domain.PaidTransactionsDay{}
+		if err := rows.Scan(&day.Date, &day.ProductType, &day.Count, &day.Amount); err != nil {
+			return nil, ErrFailedScanSQL.WithError(err)
+		}
+		days = append(days, day)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, ErrFailedQuerySQL.WithError(err)
+	}
+
+	return days, nil
+}
+
+// windowBounds is a window's two ends as UTC instants, the form the columns hold.
+//
+// The conversion is not cosmetic. The columns are timestamps without a zone, and PostgreSQL
+// silently drops the offset of a value compared with one: 2026-10-01T00:00:00+07:00 sent as
+// it is would be read as 2026-10-01 00:00 UTC, seven hours late. In UTC the wall clock and
+// the instant agree, so the comparison is the one the caller meant.
+func windowBounds(window domain.DailyWindow) (time.Time, time.Time) {
+	return window.From.UTC(), window.To.UTC()
 }
 
 func (r *PostgresProductTransactionRepository) GetPendingBySellerAccountID(ctx context.Context, sellerAccountID string) ([]*domain.ProductTransaction, error) {
