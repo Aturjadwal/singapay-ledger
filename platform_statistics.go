@@ -24,6 +24,10 @@ import (
 // caller says which calendar its days are, and From and To are the instants its first day
 // begins and the day after its last day begins, in that zone.
 //
+// The zone is checked against Go's zone database and applied by PostgreSQL's, so it must be
+// known to both: a consumer binary without system zoneinfo needs `import _ "time/tzdata"`
+// (aturjadwal-monoservice has it), or every request is refused.
+//
 // An empty or unknown TimeZone, a zero From or To, and a To before From are
 // CodeInvalidRequest. From equal to To is an empty window.
 type PlatformDailyRequest struct {
@@ -64,9 +68,10 @@ type PaidTransactionsDayRow struct {
 	// Count is the number of paid transactions (COMPLETED or SETTLED).
 	Count int64
 
-	// Amount is the sum of their TotalCharged: what the payers were charged, the seller's
-	// price and both fees included, whole rupiah. A QRIS tip is not in it — the ledger books
-	// a payment as priced.
+	// Amount is the sum of their TotalCharged: what the payers were charged, whole rupiah —
+	// the seller's price plus the fees the payer bears under the transaction's fee model
+	// (under GATEWAY_ON_SELLER, a web subscription's, the gateway fee is not in it). A QRIS
+	// tip is not in it either: the ledger books a payment as priced.
 	Amount int64
 }
 

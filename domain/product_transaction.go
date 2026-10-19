@@ -239,10 +239,17 @@ func NewProductTransaction(
 
 	redifu.InitRecord(pt)
 
-	// CRITICAL FIX: redifu.InitRecord initializes pointer fields to zero time instead of nil
-	// Explicitly set timestamp fields to nil to prevent "0001-01-01" in database
+	// redifu.InitRecord allocates every nil pointer field, so each nullable one is set back
+	// to nil here: a pointer to the zero time is stored as "0001-01-01" (toNullTime only
+	// writes NULL for nil), and a pointer to 0 reads as a recorded zero fee. Every one of
+	// them, not only the two timestamps the first fix covered: platform_fee_transferred_at
+	// was still written as year 1 on every new row.
 	pt.CompletedAt = nil
 	pt.SettledAt = nil
+	pt.PlatformFeeTransferredAt = nil
+	pt.SettledPlatformFeeMinor = nil
+	pt.SettledGatewayFeeMinor = nil
+	pt.PlatformResidualMinor = nil
 
 	return pt
 }

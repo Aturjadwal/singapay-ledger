@@ -20,9 +20,10 @@ paid, err := client.PaidTransactionsByDay(ctx, req)     // []PaidTransactionsDay
   `PLATFORM_SALE`), the platform account's ledger entries for the paid transactions that
   credited it. It reads the same transactions and the same entries as the statement's INCOME
   lines — the SQL fragments are now shared (`paidSQL`, `creditsPlatformSQL`,
-  `platformEntriesSQL`, `paidAtSQL` in `repo/postgres_product_transaction.go`), and the source
-  rule is one function (`platformIncomeSource`) — so the rows of any window add up to the
-  INCOME lines whose `OccurredAt` falls in it. A settled sale counts its settled figure, one
+  `platformEntriesSQL`, `paidAtSQL` in `repo/postgres_product_transaction.go`), and both name
+  the source through one function (`platformIncomeSource`) from the same test, seller = the
+  platform account — so the rows of any window add up to the INCOME lines whose `OccurredAt`
+  falls in it. A settled sale counts its settled figure, one
   awaiting settlement its priced fee; `AwaitingSettlement` is that PENDING-bucket part.
   `ErrLedgerNotFound` until the platform account exists.
 - **`PaidTransactionsByDay`** counts every paid transaction (`COMPLETED` or `SETTLED`) and sums
@@ -32,8 +33,10 @@ paid, err := client.PaidTransactionsByDay(ctx, req)     // []PaidTransactionsDay
   re-issue adds another row. `FAILED`/`REFUNDED` are never written.
 - `From`/`To` are a `[From, To)` window of instants; the repository sends them as UTC, since
   PostgreSQL drops the offset of a value compared with a timestamp column. An empty or unknown
-  `TimeZone`, `"Local"`, a zero end, or `To` before `From` is `CodeInvalidRequest`; rows are
-  ordered by date, then source or product type; an empty window is an empty slice.
+  `TimeZone`, `"Local"`, a zero start or end, or `To` before `From` is `CodeInvalidRequest`;
+  rows are ordered by date, then source or product type; an empty window is an empty slice.
+  The zone must be known to Go's zone database (a consumer binary without system zoneinfo
+  needs `time/tzdata`) and to PostgreSQL's.
 - New repository methods `PlatformEarningsByDay` / `PaidTransactionsByDay` on
   `domain.ProductTransactionRepository`, with `domain.DailyWindow`,
   `domain.PlatformEarningsDay` and `domain.PaidTransactionsDay`. A consumer with its own
@@ -59,6 +62,14 @@ as the zero time, and a NULL `settled_platform_fee`, `settled_gateway_fee` or
 `platform_residual` as 0 — the readings `ProductTransaction` documents as impossible ("nil
 means not recorded, never zero"). The nullable fields are now set after `InitRecord`.
 
+The write side had the same hole: `NewProductTransaction` set only `CompletedAt` and
+`SettledAt` back to nil after `InitRecord`, so every new row stored
+`platform_fee_transferred_at = 0001-01-01` (toNullTime writes NULL only for nil), and the
+settled-fee pointers of a new transaction pointed at 0. It now sets all six back to nil, so
+a new row stores NULL. Rows written before keep `0001-01-01` in that column — the 21 unswept
+rows of production on 2026-10-16 do — and read back as that date, which consumers already
+treat as "not yet" (`IsZero`); a clean-up in the style of migration 002 is optional.
+
 What it changes:
 
 - A statement line (`GetPlatformTransactions`) for a paid transaction without `completed_at`
@@ -68,11 +79,15 @@ What it changes:
   line.
 - `ProcessPlatformFeeTransfer` falls back to the priced fee for a settled transaction whose
   settled fee was never recorded, as its comment always said, instead of skipping it as a zero
-  fee. In production on 2026-10-16 no row is affected: the 8 SETTLED rows without a settled
-  fee are all transferred, and every paid row has `completed_at`.
-- `GetPaymentByInvoiceNumber`, `GetTransactionDetail` and the statement return `nil` for an
-  unset time rather than a pointer to the zero time (`omitempty` now omits it).
-  `aturjadwal-monoservice` already reads both shapes as "not recorded".
+  fee. **This moves money** for such rows when the sweep next runs. In production on 2026-10-16
+  no row qualifies: the 8 SETTLED rows without a settled fee are all transferred, and every paid
+  row has `completed_at`. Check again right before the consumer deploys this version — it must
+  return 0, or someone decides about those rows first:
+  `SELECT count(*) FROM product_transactions WHERE status = 'SETTLED' AND NOT platform_fee_transferred AND platform_fee > 0 AND settled_platform_fee IS NULL;`
+- `GetPaymentByInvoiceNumber`, `GetTransactionDetail` and the statement return `nil` for a
+  NULL time rather than a pointer to the zero time (`omitempty` now omits it): `completed_at`
+  of an unpaid row, `settled_at` of an unsettled one. `aturjadwal-monoservice` already reads
+  both shapes as "not recorded".
 
 ### Fixed — payment-link webhooks keep the attempt reference and no longer store a fake id 0
 

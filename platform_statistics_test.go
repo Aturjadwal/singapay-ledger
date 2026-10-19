@@ -377,6 +377,33 @@ func runPlatformStatisticsScenario(t *testing.T, world *statisticsWorld) {
 		assert.Equal(t, statementByDay(t, client, wibWindow(0, 0)), earningsByKey(rows))
 	})
 
+	t.Run("a payment at exactly 00:00:00 WIB is the new day's first, a window's From included", func(t *testing.T) {
+		// wibWindow(1, 1) starts at D 17:00:00Z, the instant firstOnD1 was paid.
+		rows, err := client.PaidTransactionsByDay(ctx, wibWindow(1, 1))
+		require.NoError(t, err)
+		vouchers := int64(0)
+		for _, row := range rows {
+			if row.ProductType == "VOUCHER" {
+				vouchers += row.Count
+			}
+		}
+		assert.Equal(t, int64(1), vouchers, "the voucher paid at From is in the window")
+
+		earnings, err := client.PlatformEarningsByDay(ctx, wibWindow(1, 1))
+		require.NoError(t, err)
+		assert.Equal(t, statementByDay(t, client, wibWindow(1, 1)), earningsByKey(earnings))
+	})
+
+	t.Run("an issued transaction keeps every nullable field unset, as stored", func(t *testing.T) {
+		fresh := s.reload(t, unpaid)
+		assert.Nil(t, fresh.CompletedAt)
+		assert.Nil(t, fresh.SettledAt)
+		assert.Nil(t, fresh.PlatformFeeTransferredAt, "not year 1")
+		assert.Nil(t, fresh.SettledPlatformFeeMinor, "not a recorded zero")
+		assert.Nil(t, fresh.SettledGatewayFeeMinor)
+		assert.Nil(t, fresh.PlatformResidualMinor)
+	})
+
 	t.Run("an empty window answers no rows", func(t *testing.T) {
 		empty := wibWindow(10, 12)
 		earnings, err := client.PlatformEarningsByDay(ctx, empty)
