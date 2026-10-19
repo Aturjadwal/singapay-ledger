@@ -129,6 +129,22 @@ func (r *PostgresAccountRepository) TryLockOwner(ctx context.Context, ownerType 
 	return locked, nil
 }
 
+// ProbeOwner reads the row's existence and probes the creation lock (the same key as
+// TryLockOwner) in one autocommit statement: the lock, when free, is taken and released
+// with the statement.
+func (r *PostgresAccountRepository) ProbeOwner(ctx context.Context, ownerType domain.OwnerType, ownerID string) (bool, bool, error) {
+	query := `
+		SELECT EXISTS (SELECT 1 FROM ledger_accounts WHERE owner_type = $1 AND owner_id = $2),
+		       pg_try_advisory_xact_lock(hashtextextended('ledger_accounts:' || $1::text || ':' || $2::text, 0))
+	`
+
+	var exists, lockFree bool
+	if err := r.db.QueryRowContext(ctx, query, string(ownerType), ownerID).Scan(&exists, &lockFree); err != nil {
+		return false, false, ErrFailedQuerySQL.WithError(err)
+	}
+	return exists, lockFree, nil
+}
+
 // GetBySingapayAccountID looks an account up by its Singapay ULID.
 //
 // The ULID, not the account number: the number identifies the same account but is only

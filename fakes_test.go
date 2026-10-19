@@ -39,6 +39,10 @@ type FakeAccountRepository struct {
 	creationLocks []string
 	tryLockOwner  func(ownerType domain.OwnerType, ownerID string) (bool, error)
 	saveErr       func(account *domain.Account) error
+	// probeErr, when it answers an error, fails ProbeOwner with it (a look cut short);
+	// probes counts the looks.
+	probeErr func(ctx context.Context) error
+	probes   int
 }
 
 func NewFakeAccountRepository() *FakeAccountRepository {
@@ -70,6 +74,23 @@ func (f *FakeAccountRepository) GetByOwner(ctx context.Context, ownerType domain
 		return acc, nil
 	}
 	return nil, repo.ErrNotFound
+}
+
+// ProbeOwner answers whether the account is in memory, and whether the lock is free as
+// TryLockOwner would answer it (the script is asked without being recorded as a lock).
+func (f *FakeAccountRepository) ProbeOwner(ctx context.Context, ownerType domain.OwnerType, ownerID string) (bool, bool, error) {
+	f.probes++
+	if f.probeErr != nil {
+		if err := f.probeErr(ctx); err != nil {
+			return false, false, err
+		}
+	}
+	_, exists := f.byOwner[string(ownerType)+":"+ownerID]
+	if f.tryLockOwner == nil {
+		return exists, true, nil
+	}
+	free, err := f.tryLockOwner(ownerType, ownerID)
+	return exists, free, err
 }
 
 // TryLockOwner has nothing to lock in memory; it records the call and answers what the test
@@ -831,6 +852,11 @@ func NewFakeTransactionProvider(fakes *FakeRepositoryProvider) *FakeTransactionP
 // Transact executes the function with fake repositories (no actual transaction)
 func (f *FakeTransactionProvider) Transact(ctx context.Context, fn func(tx repo.Tx) error) error {
 	// Just call the function with our fakes (which implement repo.Tx)
+	return fn(f.fakes)
+}
+
+// TransactReadCommitted is Transact: the fakes have no isolation to choose.
+func (f *FakeTransactionProvider) TransactReadCommitted(ctx context.Context, fn func(tx repo.Tx) error) error {
 	return fn(f.fakes)
 }
 

@@ -199,3 +199,20 @@ func TestTryLockOwnerTakesTheTransactionLockAndBoundsTheIdleTime(t *testing.T) {
 
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+func TestProbeOwnerLooksAtTheRowAndTheLockInOneStatement(t *testing.T) {
+	repo, mock, closeDB := newMockAccountRepo(t)
+	defer closeDB()
+
+	// One autocommit statement: the row's existence, and the creation lock tried and let go
+	// with the statement (the same key as TryLockOwner).
+	mock.ExpectQuery(`SELECT EXISTS \(SELECT 1 FROM ledger_accounts WHERE owner_type = \$1 AND owner_id = \$2\),\s+pg_try_advisory_xact_lock\(hashtextextended\('ledger_accounts:' \|\| \$1::text \|\| ':' \|\| \$2::text, 0\)\)`).
+		WithArgs("SELLER", "seller-001").
+		WillReturnRows(sqlmock.NewRows([]string{"exists", "pg_try_advisory_xact_lock"}).AddRow(false, false))
+
+	exists, lockFree, err := repo.ProbeOwner(context.Background(), domain.OwnerTypeSeller, "seller-001")
+	require.NoError(t, err)
+	assert.False(t, exists)
+	assert.False(t, lockFree, "another transaction holds it")
+	require.NoError(t, mock.ExpectationsWereMet())
+}

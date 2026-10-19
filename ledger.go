@@ -113,9 +113,11 @@ const (
 	// accountCreationIdleMargin is how far past the caller's deadline the creating
 	// transaction may still sit idle (TryLockOwner's idle); accountCreationIdleDefault is
 	// the bound for a caller that set no deadline — four times the Singapay client's
-	// 30-second timeout.
+	// 30-second timeout — and accountCreationIdleMax the most it is ever given: no
+	// Singapay call lasts longer, and Postgres takes no more than 2^31 ms.
 	accountCreationIdleMargin  = 30 * time.Second
 	accountCreationIdleDefault = 2 * time.Minute
+	accountCreationIdleMax     = 10 * time.Minute
 )
 
 // CreateAccount provisions a Singapay sub-account and persists an Account record — once per
@@ -156,34 +158,74 @@ const (
 // sub-account; it is not a way to enrol a stranger. Sellers get no Singapay dashboard,
 // which is what an `owned` sub-account means in the first place.
 func (c *LedgerClient) CreateAccount(ctx context.Context, accountID string, name string, currency domain.Currency) (*domain.Account, error) {
-	wait := accountCreationPollFirst
+	existing, err := c.repoProvider.Account().GetByOwner(ctx, domain.OwnerTypeSeller, accountID)
+	if err == nil {
+		c.logger.InfoContext(ctx, "Account already exists for owner ID", "owner_id", accountID, "account_id", existing.UUID)
+		return nil, ledgererr.ErrLedgerAlreadyExists
+	} else if !ledgererr.IsErrorCode(ledgererr.CodeNotFound, err) {
+		return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to check existing account", err)
+	}
+
 	waiting := false
 	for {
-		existing, err := c.repoProvider.Account().GetByOwner(ctx, domain.OwnerTypeSeller, accountID)
-		if err == nil {
-			c.logger.InfoContext(ctx, "Account already exists for owner ID", "owner_id", accountID, "account_id", existing.UUID, "waited", waiting)
-			return nil, ledgererr.ErrLedgerAlreadyExists
-		} else if !ledgererr.IsErrorCode(ledgererr.CodeNotFound, err) {
-			return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to check existing account", err)
-		}
-
 		account, locked, err := c.createSellerAccount(ctx, accountID, name, currency)
-		if locked || err != nil {
+		if locked {
 			return account, err
+		}
+		if err != nil {
+			if waiting && ctx.Err() != nil {
+				return nil, c.gaveUpWaiting(ctx, accountID)
+			}
+			return nil, err
 		}
 
 		if !waiting {
 			c.logger.InfoContext(ctx, "Seller account is being created by another request — waiting for it", "owner_id", accountID)
 			waiting = true
 		}
+		if err := c.awaitSellerAccount(ctx, accountID); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// awaitSellerAccount waits for the caller that holds the seller's creation lock — it is asking
+// Singapay right now — looking again every 25 ms, doubling to 400 ms, one statement per look
+// (ProbeOwner) and nothing held in between. It answers ErrLedgerAlreadyExists once the row is
+// there, nil once the lock is free with no row (that caller failed: this one tries in its
+// place), and ErrAccountCreationInProgress when the caller's deadline comes first.
+func (c *LedgerClient) awaitSellerAccount(ctx context.Context, accountID string) error {
+	wait := accountCreationPollFirst
+	for {
 		select {
 		case <-ctx.Done():
-			c.logger.WarnContext(ctx, "Gave up waiting for the seller account another request is creating", "owner_id", accountID, "error", ctx.Err())
-			return nil, ledgererr.ErrAccountCreationInProgress.WithError(ctx.Err())
+			return c.gaveUpWaiting(ctx, accountID)
 		case <-time.After(wait):
 		}
 		wait = min(2*wait, accountCreationPollMax)
+
+		exists, lockFree, err := c.repoProvider.Account().ProbeOwner(ctx, domain.OwnerTypeSeller, accountID)
+		switch {
+		case err != nil && ctx.Err() != nil:
+			return c.gaveUpWaiting(ctx, accountID)
+		case err != nil:
+			return ledgererr.NewError(ledgererr.CodeInternal, "failed to check existing account", err)
+		case exists:
+			c.logger.InfoContext(ctx, "Seller account created by another request", "owner_id", accountID)
+			return ledgererr.ErrLedgerAlreadyExists
+		case lockFree:
+			return nil
+		}
 	}
+}
+
+// gaveUpWaiting answers a caller whose deadline ended while another caller was creating
+// the account — between two looks, or in a statement itself: the holder keeps one of the
+// pool's connections across the Singapay call, so with a pool of one the looks queue
+// behind it.
+func (c *LedgerClient) gaveUpWaiting(ctx context.Context, accountID string) error {
+	c.logger.WarnContext(ctx, "Gave up waiting for the seller account another request is creating", "owner_id", accountID, "error", ctx.Err())
+	return ledgererr.ErrAccountCreationInProgress.WithError(ctx.Err())
 }
 
 // createSellerAccount is one attempt at the creation, in a transaction holding the seller's
@@ -195,7 +237,9 @@ func (c *LedgerClient) createSellerAccount(ctx context.Context, accountID string
 		created *domain.Account
 		stepErr error // the attempt's own error, rather than Transact's join with a rollback's
 	)
-	txErr := c.txProvider.Transact(ctx, func(tx repo.Tx) error {
+	// READ COMMITTED: the read under the lock must see the row of a holder that committed
+	// after this transaction began, which only a statement's own snapshot does.
+	txErr := c.txProvider.TransactReadCommitted(ctx, func(tx repo.Tx) error {
 		stepErr = func() error {
 			got, err := tx.Account().TryLockOwner(ctx, domain.OwnerTypeSeller, accountID, accountCreationIdle(ctx))
 			if err != nil {
@@ -276,29 +320,35 @@ func (c *LedgerClient) createSellerAccount(ctx context.Context, accountID string
 		}()
 		return stepErr
 	})
+	commitFailed := false
 	if stepErr == nil && txErr != nil {
 		// The transaction would not open, or would not commit.
 		if created != nil {
 			stepErr = ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to commit account", txErr)
-			created = nil
+			created, commitFailed = nil, true
 		} else {
 			stepErr = ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to run the account creation transaction", txErr)
 		}
 	}
 
 	if opened != nil && created == nil {
-		// The sub-account exists at Singapay and nothing here references it. Loud, because
-		// the fix is to bind the row by hand — creating another would leave the first one
-		// holding money nobody watches. A unique violation means a row for this seller was
+		// The sub-account exists at Singapay and nothing here references it — or, when the
+		// commit was sent and its answer lost, perhaps a row does. Loud, because the fix is to
+		// bind it by hand — creating another would leave the first one holding money nobody
+		// watches. A unique violation of the seller index means a row for this seller was
 		// written without the lock (a consumer still on an older version of this package,
 		// mid-deploy, or a hand insert): the seller has an account, and this one is the extra.
-		c.logger.ErrorContext(ctx, "CRITICAL: Singapay sub-account created but the ledger row could not be saved — bind it by hand, do not re-create",
+		message := "CRITICAL: Singapay sub-account created but the ledger row could not be saved — bind it by hand, do not re-create"
+		if commitFailed {
+			message = "CRITICAL: Singapay sub-account created but the commit of its ledger row failed — look for a row with this singapay_account_id before binding it by hand, do not re-create"
+		}
+		c.logger.ErrorContext(ctx, message,
 			"owner_id", accountID,
 			"singapay_account_id", opened.ID,
 			"singapay_account_number", opened.Number,
 			"error", stepErr,
 		)
-		if repo.IsUniqueViolation(stepErr) {
+		if repo.IsUniqueViolation(stepErr, repo.ConstraintUniqueSeller) {
 			return nil, true, ledgererr.ErrLedgerAlreadyExists
 		}
 		return nil, true, ledgererr.NewError(ledgererr.CodeInternal, "transaction failed while creating account", stepErr)
@@ -316,10 +366,15 @@ func (c *LedgerClient) createSellerAccount(ctx context.Context, accountID string
 // past the caller's deadline by a margin, so the server never ends it — and with it the
 // lock — while the Singapay call can still come back.
 func accountCreationIdle(ctx context.Context) time.Duration {
-	if deadline, ok := ctx.Deadline(); ok {
-		return time.Until(deadline) + accountCreationIdleMargin
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return accountCreationIdleDefault
 	}
-	return accountCreationIdleDefault
+	remaining := time.Until(deadline)
+	if remaining > accountCreationIdleMax {
+		return accountCreationIdleMax
+	}
+	return max(remaining, 0) + accountCreationIdleMargin
 }
 
 // BackfillSingapayAccountNumber reads an account's number from Singapay and stores it.
@@ -410,7 +465,7 @@ func (c *LedgerClient) CreatePaymentGatewayAccount(ctx context.Context, currency
 	if err != nil {
 		// The account is a singleton under a unique index on owner_type: losing that index to
 		// a concurrent caller means the account now exists, and it is the one to return.
-		if repo.IsUniqueViolation(err) {
+		if repo.IsUniqueViolation(err, repo.ConstraintUniquePaymentGateway) {
 			if existing, readErr := c.repoProvider.Account().GetPaymentGatewayAccount(ctx); readErr == nil {
 				c.logger.InfoContext(ctx, "Payment gateway account created concurrently, using it", "owner_id", ownerID, "account_id", existing.UUID)
 				return existing, nil

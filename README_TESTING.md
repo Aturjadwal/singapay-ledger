@@ -1,6 +1,7 @@
 # Testing guide
 
-156 tests across five packages. No database and no network: every test runs with `go test ./...`.
+273 tests across five packages. No network, and no database unless you give it one: every test
+runs with `go test ./...`, and the few that need PostgreSQL skip themselves without it (below).
 
 ```bash
 GOTOOLCHAIN=go1.25.5 go test ./...
@@ -8,6 +9,25 @@ GOTOOLCHAIN=go1.25.5 go test . -run TestLedgerEntries_PaymentThroughSettlement -
 GOTOOLCHAIN=go1.25.5 go test ./repo/ -run TestInsertStatementsHaveMatchingArity
 gofmt -l .    # must print nothing
 ```
+
+## Against PostgreSQL
+
+`CreateAccount`'s creation lock (`account_create_postgres_test.go`: 24 callers at once, a refused
+holder, a Singapay timeout, a short server idle limit) and `TransactReadCommitted`
+(`repo/transact_postgres_test.go`) need a real database and real concurrency, so they run only
+when one is named:
+
+```bash
+createdb ledger_test   # any empty database you may create schemas in
+LEDGER_TEST_DATABASE_URL="host=/var/run/postgresql dbname=ledger_test sslmode=disable" \
+  GOTOOLCHAIN=go1.25.5 go test . ./repo/ -run 'Postgres|TransactReadCommitted' -v
+```
+
+Each test creates a schema of its own (`ledger_race_<nanoseconds>`), loads
+`database/schemas/schema.sql` into it and drops it at the end. `LEDGER_TEST_MAX_OPEN_CONNS` sizes
+the pool (default 2, the consuming service's ledger pool in production). Point the URL at a
+transaction-mode pooler (with `binary_parameters=yes`) to run the race through it; the two tests
+that set run-time parameters skip themselves where the pooler does not pass them.
 
 ---
 
@@ -101,11 +121,12 @@ looks reasonable and quietly moves the wrong amount of money.
 
 ## What is not covered
 
-- **No real database.** `repo/` uses `go-sqlmock`, which checks the SQL text and arguments,
-  not that PostgreSQL accepts them. Constraints, triggers and types are unproven here.
+- **No real database** outside the opt-in tests above. `repo/` uses `go-sqlmock`, which checks
+  the SQL text and arguments, not that PostgreSQL accepts them. Constraints, triggers and types
+  are unproven here.
 - **No real transaction semantics.** See the fakes note above. Rollback and isolation are
   reasoned about, not exercised.
-- **No real concurrency.** Races on `UpdateStatusIf` are simulated through the `beforeCAS`
-  hook, not run in parallel.
+- **No real concurrency** outside the opt-in tests above. Races on `UpdateStatusIf` are
+  simulated through the `beforeCAS` hook, not run in parallel.
 - **No live gateway.** `cmd/singapay-smoke` is the only thing that talks to Singapay, and it
   needs sandbox credentials.

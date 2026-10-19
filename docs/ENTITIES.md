@@ -61,7 +61,7 @@ Entitas inti yang merepresentasikan akun keuangan dalam sistem. Setiap seller me
 
 - Saldo aktual **tidak disimpan langsung** di kolom `pending_balance`/`available_balance`. Nilai aslinya dihitung dengan menjumlahkan `ledger_entries`. Kolom cache diperbarui secara berkala untuk performa.
 - Hanya ada **satu** akun PLATFORM dan **satu** akun PAYMENT_GATEWAY dalam seluruh sistem.
-- Satu akun SELLER per seller, dijaga indeks unik parsial `idx_accounts_unique_seller` (migrasi 031). `CreateAccount` membuatnya — beserta sub-akun Singapay — di satu transaksi yang memegang advisory lock per seller (`pg_try_advisory_xact_lock`), jadi permintaan pertama yang datang bersamaan tidak membuka dua sub-akun; yang kalah menunggu baris pemegang kunci tanpa transaksi lalu menerima `ErrLedgerAlreadyExists`.
+- Satu akun SELLER per seller, dijaga indeks unik parsial `idx_accounts_unique_seller` (migrasi 031). `CreateAccount` membuatnya — beserta sub-akun Singapay — di satu transaksi yang memegang advisory lock per seller (`pg_try_advisory_xact_lock`), jadi permintaan pertama yang datang bersamaan tidak membuka dua sub-akun; yang kalah menunggu baris pemegang kunci — satu statement per pemeriksaan, tanpa memegang koneksi di antaranya — lalu menerima `ErrLedgerAlreadyExists`.
 
 ### Relasi
 

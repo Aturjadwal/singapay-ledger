@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -20,28 +20,40 @@ import (
 	"github.com/Aturjadwal/singapay-ledger/singapay"
 )
 
-// CreateAccount against PostgreSQL, with callers that really run at once. Opt-in, like nothing
-// else in this repository, because it needs a database:
+// CreateAccount against PostgreSQL, with callers that really run at once. Like the platform
+// statistics, it runs only when LEDGER_TEST_DATABASE_URL names a database (README_TESTING.md):
+// each test builds database/schemas/schema.sql in a schema of its own and drops it afterwards.
+// LEDGER_TEST_MAX_OPEN_CONNS sizes the pool (default 2, the consuming service's ledger pool in
+// production).
 //
-//	LEDGER_TEST_DATABASE_URL    a database holding this package's tables (built from
-//	                            database/schemas/schema.sql, or the consuming service's local
-//	                            e2e database). Each test makes accounts for owners of its own
-//	                            (ledger-race-test-…) and deletes them afterwards.
-//	LEDGER_TEST_MAX_OPEN_CONNS  the pool's size; default 2, the consuming service's ledger pool
-//	                            in production.
-//
-// Point the URL at a transaction-mode pooler (lib/pq with binary_parameters=yes, as the
-// consuming service connects) to prove the same through it: the creation lock lives and dies
-// with one transaction, so a pooler that hands each transaction a different server connection
-// changes nothing.
+// Point the URL at a transaction-mode pooler (lib/pq with binary_parameters=yes, as the consuming
+// service connects; the pooler must pass search_path through, as Supavisor does) to prove the
+// same through it: the creation lock lives and dies with one transaction, so a pooler that hands
+// each transaction a different server connection changes nothing.
 
 func ledgerTestDB(t *testing.T) *sql.DB {
 	t.Helper()
+	return ledgerTestDBWith(t, "", true)
+}
+
+// ledgerTestDBWith is ledgerTestDB with more connection parameters (extra) and, when
+// withSellerIndex is false, without migration 031's unique index — the database the creation
+// lock must hold on alone, before 031 is applied.
+func ledgerTestDBWith(t *testing.T, extra string, withSellerIndex bool) *sql.DB {
+	t.Helper()
 	dsn := os.Getenv("LEDGER_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("set LEDGER_TEST_DATABASE_URL to a database with the ledger's tables")
+		t.Skip("set LEDGER_TEST_DATABASE_URL to run against PostgreSQL (README_TESTING.md)")
 	}
-	db, err := sql.Open("postgres", dsn)
+	admin, err := sql.Open("postgres", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { admin.Close() })
+	schemaName := fmt.Sprintf("ledger_race_%d", time.Now().UnixNano())
+	_, err = admin.Exec(`CREATE SCHEMA ` + pq.QuoteIdentifier(schemaName))
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = admin.Exec(`DROP SCHEMA ` + pq.QuoteIdentifier(schemaName) + ` CASCADE`) })
+
+	db, err := sql.Open("postgres", dsn+" search_path="+schemaName+" "+extra)
 	require.NoError(t, err)
 	conns := 2
 	if raw := os.Getenv("LEDGER_TEST_MAX_OPEN_CONNS"); raw != "" {
@@ -51,18 +63,22 @@ func ledgerTestDB(t *testing.T) *sql.DB {
 	db.SetMaxOpenConns(conns)
 	db.SetMaxIdleConns(conns)
 	t.Cleanup(func() { db.Close() })
-	require.NoError(t, db.Ping())
+
+	schema, err := os.ReadFile("database/schemas/schema.sql")
+	require.NoError(t, err)
+	_, err = db.Exec(string(schema))
+	require.NoError(t, err, "database/schemas/schema.sql")
+	if !withSellerIndex {
+		_, err = db.Exec(`DROP INDEX idx_accounts_unique_seller`)
+		require.NoError(t, err)
+	}
 	return db
 }
 
-// raceOwner is an owner id of this test's own, its rows deleted when the test ends.
-func raceOwner(t *testing.T, db *sql.DB) string {
+// raceOwner is an owner id of this test's own (the advisory lock is database-wide).
+func raceOwner(t *testing.T) string {
 	t.Helper()
-	owner := fmt.Sprintf("ledger-race-test-%d-%d", time.Now().UnixNano(), rand.Intn(1e6))
-	t.Cleanup(func() {
-		_, _ = db.Exec(`DELETE FROM ledger_accounts WHERE owner_type = 'SELLER' AND owner_id = $1`, owner)
-	})
-	return owner
+	return fmt.Sprintf("ledger-race-test-%d-%d", time.Now().UnixNano(), rand.Intn(1e6))
 }
 
 func ownerRows(t *testing.T, db *sql.DB, owner string) int {
@@ -187,8 +203,12 @@ func tally(outcomes []createOutcome) (created, exists, gateway, waited int, othe
 }
 
 func TestCreateAccountPostgres_CallersAtOnceOpenOneSubAccount(t *testing.T) {
-	db := ledgerTestDB(t)
-	owner := raceOwner(t, db)
+	t.Run("with migration 031", func(t *testing.T) { callersAtOnce(t, ledgerTestDBWith(t, "", true)) })
+	t.Run("before migration 031: the lock alone", func(t *testing.T) { callersAtOnce(t, ledgerTestDBWith(t, "", false)) })
+}
+
+func callersAtOnce(t *testing.T, db *sql.DB) {
+	owner := raceOwner(t)
 	gateway := newSlowGateway(400 * time.Millisecond)
 	client := NewLedgerClient(db, gateway, testLogger())
 	const n = 24
@@ -233,7 +253,7 @@ func TestCreateAccountPostgres_CallersAtOnceOpenOneSubAccount(t *testing.T) {
 // callers asks again and creates the account.
 func TestCreateAccountPostgres_AFailedHolderLeavesNothingAndAWaiterCreates(t *testing.T) {
 	db := ledgerTestDB(t)
-	owner := raceOwner(t, db)
+	owner := raceOwner(t)
 	gateway := newSlowGateway(200 * time.Millisecond)
 	gateway.fail = func(call int) bool { return call == 1 }
 	client := NewLedgerClient(db, gateway, testLogger())
@@ -258,7 +278,7 @@ func TestCreateAccountPostgres_AFailedHolderLeavesNothingAndAWaiterCreates(t *te
 // Singapay at a time, nothing is written — and a later call creates the account.
 func TestCreateAccountPostgres_ATimeoutLeavesNothingAndALaterCallCreates(t *testing.T) {
 	db := ledgerTestDB(t)
-	owner := raceOwner(t, db)
+	owner := raceOwner(t)
 	gateway := newSlowGateway(0)
 	gateway.hang = true
 	client := NewLedgerClient(db, gateway, testLogger())
@@ -280,6 +300,29 @@ func TestCreateAccountPostgres_ATimeoutLeavesNothingAndALaterCallCreates(t *test
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	account, err := client.CreateAccount(ctx, owner, "Race Seller", domain.CurrencyIDR)
+	require.NoError(t, err)
+	require.NotNil(t, account)
+	assert.Equal(t, 1, ownerRows(t, db, owner))
+}
+
+// The server would end an idle transaction after 200 ms; the creating transaction waits on a
+// 500 ms Singapay call with nothing running, and still commits: it sets its own bound past
+// the caller's deadline, so the lock is never let go mid-call.
+func TestCreateAccountPostgres_AShortServerIdleLimitDoesNotEndTheCreation(t *testing.T) {
+	db := ledgerTestDBWith(t, "idle_in_transaction_session_timeout=200", true)
+	var limit string
+	require.NoError(t, db.QueryRow(`SHOW idle_in_transaction_session_timeout`).Scan(&limit))
+	if limit != "200ms" {
+		t.Skipf("the connection's idle_in_transaction_session_timeout is %q: this pooler does not pass run-time parameters", limit)
+	}
+	owner := raceOwner(t)
+	gateway := newSlowGateway(500 * time.Millisecond)
+	client := NewLedgerClient(db, gateway, testLogger())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	account, err := client.CreateAccount(ctx, owner, "Race Seller", domain.CurrencyIDR)
+
 	require.NoError(t, err)
 	require.NotNil(t, account)
 	assert.Equal(t, 1, ownerRows(t, db, owner))
