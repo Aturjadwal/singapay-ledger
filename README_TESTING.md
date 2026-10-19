@@ -1,6 +1,6 @@
 # Testing guide
 
-263 tests across five packages. No network, and no database unless you give it one: every test
+286 tests across five packages. No network, and no database unless you give it one: every test
 runs with `go test ./...`, and the few that need PostgreSQL skip themselves without it (below).
 
 ```bash
@@ -15,16 +15,24 @@ gofmt -l .    # must print nothing
 The platform statistics read through SQL that only PostgreSQL can check — a time zone
 conversion, a `FILTER`, a join that must add up to the statement — so their scenario runs
 twice: against the fakes, always, and against a real database when one is named.
+`CreateAccount`'s creation lock (`account_create_postgres_test.go`: 24 callers at once, a refused
+holder, a Singapay timeout, a short server idle limit) and `TransactReadCommitted`
+(`repo/transact_postgres_test.go`) need a real database and real concurrency, so they run only
+when one is named:
 
 ```bash
 createdb ledger_test   # any empty database you may create schemas in
 LEDGER_TEST_DATABASE_URL="host=/var/run/postgresql dbname=ledger_test sslmode=disable" \
-  GOTOOLCHAIN=go1.25.5 go test . -run 'PlatformStatistics|PlatformDailyRequest' -v
+  GOTOOLCHAIN=go1.25.5 go test . ./repo/ -run 'PlatformStatistics|PlatformDailyRequest|Postgres|TransactReadCommitted' -v
 ```
 
-Each run creates a schema of its own (`ledger_test_<nanoseconds>`), loads
-`database/schemas/schema.sql` into it, and drops it at the end, so runs do not see each
-other and leave nothing behind. Without the variable those tests report SKIP.
+Each run creates a schema of its own (`ledger_test_<nanoseconds>` for the statistics,
+`ledger_race_<nanoseconds>` for the creation lock), loads `database/schemas/schema.sql` into it,
+and drops it at the end, so runs do not see each other and leave nothing behind. Without the
+variable those tests report SKIP. `LEDGER_TEST_MAX_OPEN_CONNS` sizes the creation lock tests'
+pool (default 2, the consuming service's ledger pool in production). Point the URL at a
+transaction-mode pooler (with `binary_parameters=yes`) to run the race through it; the two tests
+that set run-time parameters skip themselves where the pooler does not pass them.
 
 ---
 
@@ -121,11 +129,11 @@ looks reasonable and quietly moves the wrong amount of money.
 
 - **Almost no real database.** `repo/` uses `go-sqlmock`, which checks the SQL text and
   arguments, not that PostgreSQL accepts them. Constraints, triggers and types are unproven
-  here — except along the platform statistics' path (above), which runs the money-in webhook,
-  settlement and both reads against PostgreSQL when `LEDGER_TEST_DATABASE_URL` is set.
+  here — except along the platform statistics' path and `CreateAccount`'s creation lock (above),
+  which run against PostgreSQL when `LEDGER_TEST_DATABASE_URL` is set.
 - **No real transaction semantics.** See the fakes note above. Rollback and isolation are
   reasoned about, not exercised.
-- **No real concurrency.** Races on `UpdateStatusIf` are simulated through the `beforeCAS`
-  hook, not run in parallel.
+- **No real concurrency** outside the opt-in tests above. Races on `UpdateStatusIf` are
+  simulated through the `beforeCAS` hook, not run in parallel.
 - **No live gateway.** `cmd/singapay-smoke` is the only thing that talks to Singapay, and it
   needs sandbox credentials.

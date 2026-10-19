@@ -120,6 +120,13 @@ type AccountRepository interface {
 	// still succeed — and still end a holder that never comes back.
 	TryLockOwner(ctx context.Context, ownerType OwnerType, ownerID string, idle time.Duration) (bool, error)
 
+	// ProbeOwner looks, in one statement and outside any transaction, at whether the owner's
+	// account exists and whether its creation lock is free at that instant (taken and let go
+	// with the statement). It is how a caller waiting for another caller's creation looks
+	// again without holding anything between looks. Never call it inside a transaction: the
+	// lock it takes would stay until that transaction ends.
+	ProbeOwner(ctx context.Context, ownerType OwnerType, ownerID string) (exists bool, lockFree bool, err error)
+
 	// GetBySingapayAccountID resolves an account from the ULID Singapay puts on webhooks
 	// and transaction records. There is deliberately no lookup by account number: the
 	// number appears only as a transfer beneficiary, and accounts issued without one

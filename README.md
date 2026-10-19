@@ -136,12 +136,14 @@ a caller retrying a timeout must check for the account before calling again.
 **It creates once per seller, however many callers ask at once.** The creation runs in one
 transaction holding a per-seller advisory lock (`pg_try_advisory_xact_lock`, safe behind a
 transaction-mode pooler): read the row again, ask Singapay, insert. A caller that finds the
-lock taken waits for the holder's row with no transaction open, then gets
-`ErrLedgerAlreadyExists` — exactly what an existing account answers — so a caller treats
-that error as "read the account and carry on". `ErrAccountCreationInProgress` means the
-caller's deadline ended that wait; nothing was created for it. Only the creating caller
-holds a connection across the Singapay call; an existing account takes no lock at all.
-Migration 031 adds the unique index (`idx_accounts_unique_seller`) behind it.
+lock taken waits for the holder's row — one statement per look, nothing held between looks —
+then gets `ErrLedgerAlreadyExists`, exactly what an existing account answers, so a caller
+treats that error as "read the account and carry on". `ErrAccountCreationInProgress` means
+the caller's deadline ended that wait; nothing was created for it. Only the creating caller
+holds a connection across the Singapay call — one per new seller being created at that
+moment, so size the pool for the new sellers that may arrive together — and an existing
+account takes no lock at all. Migration 031 adds the unique index
+(`idx_accounts_unique_seller`) behind it.
 
 **Singapay names one sub-account with two identifiers, and they are not interchangeable.**
 The ULID (`singapay_account_id`) is what every endpoint takes. The 12-digit number

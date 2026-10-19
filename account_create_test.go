@@ -1,8 +1,10 @@
 package ledger
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -32,6 +34,38 @@ func newAccountClient(gateway *fakeGateway) (*LedgerClient, *FakeRepositoryProvi
 		logger:       testLogger(),
 		gateway:      gateway,
 	}, fakes
+}
+
+// capturedLog is a logger whose lines a test can read back.
+func capturedLog() (*slog.Logger, *bytes.Buffer) {
+	var buf bytes.Buffer
+	return slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})), &buf
+}
+
+// failingTransactions is a transaction provider whose BEGIN or COMMIT fails (the fakes keep
+// what fn wrote: there is no rollback in memory).
+type failingTransactions struct {
+	fakes     *FakeRepositoryProvider
+	beginErr  error
+	commitErr error
+}
+
+func (f *failingTransactions) Transact(ctx context.Context, fn func(tx repo.Tx) error) error {
+	return f.run(fn)
+}
+
+func (f *failingTransactions) TransactReadCommitted(ctx context.Context, fn func(tx repo.Tx) error) error {
+	return f.run(fn)
+}
+
+func (f *failingTransactions) run(fn func(tx repo.Tx) error) error {
+	if f.beginErr != nil {
+		return f.beginErr
+	}
+	if err := fn(f.fakes); err != nil {
+		return err
+	}
+	return f.commitErr
 }
 
 // openingGateway opens a sub-account per request, numbered in order.
@@ -115,8 +149,12 @@ func TestCreateAccount_TheReadUnderTheLockFindsTheHoldersAccount(t *testing.T) {
 func TestCreateAccount_WaitsForTheHolderAndFindsItsAccount(t *testing.T) {
 	gateway := openingGateway()
 	client, fakes := newAccountClient(gateway)
+	saved := false
 	fakes.accountRepo.tryLockOwner = func(domain.OwnerType, string) (bool, error) {
-		saveSeller(fakes, raceSeller, "01BYTHEHOLDER") // committed while this caller waits
+		if !saved { // committed while this caller waits
+			saveSeller(fakes, raceSeller, "01BYTHEHOLDER")
+			saved = true
+		}
 		return false, nil
 	}
 
@@ -126,8 +164,9 @@ func TestCreateAccount_WaitsForTheHolderAndFindsItsAccount(t *testing.T) {
 	assert.Nil(t, account)
 	assert.True(t, ledgererr.IsAppError(err, ledgererr.ErrLedgerAlreadyExists), "err = %v", err)
 	assert.Empty(t, gateway.accountRequests)
-	assert.Len(t, fakes.accountRepo.creationLocks, 1, "one attempt, then reads")
-	assert.Less(t, time.Since(start), time.Second, "found at the first read after the first pause")
+	assert.Len(t, fakes.accountRepo.creationLocks, 1, "one attempt, then looks")
+	assert.Equal(t, 1, fakes.accountRepo.probes, "found at the first look after the first pause")
+	assert.Less(t, time.Since(start), time.Second)
 	assert.Equal(t, 1, sellerRows(fakes, raceSeller))
 }
 
@@ -136,10 +175,10 @@ func TestCreateAccount_WaitsForTheHolderAndFindsItsAccount(t *testing.T) {
 func TestCreateAccount_TakesOverWhenTheHolderGaveUp(t *testing.T) {
 	gateway := openingGateway()
 	client, fakes := newAccountClient(gateway)
-	attempts := 0
+	asked := 0
 	fakes.accountRepo.tryLockOwner = func(domain.OwnerType, string) (bool, error) {
-		attempts++
-		return attempts > 2, nil // held twice, then free
+		asked++
+		return asked > 2, nil // held for the attempt and the first look, then free
 	}
 
 	account, err := client.CreateAccount(context.Background(), raceSeller, "Rara", domain.CurrencyIDR)
@@ -147,7 +186,8 @@ func TestCreateAccount_TakesOverWhenTheHolderGaveUp(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, account)
 	assert.Len(t, gateway.accountRequests, 1)
-	assert.Len(t, fakes.accountRepo.creationLocks, 3)
+	assert.Len(t, fakes.accountRepo.creationLocks, 2, "the attempt that found it held, and the one that got it")
+	assert.Equal(t, 2, fakes.accountRepo.probes)
 	assert.Equal(t, 1, sellerRows(fakes, raceSeller))
 }
 
@@ -167,6 +207,33 @@ func TestCreateAccount_TheDeadlineEndsTheWaitWithNothingCreated(t *testing.T) {
 	assert.Less(t, time.Since(start), time.Second)
 	assert.Empty(t, gateway.accountRequests)
 	assert.Zero(t, sellerRows(fakes, raceSeller))
+}
+
+// The deadline ends inside a look — queued for a connection the holder of a pool of one keeps
+// across the Singapay call: that is still giving up the wait, not an internal error. A look
+// that fails for another reason is one.
+func TestCreateAccount_ADeadlineInALookIsStillTheWait(t *testing.T) {
+	gateway := openingGateway()
+	client, fakes := newAccountClient(gateway)
+	fakes.accountRepo.tryLockOwner = func(domain.OwnerType, string) (bool, error) { return false, nil }
+	fakes.accountRepo.probeErr = func(ctx context.Context) error {
+		<-ctx.Done()
+		return repo.ErrFailedQuerySQL.WithError(ctx.Err())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	account, err := client.CreateAccount(ctx, raceSeller, "Rara", domain.CurrencyIDR)
+
+	assert.Nil(t, account)
+	assert.True(t, ledgererr.IsErrorCode(ledgererr.CodeAccountCreationInProgress, err), "err = %v", err)
+	assert.Empty(t, gateway.accountRequests)
+
+	fakes.accountRepo.probeErr = func(context.Context) error { return repo.ErrFailedQuerySQL.WithError(errors.New("connection reset")) }
+	_, err = client.CreateAccount(context.Background(), raceSeller, "Rara", domain.CurrencyIDR)
+	require.Error(t, err)
+	assert.False(t, ledgererr.IsErrorCode(ledgererr.CodeAccountCreationInProgress, err), "err = %v", err)
+	assert.Contains(t, err.Error(), "failed to check existing account")
 }
 
 // Singapay refuses: no row is written, so nothing is half made, and the next call — Singapay
@@ -200,8 +267,11 @@ func TestCreateAccount_ASingapayFailureLeavesNoRowAndTheNextCallCreates(t *testi
 func TestCreateAccount_AUniqueViolationMeansTheSellerHasAnAccount(t *testing.T) {
 	gateway := openingGateway()
 	client, fakes := newAccountClient(gateway)
+	logger, logged := capturedLog()
+	client.logger = logger
 	fakes.accountRepo.saveErr = func(*domain.Account) error {
-		return repo.ErrFailedInsertSQL.WithError(&pq.Error{Code: "23505", Message: "duplicate key value violates unique constraint \"idx_accounts_unique_seller\""})
+		return repo.ErrFailedInsertSQL.WithError(&pq.Error{Code: "23505", Constraint: repo.ConstraintUniqueSeller,
+			Message: "duplicate key value violates unique constraint \"idx_accounts_unique_seller\""})
 	}
 
 	account, err := client.CreateAccount(context.Background(), raceSeller, "Rara", domain.CurrencyIDR)
@@ -209,6 +279,58 @@ func TestCreateAccount_AUniqueViolationMeansTheSellerHasAnAccount(t *testing.T) 
 	assert.Nil(t, account)
 	assert.True(t, ledgererr.IsAppError(err, ledgererr.ErrLedgerAlreadyExists), "err = %v", err)
 	assert.Len(t, gateway.accountRequests, 1)
+	assert.Contains(t, logged.String(), "CRITICAL: Singapay sub-account created but the ledger row could not be saved", "the orphan is logged for a human")
+	assert.Contains(t, logged.String(), "singapay_account_id=01SUBACCOUNTA")
+}
+
+// A duplicate Singapay identifier is not "the seller has an account": it is an error, and the
+// sub-account is logged as an orphan.
+func TestCreateAccount_AnotherUniqueViolationIsAnError(t *testing.T) {
+	gateway := openingGateway()
+	client, fakes := newAccountClient(gateway)
+	logger, logged := capturedLog()
+	client.logger = logger
+	fakes.accountRepo.saveErr = func(*domain.Account) error {
+		return repo.ErrFailedInsertSQL.WithError(&pq.Error{Code: "23505", Constraint: "idx_ledger_accounts_singapay_account_id"})
+	}
+
+	account, err := client.CreateAccount(context.Background(), raceSeller, "Rara", domain.CurrencyIDR)
+
+	assert.Nil(t, account)
+	require.Error(t, err)
+	assert.False(t, ledgererr.IsAppError(err, ledgererr.ErrLedgerAlreadyExists), "err = %v", err)
+	assert.Contains(t, logged.String(), "CRITICAL: Singapay sub-account created but the ledger row could not be saved")
+}
+
+func TestCreateAccount_ABeginFailureIsAnErrorWithNothingAsked(t *testing.T) {
+	gateway := openingGateway()
+	client, fakes := newAccountClient(gateway)
+	client.txProvider = &failingTransactions{fakes: fakes, beginErr: errors.New("pool exhausted")}
+
+	account, err := client.CreateAccount(context.Background(), raceSeller, "Rara", domain.CurrencyIDR)
+
+	assert.Nil(t, account)
+	assert.True(t, ledgererr.IsErrorCode(ledgererr.CodeDatabaseError, err), "err = %v", err)
+	assert.Empty(t, gateway.accountRequests)
+}
+
+// The commit fails after Singapay opened the sub-account: an error, and a CRITICAL line that
+// says the row may exist after all (a commit whose answer was lost).
+func TestCreateAccount_ACommitFailureIsLoggedForAHuman(t *testing.T) {
+	gateway := openingGateway()
+	client, fakes := newAccountClient(gateway)
+	logger, logged := capturedLog()
+	client.logger = logger
+	client.txProvider = &failingTransactions{fakes: fakes, commitErr: errors.New("connection reset")}
+
+	account, err := client.CreateAccount(context.Background(), raceSeller, "Rara", domain.CurrencyIDR)
+
+	assert.Nil(t, account)
+	require.Error(t, err)
+	assert.False(t, ledgererr.IsAppError(err, ledgererr.ErrLedgerAlreadyExists), "err = %v", err)
+	assert.Len(t, gateway.accountRequests, 1)
+	assert.Contains(t, logged.String(), "CRITICAL: Singapay sub-account created but the commit of its ledger row failed")
+	assert.Contains(t, logged.String(), "singapay_account_id=01SUBACCOUNTA")
 }
 
 func TestCreateAccount_AnInsertFailureIsAnError(t *testing.T) {
@@ -248,7 +370,7 @@ func TestCreatePaymentGatewayAccount_ReturnsTheAccountAConcurrentCallerCreated(t
 		theirs = domain.NewPaymentGatewayAccount("", "SINGAPAY", domain.CurrencyIDR)
 		fakes.accountRepo.saveErr = nil
 		_ = fakes.accountRepo.Save(context.Background(), &theirs)
-		return repo.ErrFailedInsertSQL.WithError(&pq.Error{Code: "23505"})
+		return repo.ErrFailedInsertSQL.WithError(&pq.Error{Code: "23505", Constraint: repo.ConstraintUniquePaymentGateway})
 	}
 
 	account, err := client.CreatePaymentGatewayAccount(context.Background(), domain.CurrencyIDR)
@@ -263,4 +385,13 @@ func TestAccountCreationIdle_OutlastsTheCallersDeadline(t *testing.T) {
 	defer cancel()
 	assert.InDelta(t, (70 * time.Second).Seconds(), accountCreationIdle(ctx).Seconds(), 1)
 	assert.Equal(t, 2*time.Minute, accountCreationIdle(context.Background()))
+
+	// Bounded both ways: a deadline weeks away would overflow Postgres's milliseconds, and
+	// one already past must not become 0, which is no bound at all.
+	far, cancelFar := context.WithTimeout(context.Background(), 30*24*time.Hour)
+	defer cancelFar()
+	assert.Equal(t, 10*time.Minute, accountCreationIdle(far))
+	past, cancelPast := context.WithDeadline(context.Background(), time.Now().Add(-time.Hour))
+	defer cancelPast()
+	assert.Equal(t, 30*time.Second, accountCreationIdle(past))
 }
