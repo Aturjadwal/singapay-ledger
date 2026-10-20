@@ -130,6 +130,12 @@ const (
 	CodeInvalidBankAccount        ErrorCode = 400008
 	CodeInsufficientBalance       ErrorCode = 400009
 
+	// Settlement error codes
+	CodeSettlementNotificationNotFound ErrorCode = 404009
+	// CodeSettlementNotListed means Singapay has no transaction list for the settlement: it
+	// answers 404 for a batch that is not completed, or not this merchant's.
+	CodeSettlementNotListed ErrorCode = 404010
+
 	// Analytics error codes
 	CodeAnalyticsDataNotFound ErrorCode = 404008
 	CodeAnalyticsQueryError   ErrorCode = 500003
@@ -182,6 +188,13 @@ var (
 	ErrInvalidDisbursementAmount = NewError(CodeInvalidDisbursementAmount, "disbursement amount must be positive", nil)
 	ErrInvalidBankAccount        = NewError(CodeInvalidBankAccount, "invalid bank account information", nil)
 	ErrInsufficientBalance       = NewError(CodeInsufficientBalance, "insufficient balance for disbursement", nil)
+)
+
+// Settlement errors
+var (
+	ErrSettlementNotificationNotFound = NewError(CodeSettlementNotificationNotFound, "settlement notification not found", nil)
+	// ErrSettlementNotListed: see CodeSettlementNotListed.
+	ErrSettlementNotListed = NewError(CodeSettlementNotListed, "Singapay lists no transactions for this settlement", nil)
 )
 
 var (

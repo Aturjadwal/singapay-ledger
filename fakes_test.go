@@ -301,6 +301,26 @@ func (f *FakeProductTransactionRepository) GetByInvoiceNumber(ctx context.Contex
 	return nil, repo.ErrNotFound
 }
 
+func (f *FakeProductTransactionRepository) GetByIDs(ctx context.Context, ids []string) ([]*domain.ProductTransaction, error) {
+	var out []*domain.ProductTransaction
+	for _, id := range ids {
+		if tx, ok := f.transactions[id]; ok {
+			out = append(out, detach(tx))
+		}
+	}
+	return out, nil
+}
+
+func (f *FakeProductTransactionRepository) GetByInvoiceNumbers(ctx context.Context, invoiceNumbers []string) ([]*domain.ProductTransaction, error) {
+	var out []*domain.ProductTransaction
+	for _, invoice := range invoiceNumbers {
+		if tx, ok := f.byInvoice[invoice]; ok {
+			out = append(out, detach(tx))
+		}
+	}
+	return out, nil
+}
+
 func (f *FakeProductTransactionRepository) GetBySellerAccountID(ctx context.Context, sellerAccountID string, page, pageSize int) ([]*domain.ProductTransaction, error) {
 	return nil, nil
 }
@@ -828,6 +848,21 @@ func (f *FakePaymentRequestRepository) GetByProductTransactionID(ctx context.Con
 		return pr, nil
 	}
 	return nil, repo.ErrNotFound
+}
+
+func (f *FakePaymentRequestRepository) GetByGatewayIdentifiers(ctx context.Context, identifiers []string) ([]*domain.PaymentRequest, error) {
+	wanted := make(map[string]bool, len(identifiers))
+	for _, id := range identifiers {
+		wanted[id] = true
+	}
+	var out []*domain.PaymentRequest
+	for _, pr := range f.byID {
+		if (pr.GatewayTransactionRef != "" && wanted[pr.GatewayTransactionRef]) ||
+			(pr.GatewayTransactionID != "" && wanted[pr.GatewayTransactionID]) {
+			out = append(out, pr)
+		}
+	}
+	return out, nil
 }
 
 func (f *FakePaymentRequestRepository) Save(ctx context.Context, pr *domain.PaymentRequest) error {

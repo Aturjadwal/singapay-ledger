@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added — the transactions inside a settlement, read back from Singapay
+
+Singapay's settlement webhook names a batch and its totals and leaves out what it covered, and
+the ledger never recorded which settlement a transaction belonged to: the settling pass asks
+about each invoice instead. Singapay does list a completed batch's transactions on request —
+`GET /api/v1.0/settlement-transactions/{identifier}` (numeric id or `reference_no`; 404 for a
+batch that is not completed or not this merchant's).
+
+- `singapay.Client.ListSettlementTransactions(ctx, identifier, opts)` reads one page of it
+  (`Page`, `PerPage`, `TransactionType`, `Refunded`) as `[]singapay.SettlementTransaction`.
+  `singapay.Pagination` also reads a plain Laravel paginator's `last_page` as `TotalPages`,
+  which is how that listing is documented to page.
+- `LedgerClient.ListSettlementTransactions(ctx, notificationUUID, page, perPage)` reads the
+  page for a stored settlement notification (default 50 per page, at most 100) and matches each
+  row to the ledger: `merchant_reff_no` against invoice numbers, then `transaction_id` against
+  the stored gateway identifiers (`gateway_transaction_ref` / `gateway_transaction_id`, how a
+  payment link's attempt is found), else `NONE` — kept, not dropped. Each row carries the
+  matched `ProductTransaction` and the seller `Account` (or the account holding the Singapay
+  sub-account the row names). Read only: nothing is written, and the settling pass does not use
+  it.
+- New errors: `ErrSettlementNotificationNotFound` (404009) and `ErrSettlementNotListed`
+  (404010, Singapay's 404). Singapay failing to answer is `CodeGatewayAPIError`, as elsewhere.
+- **Interfaces grew** — anything implementing them outside this module must add the methods:
+  `PaymentGateway.ListSettlementTransactions`; `ProductTransactionRepository.GetByIDs` and
+  `GetByInvoiceNumbers`; `PaymentRequestRepository.GetByGatewayIdentifiers` (one statement per
+  lookup; only `gateway_transaction_id` is indexed, which is fine for the few rows the invoice
+  lookup could not place).
+
+No migration. Tests: the client against a scripted server, the matching against the fakes and
+against PostgreSQL (`LEDGER_TEST_DATABASE_URL`), the new statements against `go-sqlmock`.
+
 ### Fixed — a seller's first payments arriving together open one Singapay sub-account, not several
 
 `CreateAccount` read the seller's row, asked Singapay for a sub-account when there was none and

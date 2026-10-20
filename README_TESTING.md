@@ -14,7 +14,9 @@ gofmt -l .    # must print nothing
 
 The platform statistics read through SQL that only PostgreSQL can check — a time zone
 conversion, a `FILTER`, a join that must add up to the statement — so their scenario runs
-twice: against the fakes, always, and against a real database when one is named.
+twice: against the fakes, always, and against a real database when one is named. So does the
+settlement listing's (`settlement_transactions_test.go`), for its batch lookups by invoice
+number and gateway identifier.
 `CreateAccount`'s creation lock (`account_create_postgres_test.go`: 24 callers at once, a refused
 holder, a Singapay timeout, a short server idle limit) and `TransactReadCommitted`
 (`repo/transact_postgres_test.go`) need a real database and real concurrency, so they run only
@@ -23,7 +25,7 @@ when one is named:
 ```bash
 createdb ledger_test   # any empty database you may create schemas in
 LEDGER_TEST_DATABASE_URL="host=/var/run/postgresql dbname=ledger_test sslmode=disable" \
-  GOTOOLCHAIN=go1.25.5 go test . ./repo/ -run 'PlatformStatistics|PlatformDailyRequest|Postgres|TransactReadCommitted' -v
+  GOTOOLCHAIN=go1.25.5 go test . ./repo/ -run 'PlatformStatistics|PlatformDailyRequest|Postgres|TransactReadCommitted|ListSettlementTransactions' -v
 ```
 
 Each run creates a schema of its own (`ledger_test_<nanoseconds>` for the statistics,

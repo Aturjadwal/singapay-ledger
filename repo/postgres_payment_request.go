@@ -8,6 +8,7 @@ import (
 
 	"github.com/21strive/redifu"
 	"github.com/Aturjadwal/singapay-ledger/domain"
+	"github.com/lib/pq"
 )
 
 type PostgresPaymentRequestRepository struct {
@@ -64,6 +65,28 @@ func (r *PostgresPaymentRequestRepository) GetByProductTransactionID(ctx context
 	`
 
 	return r.scanOne(ctx, query, productTransactionID)
+}
+
+// GetByGatewayIdentifiers reads every payment request whose gateway_transaction_ref or
+// gateway_transaction_id is one of the identifiers, in no set order.
+//
+// Only gateway_transaction_id has an index (migration 023), and that is acceptable here: the
+// caller asks for the few rows its first lookup by invoice number could not place, from a
+// page a person opened, never on a path that runs per payment.
+func (r *PostgresPaymentRequestRepository) GetByGatewayIdentifiers(ctx context.Context, identifiers []string) ([]*domain.PaymentRequest, error) {
+	if len(identifiers) == 0 {
+		return nil, nil
+	}
+
+	query := `
+		SELECT uuid, randid, product_transaction_uuid, request_id, payment_code, payment_channel, payment_url,
+		       amount, currency, created_at, updated_at, expires_at,
+		       gateway_transaction_id, gateway_transaction_ref
+		FROM payment_requests
+		WHERE gateway_transaction_ref = ANY($1) OR gateway_transaction_id = ANY($1)
+	`
+
+	return r.scanMany(ctx, query, pq.Array(identifiers))
 }
 
 func (r *PostgresPaymentRequestRepository) Save(ctx context.Context, pr *domain.PaymentRequest) error {

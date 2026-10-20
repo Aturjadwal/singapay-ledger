@@ -219,3 +219,64 @@ func TestGetPlatformIncomes_ContinuesPastTheCursorInSortDirection(t *testing.T) 
 		closeDB()
 	}
 }
+
+// productTransactionRow is one plain product transaction row, in productTransactionColumns
+// order.
+func productTransactionRow(uuid, invoiceNumber, status string, createdAt time.Time) []driver.Value {
+	return []driver.Value{
+		uuid, "randid-" + uuid, "buyer-1", "seller-acc", "product-1", "SERVICE", invoiceNumber,
+		int64(36_000), int64(3_000), int64(275), int64(39_275), int64(36_000), "GATEWAY_ON_CUSTOMER", "IDR",
+		status, createdAt, createdAt, createdAt, nil,
+		false, nil, nil, []byte(`{}`),
+		nil, nil, nil,
+	}
+}
+
+// A settlement page resolves every invoice number it lists in one statement, served by the
+// invoice index; an empty list asks the database nothing.
+func TestGetByInvoiceNumbers_OneStatementForEveryInvoice(t *testing.T) {
+	repo, mock, closeDB := newMockProductTransactionRepo(t)
+	defer closeDB()
+
+	created := time.Date(2026, 10, 2, 18, 39, 27, 0, time.UTC)
+	mock.ExpectQuery(`(?s)SELECT uuid, randid.*FROM product_transactions\s+WHERE invoice_number = ANY\(\$1\)`).
+		WithArgs(`{"INV-1","INV-2"}`).
+		WillReturnRows(sqlmock.NewRows(productTransactionColumns).
+			AddRow(productTransactionRow("pt-1", "INV-1", "SETTLED", created)...).
+			AddRow(productTransactionRow("pt-2", "INV-2", "COMPLETED", created)...))
+
+	txs, err := repo.GetByInvoiceNumbers(context.Background(), []string{"INV-1", "INV-2"})
+
+	require.NoError(t, err)
+	require.Len(t, txs, 2)
+	assert.Equal(t, "INV-1", txs[0].InvoiceNumber)
+	assert.Equal(t, domain.TransactionStatusSettled, txs[0].Status)
+	assert.Equal(t, "INV-2", txs[1].InvoiceNumber)
+
+	none, err := repo.GetByInvoiceNumbers(context.Background(), nil)
+	require.NoError(t, err)
+	assert.Empty(t, none)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetByIDs_OneStatementForEveryID(t *testing.T) {
+	repo, mock, closeDB := newMockProductTransactionRepo(t)
+	defer closeDB()
+
+	created := time.Date(2026, 9, 25, 16, 15, 38, 0, time.UTC)
+	mock.ExpectQuery(`(?s)SELECT uuid, randid.*FROM product_transactions\s+WHERE uuid = ANY\(\$1\)`).
+		WithArgs(`{"pt-card"}`).
+		WillReturnRows(sqlmock.NewRows(productTransactionColumns).
+			AddRow(productTransactionRow("pt-card", "INV-CARD", "SETTLED", created)...))
+
+	txs, err := repo.GetByIDs(context.Background(), []string{"pt-card"})
+
+	require.NoError(t, err)
+	require.Len(t, txs, 1)
+	assert.Equal(t, "pt-card", txs[0].UUID)
+
+	none, err := repo.GetByIDs(context.Background(), []string{})
+	require.NoError(t, err)
+	assert.Empty(t, none)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}

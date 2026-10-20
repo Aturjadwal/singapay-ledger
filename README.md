@@ -536,6 +536,26 @@ could not be read — and nothing was written.
 journal and ledger entry booked against it with the accounts they name. It asks Singapay
 nothing.
 
+**What one batch covered can be read back.** The webhook leaves the list out, but Singapay
+lists a completed batch's transactions on request (`GET /api/v1.0/settlement-transactions/{id}`).
+`ListSettlementTransactions` reads one page of it for a stored notification and puts each row
+beside the ledger's record of the same payment — found by invoice number (`merchant_reff_no`),
+else by a gateway identifier the ledger stored (a payment link's attempt), else reported
+unmatched rather than dropped:
+
+```go
+page, err := client.ListSettlementTransactions(ctx, notificationUUID, 1, 50) // per page ≤ 100
+// page.Transactions[i].Gateway: Singapay's row — ids, sub-account, method, amount and fee
+//                               (sen; FeeMinor nil when unreported), has_settle, settle_at
+// page.Transactions[i].Match: INVOICE_NUMBER, GATEWAY_ID or NONE
+// page.Transactions[i].Transaction / .Account: the ledger's payment and its seller account
+// page.HasMore: whether another page exists
+```
+
+It writes nothing and decides nothing: a listed payment the ledger still holds as `COMPLETED`
+is reported as such. `ErrSettlementNotListed` (404010) is Singapay's 404 — the batch is not
+completed, or not this merchant's; `CodeGatewayAPIError` is Singapay failing to answer.
+
 **Still open: `settlement.refunded`.** It can pull back funds that have already become
 `AVAILABLE` and may already have been withdrawn. This ledger has no negative-balance policy,
 so refund deliveries are stored as `NEEDS_REVIEW` and left for a person. That is a business
@@ -598,6 +618,7 @@ neither take a payment nor pay out, and the code refuses both explicitly.
 | `RetryDisbursement` | `POST /api/v2.0/disbursement/inquiry-status` |
 | `HandleDisbursementNotification` | `disbursement_notif_url` webhook |
 | `ProcessPlatformFeeTransfer` | `POST /api/v1.0/account-transfer/{id}/transfer` |
+| `ListSettlementTransactions` | `GET /api/v1.0/settlement-transactions/{id}` (read only) |
 | `GetBalance` (verification) | `GET /api/v1.0/balance-inquiry/{id}` |
 
 Singapay versions each module separately — accounts, balances and account transfer exist only

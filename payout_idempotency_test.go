@@ -254,6 +254,9 @@ func (f *fakeGateway) GetPaymentLinkHistory(context.Context, string, int64) (*si
 func (f *fakeGateway) ListPaymentLinkHistories(context.Context, string, singapay.SettlementWindow) ([]singapay.PaymentLinkHistory, singapay.Pagination, error) {
 	panic("fakeGateway.ListPaymentLinkHistories: not scripted for this test")
 }
+func (f *fakeGateway) ListSettlementTransactions(context.Context, string, singapay.ListSettlementTransactionsOptions) ([]singapay.SettlementTransaction, singapay.Pagination, error) {
+	panic("fakeGateway.ListSettlementTransactions: not scripted for this test")
+}
 func (f *fakeGateway) CheckBeneficiary(context.Context, string, string) (*singapay.Beneficiary, error) {
 	panic("fakeGateway.CheckBeneficiary: not scripted for this test")
 }

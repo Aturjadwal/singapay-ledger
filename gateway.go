@@ -55,6 +55,11 @@ type PaymentGateway interface {
 	ListEwalletTransactions(ctx context.Context, accountID string, w singapay.SettlementWindow) ([]singapay.EwalletTransaction, singapay.Pagination, error)
 	ListPaymentLinkHistories(ctx context.Context, accountID string, w singapay.SettlementWindow) ([]singapay.PaymentLinkHistory, singapay.Pagination, error)
 
+	// ListSettlementTransactions reads what one settlement batch covered — the list its
+	// webhook leaves out. Read-only, for a person looking at a settlement; the settling pass
+	// never selects on it, for the same reason it never selects on a window.
+	ListSettlementTransactions(ctx context.Context, identifier string, opts singapay.ListSettlementTransactionsOptions) ([]singapay.SettlementTransaction, singapay.Pagination, error)
+
 	// Money out
 	CheckBeneficiary(ctx context.Context, bankCode, accountNumber string) (*singapay.Beneficiary, error)
 	CheckFee(ctx context.Context, accountID, bankSwiftCode string, netAmount int64) (*singapay.FeeQuote, error)

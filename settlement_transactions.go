@@ -1,0 +1,394 @@
+package ledger
+
+import (
+	"cmp"
+	"context"
+	"net/http"
+	"time"
+
+	"github.com/Aturjadwal/singapay-ledger/domain"
+	"github.com/Aturjadwal/singapay-ledger/ledgererr"
+	"github.com/Aturjadwal/singapay-ledger/repo"
+	"github.com/Aturjadwal/singapay-ledger/singapay"
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Settlement — what one batch covered, read back from Singapay.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A settlement webhook names a batch and its totals and nothing it covered, and the
+// settling pass never needs more (settlement.go). A person reading the settlement inbox
+// does: which payments were in SETTLEMENT-647-…? Singapay answers that itself — its
+// settlement-transactions listing gives a completed batch's contents — and this puts each
+// row it lists beside the ledger's own record of the same payment.
+//
+// Read only, and it decides nothing. A listed payment the ledger still holds as COMPLETED
+// is reported as such, not settled from here: the pass, or CheckTransactionSettlement
+// behind its own button, does that through the same compare-and-set as always. Nor does a
+// listing feed the pass — its contents are Singapay's answer about a batch, and the pass
+// asks about invoices, for the reasons settlement.go gives.
+
+// Page sizes for ListSettlementTransactions. Singapay documents no maximum; these keep one
+// page to what a person reads at once, and one gateway call bounded.
+const (
+	DefaultSettlementTransactionsPerPage = 50
+	MaxSettlementTransactionsPerPage     = 100
+)
+
+// SettlementTransactionMatch says how a row Singapay listed was tied to a ledger
+// transaction.
+type SettlementTransactionMatch string
+
+const (
+	// SettlementMatchInvoice: the row's merchant_reff_no is a ledger invoice number — the
+	// reference this ledger issues VA, QRIS and e-wallet payments under.
+	SettlementMatchInvoice SettlementTransactionMatch = "INVOICE_NUMBER"
+	// SettlementMatchGatewayID: the row's transaction_id is a gateway identifier the ledger
+	// stored for the payment (gateway_transaction_ref or gateway_transaction_id) — how a
+	// payment link's attempt is found, a link being created with the invoice as reff_no
+	// rather than merchant_reff_no.
+	SettlementMatchGatewayID SettlementTransactionMatch = "GATEWAY_ID"
+	// SettlementMatchNone: nothing in the ledger matches the row.
+	SettlementMatchNone SettlementTransactionMatch = "NONE"
+)
+
+// SettlementTransactionsPage is one page of what a settlement covered.
+type SettlementTransactionsPage struct {
+	// Notification is the stored webhook the settlement was read through.
+	Notification *domain.SettlementNotification
+
+	Transactions []SettlementTransaction
+
+	// Page and PerPage are the page Singapay answered with: what it reported, or what was
+	// asked for when it reported nothing.
+	Page    int
+	PerPage int
+	// Total and TotalPages are Singapay's counts across every page; 0 when it sent none.
+	Total      int
+	TotalPages int
+	// HasMore says whether a later page exists — from Singapay's counts when it sent them,
+	// otherwise from whether this page came back full.
+	HasMore bool
+}
+
+// SettlementTransaction is one payment a settlement covered: the row Singapay listed, and
+// the ledger's record of the same payment when one matches.
+type SettlementTransaction struct {
+	Gateway SettlementGatewayTransaction
+
+	Match SettlementTransactionMatch
+	// Transaction is the matched payment; nil when Match is SettlementMatchNone.
+	Transaction *domain.ProductTransaction
+	// Account is the ledger account the payment belongs to: the matched transaction's
+	// seller, else the account whose Singapay sub-account the row names. nil when the
+	// ledger knows neither. A matched transaction whose seller's sub-account is not the one
+	// Singapay names is worth a look: Account.SingapayAccountID and
+	// Gateway.AccountID then differ.
+	Account *domain.Account
+}
+
+// SettlementGatewayTransaction is a row of Singapay's settlement listing, in the ledger's
+// units: every amount in sen, every absent timestamp nil.
+type SettlementGatewayTransaction struct {
+	// TransactionID is Singapay's business id: a VA payment's transaction_id, every other
+	// product's reff_no.
+	TransactionID string
+	// MerchantReference is merchant_reff_no, the reference the payment was created with.
+	MerchantReference string
+	// AccountID is the Singapay sub-account (ULID) the payment was made to; AccountName is
+	// Singapay's name for it.
+	AccountID   string
+	AccountName string
+	// PaymentMethod is Singapay's name for how it was paid ("BRI Virtual Account").
+	PaymentMethod string
+
+	// AmountMinor is what the payment was for. FeeMinor is the fee Singapay charged the
+	// merchant, nil when it reported none — which is not a zero fee.
+	AmountMinor int64
+	FeeMinor    *int64
+	Currency    string
+
+	PostedAt *time.Time
+	// PaidAt is processed_timestamp; Singapay reports none for QRIS.
+	PaidAt *time.Time
+	// Settled is has_settle and SettledAt settle_at.
+	Settled   bool
+	SettledAt *time.Time
+}
+
+// ListSettlementTransactions reads one page of the payments a settlement covered, as
+// Singapay lists them, each beside the ledger's record of the same payment.
+//
+// notificationID is a stored settlement webhook's UUID; the settlement is the one it names,
+// whatever its event — a refund event names the batch the refunded payment was in. page
+// starts at 1; perPage defaults to DefaultSettlementTransactionsPerPage and is capped at
+// MaxSettlementTransactionsPerPage.
+//
+// A row is matched by its merchant_reff_no against invoice numbers first, then by its
+// transaction_id against the gateway identifiers the ledger stored. A row neither finds is
+// returned unmatched rather than dropped: a payment Singapay settled that the ledger cannot
+// place is exactly what someone reading a settlement needs to see.
+//
+// Errors: ErrSettlementNotificationNotFound for an unknown notification;
+// ErrSettlementNotListed when Singapay answers 404 (the batch is not completed, or not this
+// merchant's); CodeGatewayAPIError when Singapay could not be read otherwise; and
+// CodeDatabaseError. Nothing is written in any case.
+func (c *LedgerClient) ListSettlementTransactions(ctx context.Context, notificationID string, page, perPage int) (*SettlementTransactionsPage, error) {
+	if notificationID == "" {
+		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "settlement notification id is required", nil)
+	}
+	page = max(page, 1)
+	if perPage <= 0 {
+		perPage = DefaultSettlementTransactionsPerPage
+	}
+	perPage = min(perPage, MaxSettlementTransactionsPerPage)
+
+	notification, err := c.repoProvider.SettlementNotification().GetByID(ctx, notificationID)
+	if err != nil {
+		if ledgererr.IsAppError(err, repo.ErrNotFound) {
+			return nil, ledgererr.ErrSettlementNotificationNotFound.WithError(err)
+		}
+		return nil, ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to read the settlement notification", err)
+	}
+
+	listed, pagination, err := c.gateway.ListSettlementTransactions(ctx, notification.SettlementID,
+		singapay.ListSettlementTransactionsOptions{Page: page, PerPage: perPage})
+	if err != nil {
+		if gatewayErr, ok := singapay.AsError(err); ok && gatewayErr.StatusCode == http.StatusNotFound {
+			return nil, ledgererr.ErrSettlementNotListed.WithError(err)
+		}
+		return nil, ledgererr.NewError(ledgererr.CodeGatewayAPIError, "could not read the settlement's transactions from Singapay", err)
+	}
+
+	result := &SettlementTransactionsPage{
+		Notification: notification,
+		Transactions: make([]SettlementTransaction, len(listed)),
+		Page:         cmp.Or(pagination.CurrentPage, page),
+		PerPage:      cmp.Or(pagination.PerPage, perPage),
+		Total:        pagination.Total,
+		TotalPages:   pagination.TotalPages,
+	}
+	switch {
+	case pagination.TotalPages > 0:
+		result.HasMore = result.Page < pagination.TotalPages
+	case pagination.Total > 0:
+		result.HasMore = result.Page*result.PerPage < pagination.Total
+	default:
+		result.HasMore = len(listed) >= result.PerPage
+	}
+
+	for i, row := range listed {
+		result.Transactions[i] = SettlementTransaction{
+			Gateway: settlementGatewayTransaction(row),
+			Match:   SettlementMatchNone,
+		}
+	}
+	if err := c.matchSettlementTransactions(ctx, result.Transactions); err != nil {
+		return nil, err
+	}
+	if err := c.attachSettlementAccounts(ctx, result.Transactions); err != nil {
+		return nil, err
+	}
+
+	matched := 0
+	for _, t := range result.Transactions {
+		if t.Match != SettlementMatchNone {
+			matched++
+		}
+	}
+	c.logger.InfoContext(ctx, "Listed a settlement's transactions",
+		"settlement_notification_uuid", notification.UUID,
+		"settlement_id", notification.SettlementID,
+		"settlement_reference", notification.SettlementReference,
+		"page", result.Page,
+		"rows", len(result.Transactions),
+		"matched", matched,
+		"total", result.Total,
+	)
+
+	return result, nil
+}
+
+// settlementGatewayTransaction converts a listed row to the ledger's units.
+func settlementGatewayTransaction(row singapay.SettlementTransaction) SettlementGatewayTransaction {
+	t := SettlementGatewayTransaction{
+		TransactionID:     row.TransactionID,
+		MerchantReference: row.MerchantReffNo,
+		PaymentMethod:     row.Fees.Name,
+		AmountMinor:       row.Amount.Minor(),
+		Currency:          cmp.Or(row.Amount.Currency, row.Fees.Currency),
+		PostedAt:          millisTimePtr(row.PostedAt),
+		PaidAt:            millisTimePtr(row.ProcessedAt),
+		Settled:           row.HasSettle,
+		SettledAt:         millisTimePtr(row.SettleAt),
+	}
+	if row.Account != nil {
+		t.AccountID = row.Account.ID
+		t.AccountName = row.Account.Name
+	}
+	if row.Fees.Amount.Set {
+		fee := row.Fees.Amount.Minor()
+		t.FeeMinor = &fee
+	}
+	return t
+}
+
+// matchSettlementTransactions ties each listed row to a ledger transaction: by invoice
+// number in one query, then — for the rows that found nothing — by stored gateway
+// identifier in two more. Rows that match neither keep SettlementMatchNone.
+func (c *LedgerClient) matchSettlementTransactions(ctx context.Context, rows []SettlementTransaction) error {
+	invoices := distinctNonEmpty(len(rows), func(i int) string { return rows[i].Gateway.MerchantReference })
+	byInvoice := map[string]*domain.ProductTransaction{}
+	if len(invoices) > 0 {
+		txs, err := c.repoProvider.ProductTransaction().GetByInvoiceNumbers(ctx, invoices)
+		if err != nil {
+			return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to read the settlement's transactions by invoice number", err)
+		}
+		for _, tx := range txs {
+			byInvoice[tx.InvoiceNumber] = preferredTransaction(byInvoice[tx.InvoiceNumber], tx)
+		}
+	}
+	for i := range rows {
+		if tx := byInvoice[rows[i].Gateway.MerchantReference]; tx != nil {
+			rows[i].Transaction = tx
+			rows[i].Match = SettlementMatchInvoice
+		}
+	}
+
+	gatewayIDs := distinctNonEmpty(len(rows), func(i int) string {
+		if rows[i].Match != SettlementMatchNone {
+			return ""
+		}
+		return rows[i].Gateway.TransactionID
+	})
+	if len(gatewayIDs) == 0 {
+		return nil
+	}
+
+	requests, err := c.repoProvider.PaymentRequest().GetByGatewayIdentifiers(ctx, gatewayIDs)
+	if err != nil {
+		return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to read payment requests by gateway identifier", err)
+	}
+	txIDs := distinctNonEmpty(len(requests), func(i int) string { return requests[i].ProductTransactionUUID })
+	if len(txIDs) == 0 {
+		return nil
+	}
+	txs, err := c.repoProvider.ProductTransaction().GetByIDs(ctx, txIDs)
+	if err != nil {
+		return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to read the settlement's transactions by id", err)
+	}
+	byID := make(map[string]*domain.ProductTransaction, len(txs))
+	for _, tx := range txs {
+		byID[tx.UUID] = tx
+	}
+
+	// One identifier can only be one payment at Singapay, but the ledger keeps two columns
+	// per request and makes no uniqueness claim about either; if two requests answer, the
+	// paid one wins, exactly as for a reused invoice number.
+	byGatewayID := map[string]*domain.ProductTransaction{}
+	for _, pr := range requests {
+		tx := byID[pr.ProductTransactionUUID]
+		if tx == nil {
+			continue
+		}
+		for _, id := range []string{pr.GatewayTransactionRef, pr.GatewayTransactionID} {
+			if id != "" {
+				byGatewayID[id] = preferredTransaction(byGatewayID[id], tx)
+			}
+		}
+	}
+	for i := range rows {
+		if rows[i].Match != SettlementMatchNone {
+			continue
+		}
+		if tx := byGatewayID[rows[i].Gateway.TransactionID]; tx != nil {
+			rows[i].Transaction = tx
+			rows[i].Match = SettlementMatchGatewayID
+		}
+	}
+	return nil
+}
+
+// attachSettlementAccounts names each row's ledger account: the matched transaction's
+// seller, else the account holding the Singapay sub-account the row names. A page involves
+// a handful of sellers, so each distinct account is read once.
+func (c *LedgerClient) attachSettlementAccounts(ctx context.Context, rows []SettlementTransaction) error {
+	byID := map[string]*domain.Account{}
+	bySingapayID := map[string]*domain.Account{}
+
+	for i := range rows {
+		var account *domain.Account
+		if tx := rows[i].Transaction; tx != nil && tx.SellerAccountID != "" {
+			found, ok := byID[tx.SellerAccountID]
+			if !ok {
+				var err error
+				found, err = c.repoProvider.Account().GetByID(ctx, tx.SellerAccountID)
+				if err != nil && !ledgererr.IsAppError(err, repo.ErrNotFound) {
+					return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to read a seller account", err)
+				}
+				byID[tx.SellerAccountID] = found
+			}
+			account = found
+		}
+
+		if singapayID := rows[i].Gateway.AccountID; account == nil && singapayID != "" {
+			found, ok := bySingapayID[singapayID]
+			if !ok {
+				var err error
+				found, err = c.repoProvider.Account().GetBySingapayAccountID(ctx, singapayID)
+				if err != nil && !ledgererr.IsAppError(err, repo.ErrNotFound) {
+					return ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to read an account by its Singapay sub-account", err)
+				}
+				bySingapayID[singapayID] = found
+			}
+			account = found
+		}
+
+		rows[i].Account = account
+	}
+	return nil
+}
+
+// preferredTransaction picks between two transactions answering to one reference: the one
+// that was paid — SETTLED, then COMPLETED — and between equals the newer. A nil current
+// loses to anything.
+func preferredTransaction(current, candidate *domain.ProductTransaction) *domain.ProductTransaction {
+	if current == nil {
+		return candidate
+	}
+	rank := func(tx *domain.ProductTransaction) int {
+		switch tx.Status {
+		case domain.TransactionStatusSettled:
+			return 2
+		case domain.TransactionStatusCompleted:
+			return 1
+		default:
+			return 0
+		}
+	}
+	if rc, rn := rank(current), rank(candidate); rc != rn {
+		if rn > rc {
+			return candidate
+		}
+		return current
+	}
+	if candidate.CreatedAt.After(current.CreatedAt) {
+		return candidate
+	}
+	return current
+}
+
+// distinctNonEmpty collects key(0) … key(n-1), skipping empty strings and repeats, in order.
+func distinctNonEmpty(n int, key func(i int) string) []string {
+	seen := make(map[string]bool, n)
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		k := key(i)
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, k)
+	}
+	return out
+}

@@ -76,6 +76,12 @@ type PaymentRequestRepository interface {
 	GetByRequestID(ctx context.Context, requestID string) (*PaymentRequest, error)
 	GetByPaymentCode(ctx context.Context, paymentCode string) (*PaymentRequest, error)
 	GetByProductTransactionID(ctx context.Context, productTransactionID string) (*PaymentRequest, error)
+
+	// GetByGatewayIdentifiers reads every payment request whose stored gateway identifier —
+	// gateway_transaction_ref or gateway_transaction_id — is one of the given ones, in no set
+	// order; an identifier nothing matches is simply absent, and an empty list reads nothing.
+	// It traces a row Singapay lists by its own id back to the payment it belongs to.
+	GetByGatewayIdentifiers(ctx context.Context, identifiers []string) ([]*PaymentRequest, error)
 	Save(ctx context.Context, pr *PaymentRequest) error
 	Update(ctx context.Context, pr *PaymentRequest) error
 

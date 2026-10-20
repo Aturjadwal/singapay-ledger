@@ -360,7 +360,9 @@ func classify(status int, env *envelope, raw []byte) *Error {
 // Pagination is the page metadata on list endpoints.
 //
 // Singapay spells these two ways: fractal's snake_case on most collections, and camelCase
-// on statements, where the app remaps them. Both are accepted.
+// on statements, where the app remaps them. Both are accepted, and so is a plain Laravel
+// paginator's last_page for the page count — what the settlement-transactions listing is
+// documented to send.
 type Pagination struct {
 	Count       int
 	Total       int
@@ -381,6 +383,8 @@ func (p *Pagination) UnmarshalJSON(b []byte) error {
 		PerPageCamel     int `json:"perPage"`
 		CurrentPageCamel int `json:"currentPage"`
 		TotalPagesCamel  int `json:"totalPages"`
+
+		LastPage int `json:"last_page"`
 	}
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return err
@@ -390,7 +394,7 @@ func (p *Pagination) UnmarshalJSON(b []byte) error {
 		Total:       raw.Total,
 		PerPage:     cmpOr(raw.PerPage, raw.PerPageCamel),
 		CurrentPage: cmpOr(raw.CurrentPage, raw.CurrentPageCamel),
-		TotalPages:  cmpOr(raw.TotalPages, raw.TotalPagesCamel),
+		TotalPages:  cmpOr(raw.TotalPages, cmpOr(raw.TotalPagesCamel, raw.LastPage)),
 	}
 	return nil
 }

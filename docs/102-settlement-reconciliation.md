@@ -239,6 +239,32 @@ would need a reversal, the second the money-in webhook). A blocked fee is report
 For a payment link, `found = false` is the scan's proven answer. A scan that cannot conclude is
 not `NOT_SETTLED`: it is a `CodeGatewayAPIError`, the same as Singapay failing to answer.
 
+## What one batch covered, read back
+
+The webhook leaves the list out, but Singapay will give it: `GET
+/api/v1.0/settlement-transactions/{identifier}` lists the transactions of a **completed** batch
+(numeric id or `reference_no`; anything else, or another merchant's batch, is a 404). Each row
+carries `transaction_id` (a VA payment's business id, every other product's `reff_no`),
+`merchant_reff_no`, the sub-account, the method, amount and fee, `has_settle` and `settle_at` —
+no status and no product type.
+
+`ListSettlementTransactions` reads one page of it for a stored notification, for a person
+asking "which payments were in this settlement?", and matches each row to the ledger:
+
+1. `merchant_reff_no` against invoice numbers — the reference VA, QRIS and e-wallet payments
+   are issued under;
+2. `transaction_id` against `payment_requests.gateway_transaction_ref` / `gateway_transaction_id`
+   — a payment link is created with the invoice as `reff_no` instead, and its attempt's own
+   reference is what the ledger stores once it has found it;
+3. otherwise `NONE`, kept rather than dropped: a payment Singapay settled that the ledger cannot
+   place is the row worth seeing.
+
+It is a read, and the pass does not use it. The pass's question is "has *this invoice*
+settled?", which the point lookup answers for any status and with the fee the ledger books; the
+listing answers "what was in *this batch*?", only once the batch is completed, and only for a
+batch someone asks about. A listed payment the ledger still holds as `COMPLETED` is reported
+as such — the next pass, or a check, settles it.
+
 ## Cost
 
 One call per open invoice, instead of N accounts × up to 4 product lists × pagination per

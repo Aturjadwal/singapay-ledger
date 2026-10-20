@@ -33,6 +33,7 @@ separate copies of the same rules, and the copies drift.
 ├── payment.go             # Payment creation and channel routing
 ├── webhook.go             # Inbound webhook verification and booking
 ├── settlement.go          # Settlement inbox + the per-transaction settling pass
+├── settlement_transactions.go # What one settlement batch covered, read back from Singapay
 ├── gateway.go             # PaymentGateway interface and channel mapping
 ├── domain.go, response.go # Re-exports and response shapes
 ├── dummy.go               # Local seeder. Not used in production.

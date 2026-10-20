@@ -311,6 +311,11 @@ func TestPaginationAcceptsBothSpellings(t *testing.T) {
 			in:   `{"count":6,"total":42,"perPage":25,"currentPage":2,"totalPages":2}`,
 			want: Pagination{Count: 6, Total: 42, PerPage: 25, CurrentPage: 2, TotalPages: 2},
 		},
+		{
+			name: "laravel paginator",
+			in:   `{"current_page":2,"last_page":3,"per_page":25,"total":60,"from":26,"to":50}`,
+			want: Pagination{Total: 60, PerPage: 25, CurrentPage: 2, TotalPages: 3},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

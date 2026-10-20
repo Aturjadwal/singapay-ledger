@@ -49,6 +49,45 @@ func (r *PostgresProductTransactionRepository) GetByInvoiceNumber(ctx context.Co
 	return r.scanOne(ctx, query, invoiceNumber)
 }
 
+// GetByIDs reads every transaction with one of the ids, in no set order.
+func (r *PostgresProductTransactionRepository) GetByIDs(ctx context.Context, ids []string) ([]*domain.ProductTransaction, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	query := `
+		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
+		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
+		       status, created_at, updated_at, completed_at, settled_at,
+		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
+		       settled_platform_fee, settled_gateway_fee, platform_residual
+		FROM product_transactions
+		WHERE uuid = ANY($1)
+	`
+
+	return r.scanMany(ctx, query, pq.Array(ids))
+}
+
+// GetByInvoiceNumbers reads every transaction issued under one of the invoice numbers, in
+// no set order. idx_product_transactions_invoice serves it.
+func (r *PostgresProductTransactionRepository) GetByInvoiceNumbers(ctx context.Context, invoiceNumbers []string) ([]*domain.ProductTransaction, error) {
+	if len(invoiceNumbers) == 0 {
+		return nil, nil
+	}
+
+	query := `
+		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
+		       seller_price, platform_fee, gateway_fee, total_charged, seller_net_amount, fee_model, currency,
+		       status, created_at, updated_at, completed_at, settled_at,
+		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
+		       settled_platform_fee, settled_gateway_fee, platform_residual
+		FROM product_transactions
+		WHERE invoice_number = ANY($1)
+	`
+
+	return r.scanMany(ctx, query, pq.Array(invoiceNumbers))
+}
+
 func (r *PostgresProductTransactionRepository) GetBySellerAccountID(ctx context.Context, sellerAccountID string, page, pageSize int) ([]*domain.ProductTransaction, error) {
 	offset := (page - 1) * pageSize
 	query := `

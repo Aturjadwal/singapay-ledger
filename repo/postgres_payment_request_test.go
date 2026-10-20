@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/assert"
@@ -76,4 +77,42 @@ func TestRecordGatewayTransactionSQL_KeepsItsConditions(t *testing.T) {
 	assert.Contains(t, statement, "($2::text <> '' AND COALESCE(gateway_transaction_id, '') !~ '^[1-9][0-9]*$')")
 	assert.Contains(t, statement, "($3::text <> '' AND btrim(COALESCE(gateway_transaction_ref, '')) = '')")
 	assert.Equal(t, 2, strings.Count(statement, "ELSE gateway_transaction_"), "each column keeps its value unless its condition holds")
+}
+
+// paymentRequestColumns is the SELECT list every payment request query reads, in the order
+// scanRow scans it.
+var paymentRequestColumns = []string{
+	"uuid", "randid", "product_transaction_uuid", "request_id", "payment_code", "payment_channel", "payment_url",
+	"amount", "currency", "created_at", "updated_at", "expires_at",
+	"gateway_transaction_id", "gateway_transaction_ref",
+}
+
+// A listed row's transaction_id is looked for in both stored identifiers at once: a payment
+// link's attempt reference is the ref, a numeric id the id.
+func TestGetByGatewayIdentifiers_MatchesEitherStoredIdentifier(t *testing.T) {
+	repo, mock := newMockPaymentRequestRepo(t)
+
+	created := time.Date(2026, 9, 25, 16, 15, 38, 0, time.UTC)
+	mock.ExpectQuery(`(?s)SELECT uuid, randid, product_transaction_uuid.*FROM payment_requests\s+` +
+		`WHERE gateway_transaction_ref = ANY\(\$1\) OR gateway_transaction_id = ANY\(\$1\)`).
+		WithArgs(`{"984656477720260925231717415YVichz6Y","647179096636882876"}`).
+		WillReturnRows(sqlmock.NewRows(paymentRequestColumns).AddRow(
+			"pr-card", "randid-pr-card", "pt-card", "98465", nil, "CREDIT_CARD", "https://pay.example/98465",
+			int64(68_041), "IDR", created, created, created.Add(time.Hour),
+			"80937", "984656477720260925231717415YVichz6Y",
+		))
+
+	requests, err := repo.GetByGatewayIdentifiers(context.Background(),
+		[]string{"984656477720260925231717415YVichz6Y", "647179096636882876"})
+
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, "pt-card", requests[0].ProductTransactionUUID)
+	assert.Equal(t, "80937", requests[0].GatewayTransactionID)
+	assert.Equal(t, "984656477720260925231717415YVichz6Y", requests[0].GatewayTransactionRef)
+
+	none, err := repo.GetByGatewayIdentifiers(context.Background(), nil)
+	require.NoError(t, err)
+	assert.Empty(t, none)
+	require.NoError(t, mock.ExpectationsWereMet())
 }

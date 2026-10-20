@@ -103,6 +103,14 @@ type ProductTransaction struct {
 type ProductTransactionRepository interface {
 	GetByID(ctx context.Context, id string) (*ProductTransaction, error)
 	GetByInvoiceNumber(ctx context.Context, invoiceNumber string) (*ProductTransaction, error)
+
+	// GetByIDs and GetByInvoiceNumbers read every transaction with any of the given ids or
+	// invoice numbers, in no set order. A key nothing matches is simply absent from the
+	// result, and an empty list reads nothing. They exist for pages that resolve many
+	// references at once — a settlement's transactions as Singapay lists them — where one
+	// query per reference would be one round trip per row.
+	GetByIDs(ctx context.Context, ids []string) ([]*ProductTransaction, error)
+	GetByInvoiceNumbers(ctx context.Context, invoiceNumbers []string) ([]*ProductTransaction, error)
 	GetBySellerAccountID(ctx context.Context, sellerAccountID string, page, pageSize int) ([]*ProductTransaction, error)
 	GetByBuyerAccountID(ctx context.Context, buyerAccountID string, page, pageSize int) ([]*ProductTransaction, error)
 	GetPendingBySellerAccountID(ctx context.Context, sellerAccountID string) ([]*ProductTransaction, error)
