@@ -351,3 +351,38 @@ func TestPreferredTransaction(t *testing.T) {
 	assert.Same(t, newerSettled, preferredTransaction(settled, newerSettled))
 	assert.Same(t, newerSettled, preferredTransaction(newerSettled, settled))
 }
+
+// Singapay's documentation lists no `page` parameter. If it answers page 1 to a request for
+// page 2, those rows are not page 2's: the page comes back empty and the listing ends, rather
+// than showing the first rows again.
+func TestListSettlementTransactions_APageSingapayDidNotHonour(t *testing.T) {
+	gw := &listingGateway{
+		fakeGateway: &fakeGateway{},
+		rows:        []singapay.SettlementTransaction{listedRow("a", "INV-A", "", 1000, nil), listedRow("b", "INV-B", "", 1000, nil)},
+		pagination:  singapay.Pagination{CurrentPage: 1, PerPage: 2, Total: 6, TotalPages: 3},
+	}
+	f := newListingFixture(t, fakeListingClient(t, gw))
+
+	page, err := f.client.ListSettlementTransactions(context.Background(), f.notification.UUID, 2, 2)
+	require.NoError(t, err)
+
+	assert.Empty(t, page.Transactions)
+	assert.False(t, page.HasMore)
+	assert.Equal(t, 2, page.Page)
+}
+
+// A row whose merchant_reff_no names nothing the ledger knows is still found when its
+// transaction_id is an invoice number — a payment link's reference may land there.
+func TestListSettlementTransactions_TransactionIDAsInvoice(t *testing.T) {
+	gw := &listingGateway{fakeGateway: &fakeGateway{}}
+	f := newListingFixture(t, fakeListingClient(t, gw))
+	gw.rows = []singapay.SettlementTransaction{listedRow(f.qrisOpen.InvoiceNumber, "", "01SELLERAULID", 22155, nil)}
+
+	page, err := f.client.ListSettlementTransactions(context.Background(), f.notification.UUID, 1, 0)
+	require.NoError(t, err)
+
+	require.Len(t, page.Transactions, 1)
+	assert.Equal(t, SettlementMatchInvoice, page.Transactions[0].Match)
+	require.NotNil(t, page.Transactions[0].Transaction)
+	assert.Equal(t, f.qrisOpen.UUID, page.Transactions[0].Transaction.UUID)
+}

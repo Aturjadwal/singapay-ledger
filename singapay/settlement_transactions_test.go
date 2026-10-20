@@ -153,3 +153,76 @@ func TestListSettlementTransactionsNotFound(t *testing.T) {
 		t.Errorf("error = %d %q", e.StatusCode, e.Message)
 	}
 }
+
+// A row is read leniently: the listing is shown to a person, and one odd field must not cost
+// the whole page. Each value below fails the strict types this package uses for money paths.
+func TestSettlementTransactionDecodesOddRowsLeniently(t *testing.T) {
+	body := `{"status":200,"success":true,"data":[
+		{"transaction_id":647179096636882876,"merchant_reff_no":null,"account":[],
+		 "fees":{"name":"QRIS","amount":1.1300000000000001,"currency":"IDR"},
+		 "amount":{"value":"39275.004","currency":"IDR"},
+		 "post_timestamp":1759395328000,"processed_timestamp":"","has_settle":1,
+		 "settle_at":"2026-10-07T07:00:00+07:00"},
+		{"transaction_id":"VA-1","merchant_reff_no":"INV-1","account":{"id":"01SUB","name":null},
+		 "fees":[],"amount":"not a number","post_timestamp":"yesterday","has_settle":"false","settle_at":null}],
+		"pagination":{"count":2,"total":2,"per_page":25,"current_page":1,"total_pages":1}}`
+	srv := newServer(t, nil, func(w http.ResponseWriter, r *http.Request, c *capture) {
+		writeJSON(w, 200, body)
+	})
+	c := testClient(t, srv.URL)
+
+	rows, page, err := c.ListSettlementTransactions(context.Background(), "3937", ListSettlementTransactionsOptions{})
+	if err != nil {
+		t.Fatalf("ListSettlementTransactions: %v", err)
+	}
+	if page.Total != 2 || len(rows) != 2 {
+		t.Fatalf("got %d rows, page %+v", len(rows), page)
+	}
+
+	odd := rows[0]
+	if odd.TransactionID != "647179096636882876" {
+		t.Errorf("a numeric id reads as its digits, got %q", odd.TransactionID)
+	}
+	if odd.MerchantReffNo != "" || odd.Account != nil {
+		t.Errorf("null reference and [] account read as absent, got %q / %+v", odd.MerchantReffNo, odd.Account)
+	}
+	if !odd.Fees.Amount.Set || odd.Fees.Amount.Minor() != 113 {
+		t.Errorf("float noise is rounded to the sen: fee = %+v", odd.Fees.Amount)
+	}
+	if !odd.Amount.Set || odd.Amount.Minor() != 3927500 || odd.Amount.Currency != "IDR" {
+		t.Errorf("a third decimal is rounded to the sen: amount = %+v", odd.Amount)
+	}
+	if !odd.HasSettle {
+		t.Error("has_settle 1 is true")
+	}
+	if !odd.PostedAt.Set || !odd.PostedAt.Equal(time.UnixMilli(1759395328000)) || odd.ProcessedAt.Set {
+		t.Errorf("posted %+v, processed %+v", odd.PostedAt, odd.ProcessedAt)
+	}
+	if want := time.Date(2026, 10, 7, 0, 0, 0, 0, time.UTC); !odd.SettleAt.Set || !odd.SettleAt.Equal(want) {
+		t.Errorf("an ISO settle_at is read too: %+v", odd.SettleAt)
+	}
+
+	bare := rows[1]
+	if bare.Account == nil || bare.Account.ID != "01SUB" || bare.Account.Name != "" {
+		t.Errorf("account = %+v", bare.Account)
+	}
+	if bare.Fees.Amount.Set || bare.Amount.Set {
+		t.Errorf("unreadable figures are unset: fee %+v, amount %+v", bare.Fees.Amount, bare.Amount)
+	}
+	if bare.PostedAt.Set || bare.SettleAt.Set || bare.HasSettle {
+		t.Errorf("unreadable timestamps are unset, \"false\" is false: %+v %+v %v", bare.PostedAt, bare.SettleAt, bare.HasSettle)
+	}
+}
+
+// Only a row that is not an object fails, and it fails the call: that is a different shape
+// altogether, not an odd field.
+func TestSettlementTransactionThatIsNotAnObjectFails(t *testing.T) {
+	srv := newServer(t, nil, func(w http.ResponseWriter, r *http.Request, c *capture) {
+		writeJSON(w, 200, `{"status":200,"success":true,"data":["INV-1"]}`)
+	})
+	c := testClient(t, srv.URL)
+
+	if _, _, err := c.ListSettlementTransactions(context.Background(), "3937", ListSettlementTransactionsOptions{}); err == nil {
+		t.Error("want an error for a row that is a string")
+	}
+}

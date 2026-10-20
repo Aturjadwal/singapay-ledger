@@ -40,8 +40,8 @@ const (
 type SettlementTransactionMatch string
 
 const (
-	// SettlementMatchInvoice: the row's merchant_reff_no is a ledger invoice number — the
-	// reference this ledger issues VA, QRIS and e-wallet payments under.
+	// SettlementMatchInvoice: the row's merchant_reff_no — or failing that its transaction_id
+	// — is a ledger invoice number, the reference this ledger issues payments under.
 	SettlementMatchInvoice SettlementTransactionMatch = "INVOICE_NUMBER"
 	// SettlementMatchGatewayID: the row's transaction_id is a gateway identifier the ledger
 	// stored for the payment (gateway_transaction_ref or gateway_transaction_id) — how a
@@ -162,13 +162,25 @@ func (c *LedgerClient) ListSettlementTransactions(ctx context.Context, notificat
 
 	result := &SettlementTransactionsPage{
 		Notification: notification,
-		Transactions: make([]SettlementTransaction, len(listed)),
 		Page:         cmp.Or(pagination.CurrentPage, page),
 		PerPage:      cmp.Or(pagination.PerPage, perPage),
 		Total:        pagination.Total,
 		TotalPages:   pagination.TotalPages,
 	}
 	switch {
+	case result.Page != page:
+		// Singapay answered another page than the one asked for: it does not honour `page`,
+		// which its documentation does not list. Those rows are some other page's, and showing
+		// them again would repeat rows, so this page is empty and the listing ends here.
+		c.logger.WarnContext(ctx, "Singapay answered another page of a settlement's transactions than the one asked for",
+			"settlement_notification_uuid", notification.UUID,
+			"settlement_id", notification.SettlementID,
+			"asked_page", page,
+			"answered_page", result.Page,
+		)
+		listed = nil
+		result.Page = page
+		result.HasMore = false
 	case pagination.TotalPages > 0:
 		result.HasMore = result.Page < pagination.TotalPages
 	case pagination.Total > 0:
@@ -176,6 +188,7 @@ func (c *LedgerClient) ListSettlementTransactions(ctx context.Context, notificat
 	default:
 		result.HasMore = len(listed) >= result.PerPage
 	}
+	result.Transactions = make([]SettlementTransaction, len(listed))
 
 	for i, row := range listed {
 		result.Transactions[i] = SettlementTransaction{
@@ -236,8 +249,19 @@ func settlementGatewayTransaction(row singapay.SettlementTransaction) Settlement
 // matchSettlementTransactions ties each listed row to a ledger transaction: by invoice
 // number in one query, then — for the rows that found nothing — by stored gateway
 // identifier in two more. Rows that match neither keep SettlementMatchNone.
+//
+// The invoice lookup takes each row's transaction_id as well as its merchant_reff_no. For a
+// payment link Singapay's documentation does not say which reference lands where — the link
+// is created with the invoice as reff_no, and "other types use reff_no" for transaction_id —
+// and an attempt the money-in webhook left without its own reference has no gateway
+// identifier stored to be found by.
 func (c *LedgerClient) matchSettlementTransactions(ctx context.Context, rows []SettlementTransaction) error {
-	invoices := distinctNonEmpty(len(rows), func(i int) string { return rows[i].Gateway.MerchantReference })
+	invoices := distinctNonEmpty(2*len(rows), func(i int) string {
+		if i%2 == 0 {
+			return rows[i/2].Gateway.MerchantReference
+		}
+		return rows[i/2].Gateway.TransactionID
+	})
 	byInvoice := map[string]*domain.ProductTransaction{}
 	if len(invoices) > 0 {
 		txs, err := c.repoProvider.ProductTransaction().GetByInvoiceNumbers(ctx, invoices)
@@ -249,7 +273,11 @@ func (c *LedgerClient) matchSettlementTransactions(ctx context.Context, rows []S
 		}
 	}
 	for i := range rows {
-		if tx := byInvoice[rows[i].Gateway.MerchantReference]; tx != nil {
+		tx := byInvoice[rows[i].Gateway.MerchantReference]
+		if tx == nil {
+			tx = byInvoice[rows[i].Gateway.TransactionID]
+		}
+		if tx != nil {
 			rows[i].Transaction = tx
 			rows[i].Match = SettlementMatchInvoice
 		}

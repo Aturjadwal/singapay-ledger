@@ -251,13 +251,19 @@ no status and no product type.
 `ListSettlementTransactions` reads one page of it for a stored notification, for a person
 asking "which payments were in this settlement?", and matches each row to the ledger:
 
-1. `merchant_reff_no` against invoice numbers — the reference VA, QRIS and e-wallet payments
-   are issued under;
+1. `merchant_reff_no` — or, failing that, the row's `transaction_id` — against invoice
+   numbers: the reference VA, QRIS and e-wallet payments are issued under, and a payment
+   link's, wherever Singapay puts it;
 2. `transaction_id` against `payment_requests.gateway_transaction_ref` / `gateway_transaction_id`
    — a payment link is created with the invoice as `reff_no` instead, and its attempt's own
    reference is what the ledger stores once it has found it;
 3. otherwise `NONE`, kept rather than dropped: a payment Singapay settled that the ledger cannot
    place is the row worth seeing.
+
+Rows are decoded leniently (a fee with float noise is rounded to the sen, an unreadable field
+is left unset) because the listing is only ever shown, and Singapay documents no `page`
+parameter: a page it answers as another page than the one asked for is returned empty, ending
+the listing, rather than repeating rows.
 
 It is a read, and the pass does not use it. The pass's question is "has *this invoice*
 settled?", which the point lookup answers for any status and with the fee the ledger books; the

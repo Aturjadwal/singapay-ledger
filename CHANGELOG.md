@@ -14,13 +14,22 @@ batch that is not completed or not this merchant's).
 
 - `singapay.Client.ListSettlementTransactions(ctx, identifier, opts)` reads one page of it
   (`Page`, `PerPage`, `TransactionType`, `Refunded`) as `[]singapay.SettlementTransaction`.
+  A row is decoded leniently — display only: a fee with float noise (`1.1300000000000001`) is
+  rounded to the sen, a boolean written `1` is true, `account: []` is no account, an id
+  written as a number is its digits, an unreadable figure or timestamp is unset — so one odd
+  field never fails the page; only a row that is not an object does.
   `singapay.Pagination` also reads a plain Laravel paginator's `last_page` as `TotalPages`,
-  which is how that listing is documented to page.
+  which is how that listing is documented to page. Every list read shares the type: the
+  payment-link history scan now stops at the last page Singapay names when it sends
+  `last_page`, instead of asking for one more, empty page.
 - `LedgerClient.ListSettlementTransactions(ctx, notificationUUID, page, perPage)` reads the
   page for a stored settlement notification (default 50 per page, at most 100) and matches each
-  row to the ledger: `merchant_reff_no` against invoice numbers, then `transaction_id` against
-  the stored gateway identifiers (`gateway_transaction_ref` / `gateway_transaction_id`, how a
-  payment link's attempt is found), else `NONE` — kept, not dropped. Each row carries the
+  row to the ledger: `merchant_reff_no` — or the row's `transaction_id` — against invoice
+  numbers, then `transaction_id` against the stored gateway identifiers
+  (`gateway_transaction_ref` / `gateway_transaction_id`, how a payment link's attempt is
+  found), else `NONE` — kept, not dropped. Singapay documents no `page` parameter: a page it
+  answers as another page than the one asked for comes back empty and ends the listing, so
+  no row is shown twice. Each row carries the
   matched `ProductTransaction` and the seller `Account` (or the account holding the Singapay
   sub-account the row names). Read only: nothing is written, and the settling pass does not use
   it.
