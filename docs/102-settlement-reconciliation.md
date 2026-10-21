@@ -265,14 +265,19 @@ is left unset) because the listing is only ever shown, and Singapay documents no
 parameter: a page it answers as another page than the one asked for is returned empty, ending
 the listing, rather than repeating rows.
 
-`ReadSettlementListing` reads the whole listing instead — a hundred rows a page, the pages after
-the first four at a time once Singapay has said how many there are, at most 10 000 rows — and
-matches nothing; `MatchSettlementTransactions` puts any set of its rows beside the ledger with the
-same three steps. The split is for a consumer that keeps the rows: Singapay's answer about a
-completed batch does not change, while the ledger's side does as the pass settles the payments,
-so the rows are read from Singapay once and matched every time they are shown. One page failing
-fails the whole read — a listing is never missing a page in the middle — and a page Singapay
-answers as another page, or the row cap, ends it early with `Complete` false.
+`ReadSettlementListing` reads the whole listing instead — a hundred rows a page, at most
+10 000 rows — and matches nothing; `MatchSettlementTransactions` puts any set of its rows beside
+the ledger with the same three steps. The split is for a consumer that keeps the rows:
+Singapay's answer about a completed batch does not change, while the ledger's side does as the
+pass settles the payments, so the rows are read from Singapay once and matched every time they
+are shown. Each page is checked as it arrives — a page answered as another page number, or one
+opening on a row an earlier page already listed, ends the listing — and when the first page
+counts the pages, page 2 is read alone and checked before the rest go four at a time, so a
+Singapay that ignores `page` costs two calls. One page failing fails the whole read; a listing
+is never missing a page in the middle. `Complete` is false when the read stopped early, when
+the rows and Singapay's count disagree, or when a transaction id repeats (`RepeatedRows`).
+Each matched row names two accounts: `Account`, whose payment it is, and `SubAccount`, whose
+Singapay sub-account it was paid into.
 
 It is a read, and the pass does not use it. The pass's question is "has *this invoice*
 settled?", which the point lookup answers for any status and with the fee the ledger books; the

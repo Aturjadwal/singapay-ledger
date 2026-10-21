@@ -1,6 +1,7 @@
 package ledger
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -206,6 +207,8 @@ func assertScenarioTransactions(t *testing.T, f *listingFixture, transactions []
 
 	settled := transactions[0]
 	assert.Equal(t, SettlementMatchInvoice, settled.Match)
+	require.NotNil(t, settled.SubAccount)
+	assert.Equal(t, f.sellerA.UUID, settled.SubAccount.UUID)
 	require.NotNil(t, settled.Transaction)
 	assert.Equal(t, f.qrisSettled.UUID, settled.Transaction.UUID)
 	assert.Equal(t, domain.TransactionStatusSettled, settled.Transaction.Status)
@@ -247,6 +250,7 @@ func assertScenarioTransactions(t *testing.T, f *listingFixture, transactions []
 	assert.Equal(t, SettlementMatchNone, bare.Match)
 	assert.Nil(t, bare.Transaction)
 	assert.Nil(t, bare.Account)
+	assert.Nil(t, bare.SubAccount)
 
 	// Read only: the open transaction is still COMPLETED and nothing was booked.
 	stillOpen, err := f.client.repoProvider.ProductTransaction().GetByID(context.Background(), f.qrisOpen.UUID)
@@ -419,9 +423,13 @@ type pagedListingGateway struct {
 	// ignorePageFrom answers page 1 for this page and every later one: Singapay not honouring
 	// `page`.
 	ignorePageFrom int
-	// failPage fails with failErr.
-	failPage int
-	failErr  error
+	// failPage fails with failErr; panicPage panics.
+	failPage  int
+	failErr   error
+	panicPage int
+	// claimTotal is the total Singapay reports, whatever it lists; reportPerPage the per_page.
+	claimTotal    int
+	reportPerPage int
 
 	mu          sync.Mutex
 	asked       []singapay.ListSettlementTransactionsOptions
@@ -450,6 +458,9 @@ func (g *pagedListingGateway) ListSettlementTransactions(ctx context.Context, _ 
 	if opts.Page == g.failPage {
 		return nil, singapay.Pagination{}, g.failErr
 	}
+	if opts.Page == g.panicPage {
+		panic("a row Singapay sent that nothing expected")
+	}
 
 	perPage := opts.PerPage
 	if g.singapayPerPage > 0 {
@@ -464,10 +475,11 @@ func (g *pagedListingGateway) ListSettlementTransactions(ctx context.Context, _ 
 	if g.bare {
 		return g.rows[from:to], singapay.Pagination{}, nil
 	}
-	pagination := singapay.Pagination{Count: to - from, PerPage: perPage, CurrentPage: page}
+	pagination := singapay.Pagination{Count: to - from, PerPage: cmp.Or(g.reportPerPage, perPage), CurrentPage: page}
 	if g.counts {
-		pagination.Total = len(g.rows)
-		pagination.TotalPages = (len(g.rows) + perPage - 1) / perPage
+		total := cmp.Or(g.claimTotal, len(g.rows))
+		pagination.Total = total
+		pagination.TotalPages = (total + perPage - 1) / perPage
 	}
 	return g.rows[from:to], pagination, nil
 }
@@ -611,16 +623,79 @@ func TestReadSettlementListing_SingapaysOwnPageSize(t *testing.T) {
 }
 
 // A page Singapay answers as another page ends the listing there: the rows before it are
-// kept and nothing is shown twice.
+// kept, nothing is shown twice, and no more pages are asked for — page 2 is checked before
+// the rest are read.
 func TestReadSettlementListing_APageSingapayDidNotHonour(t *testing.T) {
-	gw := &pagedListingGateway{fakeGateway: &fakeGateway{}, rows: numberedRows(250), counts: true, ignorePageFrom: 2}
-	f := newListingFixture(t, fakeListingClient(t, gw))
+	for _, tc := range []struct {
+		name string
+		gw   *pagedListingGateway
+	}{
+		// It says so: page 2 comes back as current_page 1.
+		{"counted", &pagedListingGateway{fakeGateway: &fakeGateway{}, rows: numberedRows(1_000), counts: true, ignorePageFrom: 2}},
+		{"not counted", &pagedListingGateway{fakeGateway: &fakeGateway{}, rows: numberedRows(1_000), ignorePageFrom: 2}},
+		// It does not say so: no pagination at all, page 2 opens on page 1's first row.
+		{"silent", &pagedListingGateway{fakeGateway: &fakeGateway{}, rows: numberedRows(1_000), bare: true, ignorePageFrom: 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newListingFixture(t, fakeListingClient(t, tc.gw))
 
+			listing, err := f.client.ReadSettlementListing(context.Background(), f.notification.UUID, 0)
+			require.NoError(t, err)
+
+			assert.False(t, listing.Complete)
+			assert.Equal(t, gatewayIDs(tc.gw.rows[:100]), listedIDs(listing.Rows))
+			assert.Equal(t, 0, listing.RepeatedRows)
+			assert.Equal(t, []int{1, 2}, tc.gw.askedPages(), "two calls, not ten")
+		})
+	}
+
+	// Page 3 of a counted listing not honoured: pages 1 and 2 are kept.
+	gw := &pagedListingGateway{fakeGateway: &fakeGateway{}, rows: numberedRows(450), counts: true, ignorePageFrom: 3}
+	f := newListingFixture(t, fakeListingClient(t, gw))
 	listing, err := f.client.ReadSettlementListing(context.Background(), f.notification.UUID, 0)
 	require.NoError(t, err)
-
 	assert.False(t, listing.Complete)
-	assert.Equal(t, gatewayIDs(gw.rows[:100]), listedIDs(listing.Rows))
+	assert.Equal(t, gatewayIDs(gw.rows[:200]), listedIDs(listing.Rows))
+}
+
+// The rows are the whole batch only when they are as many as Singapay counts, each once.
+func TestReadSettlementListing_CompleteMeansTheWholeBatch(t *testing.T) {
+	// Singapay counts 300 and lists 250.
+	short := &pagedListingGateway{fakeGateway: &fakeGateway{}, rows: numberedRows(250), counts: true, claimTotal: 300}
+	f := newListingFixture(t, fakeListingClient(t, short))
+	listing, err := f.client.ReadSettlementListing(context.Background(), f.notification.UUID, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 300, listing.Total)
+	assert.Len(t, listing.Rows, 250)
+	assert.False(t, listing.Complete)
+
+	// Its order shifted between pages: one row listed twice (and so another not at all).
+	rows := numberedRows(250)
+	rows[150] = rows[10]
+	shifted := &pagedListingGateway{fakeGateway: &fakeGateway{}, rows: rows, counts: true}
+	f = newListingFixture(t, fakeListingClient(t, shifted))
+	listing, err = f.client.ReadSettlementListing(context.Background(), f.notification.UUID, 0)
+	require.NoError(t, err)
+	assert.Len(t, listing.Rows, 250, "the rows are kept as listed")
+	assert.Equal(t, 1, listing.RepeatedRows)
+	assert.False(t, listing.Complete)
+}
+
+// What Singapay sends that makes no sense does not crash the read.
+func TestReadSettlementListing_OddAnswers(t *testing.T) {
+	// A negative per_page: the read pages at its own size.
+	odd := &pagedListingGateway{fakeGateway: &fakeGateway{}, rows: numberedRows(150), counts: true, reportPerPage: -5}
+	f := newListingFixture(t, fakeListingClient(t, odd))
+	listing, err := f.client.ReadSettlementListing(context.Background(), f.notification.UUID, 0)
+	require.NoError(t, err)
+	assert.True(t, listing.Complete)
+	assert.Len(t, listing.Rows, 150)
+
+	// A page read off the caller's goroutine panics: an error, not a dead process.
+	panics := &pagedListingGateway{fakeGateway: &fakeGateway{}, rows: numberedRows(1_000), counts: true, panicPage: 4}
+	f = newListingFixture(t, fakeListingClient(t, panics))
+	_, err = f.client.ReadSettlementListing(context.Background(), f.notification.UUID, 0)
+	assert.Equal(t, ledgererr.CodeInternal, outerCode(t, err), "got %v", err)
 }
 
 // One page failing fails the read with that page's error, never a listing with a hole in
@@ -687,6 +762,26 @@ func TestMatchSettlementTransactions_PutsEachRowBesideTheLedgersRecord(t *testin
 			none, err := f.client.MatchSettlementTransactions(context.Background(), nil)
 			require.NoError(t, err)
 			assert.Empty(t, none)
+		})
+	}
+}
+
+// A payment of one seller paid into another seller's sub-account belongs to its seller and
+// became the other's money: both accounts are named.
+func TestMatchSettlementTransactions_PaidIntoAnotherSubAccount(t *testing.T) {
+	for _, store := range listingStores {
+		t.Run(store.name, func(t *testing.T) {
+			f := newListingFixture(t, store.client(t, &listingGateway{fakeGateway: &fakeGateway{}}))
+
+			listed := settlementGatewayTransaction(listedRow("647179096636882876", f.qrisSettled.InvoiceNumber, "01SELLERBULID", 39275, feeMinor(27493)))
+			matched, err := f.client.MatchSettlementTransactions(context.Background(), []SettlementGatewayTransaction{listed})
+			require.NoError(t, err)
+
+			require.Len(t, matched, 1)
+			require.NotNil(t, matched[0].Account)
+			assert.Equal(t, f.sellerA.UUID, matched[0].Account.UUID, "the payment's seller")
+			require.NotNil(t, matched[0].SubAccount)
+			assert.Equal(t, f.sellerB.UUID, matched[0].SubAccount.UUID, "the sub-account's holder")
 		})
 	}
 }

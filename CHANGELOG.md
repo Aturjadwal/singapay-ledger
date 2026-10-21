@@ -12,23 +12,33 @@ it can search and filter. Singapay's listing only pages, so that needs every row
 completed batch does not change at Singapay while the ledger's side of it does.
 
 - `LedgerClient.ReadSettlementListing(ctx, notificationUUID, maxRows)` reads every page of the
-  settlement's listing (`MaxSettlementTransactionsPerPage` a page; once the first page counts
-  the pages or the rows, the rest four at a time; otherwise one after another until a short
-  page) up to `maxRows` (0 or more than `MaxSettlementListingRows`, 10 000, is 10 000), and
-  returns Singapay's rows in its order, unmatched, as a `SettlementListing` with Singapay's
-  `Total` and `Complete` — false when the row cap or a page Singapay answered as another page
-  ended the read early. One page failing fails the read with that page's error, never the
-  cancellation it caused in the pages beside it. A transaction id listed twice is logged.
+  settlement's listing (`MaxSettlementTransactionsPerPage` a page) up to `maxRows` (0 or more
+  than `MaxSettlementListingRows`, 10 000, is 10 000), and returns Singapay's rows in its order,
+  unmatched, as a `SettlementListing` with Singapay's `Total`, `RepeatedRows` and `Complete`.
+  Each page is checked as it comes back: one answered as another page number, or opening on a
+  row an earlier page listed (Singapay serving page 1 again without saying so), ends the
+  listing there. When the first page counts the pages or the rows, page 2 is read alone and
+  checked before the rest are read four at a time — a Singapay that ignores `page` costs two
+  calls; otherwise pages are read one after another until a short one. `Complete` is false
+  when the row cap or a page not honoured ended the read, when the rows and `Total` disagree,
+  and when a transaction id repeats (`RepeatedRows`: Singapay's order shifting between pages,
+  or a payment settled twice). One page failing fails the read with that page's error, never
+  the cancellation it caused beside it; a page read that panics is a `CodeInternal` error.
 - `LedgerClient.MatchSettlementTransactions(ctx, rows)` puts any rows of a listing beside the
   ledger exactly as `ListSettlementTransactions` does a page (invoice number, then stored
   gateway identifier, else `NONE`; the seller's account), reading the ledger's side anew on
   every call.
+- `SettlementTransaction.SubAccount` (both reads): the account holding the Singapay sub-account
+  the row was paid into, beside `Account` (the payment's seller, else that holder). They differ
+  when a payment was paid into another seller's sub-account.
 - `ListSettlementTransactions` is unchanged; it now shares the notification lookup and the page
   read with the two above.
 
 No migration, no interface change. Tests: the paged read against a scripted gateway (counted and
-uncounted pages, Singapay's own page size, the row cap, a page not honoured, errors, the
-caller's deadline, reads in flight bounded), the match against the fakes and PostgreSQL.
+uncounted pages, Singapay's own page size, the row cap, pages not honoured with and without
+saying so, a count that disagrees, a repeated id, a negative per_page, a panicking page,
+errors, the caller's deadline, reads in flight bounded), the match against the fakes and
+PostgreSQL.
 
 ### Added — the transactions inside a settlement, read back from Singapay
 
