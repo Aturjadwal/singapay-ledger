@@ -556,6 +556,18 @@ It writes nothing and decides nothing: a listed payment the ledger still holds a
 is reported as such. `ErrSettlementNotListed` (404010) is Singapay's 404 — the batch is not
 completed, or not this merchant's; `CodeGatewayAPIError` is Singapay failing to answer.
 
+A consumer that needs the whole batch — totals, a search, a filter on where each payment stands —
+reads it once and matches it as often as it shows it. A completed batch does not change at
+Singapay, so the rows can be kept (the consuming service caches them); the ledger's side is what
+moves:
+
+```go
+listing, err := client.ReadSettlementListing(ctx, notificationUUID, 0) // every page, ≤ 10 000 rows
+// listing.Rows: Singapay's rows in its order; listing.Total: Singapay's count
+// listing.Complete: false when the row cap or a page Singapay did not honour ended the read
+rows, err := client.MatchSettlementTransactions(ctx, listing.Rows) // the ledger's side, read now
+```
+
 **Still open: `settlement.refunded`.** It can pull back funds that have already become
 `AVAILABLE` and may already have been withdrawn. This ledger has no negative-balance policy,
 so refund deliveries are stored as `NEEDS_REVIEW` and left for a person. That is a business
@@ -618,7 +630,7 @@ neither take a payment nor pay out, and the code refuses both explicitly.
 | `RetryDisbursement` | `POST /api/v2.0/disbursement/inquiry-status` |
 | `HandleDisbursementNotification` | `disbursement_notif_url` webhook |
 | `ProcessPlatformFeeTransfer` | `POST /api/v1.0/account-transfer/{id}/transfer` |
-| `ListSettlementTransactions` | `GET /api/v1.0/settlement-transactions/{id}` (read only) |
+| `ListSettlementTransactions`, `ReadSettlementListing` | `GET /api/v1.0/settlement-transactions/{id}` (read only) |
 | `GetBalance` (verification) | `GET /api/v1.0/balance-inquiry/{id}` |
 
 Singapay versions each module separately — accounts, balances and account transfer exist only

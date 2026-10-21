@@ -3,7 +3,9 @@ package ledger
 import (
 	"cmp"
 	"context"
+	"errors"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/Aturjadwal/singapay-ledger/domain"
@@ -134,8 +136,9 @@ type SettlementGatewayTransaction struct {
 // merchant's); CodeGatewayAPIError when Singapay could not be read otherwise; and
 // CodeDatabaseError. Nothing is written in any case.
 func (c *LedgerClient) ListSettlementTransactions(ctx context.Context, notificationID string, page, perPage int) (*SettlementTransactionsPage, error) {
-	if notificationID == "" {
-		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "settlement notification id is required", nil)
+	notification, err := c.settlementNotification(ctx, notificationID)
+	if err != nil {
+		return nil, err
 	}
 	page = max(page, 1)
 	if perPage <= 0 {
@@ -143,22 +146,11 @@ func (c *LedgerClient) ListSettlementTransactions(ctx context.Context, notificat
 	}
 	perPage = min(perPage, MaxSettlementTransactionsPerPage)
 
-	notification, err := c.repoProvider.SettlementNotification().GetByID(ctx, notificationID)
+	answered, err := c.readSettlementPage(ctx, notification, page, perPage)
 	if err != nil {
-		if ledgererr.IsAppError(err, repo.ErrNotFound) {
-			return nil, ledgererr.ErrSettlementNotificationNotFound.WithError(err)
-		}
-		return nil, ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to read the settlement notification", err)
+		return nil, err
 	}
-
-	listed, pagination, err := c.gateway.ListSettlementTransactions(ctx, notification.SettlementID,
-		singapay.ListSettlementTransactionsOptions{Page: page, PerPage: perPage})
-	if err != nil {
-		if gatewayErr, ok := singapay.AsError(err); ok && gatewayErr.StatusCode == http.StatusNotFound {
-			return nil, ledgererr.ErrSettlementNotListed.WithError(err)
-		}
-		return nil, ledgererr.NewError(ledgererr.CodeGatewayAPIError, "could not read the settlement's transactions from Singapay", err)
-	}
+	listed, pagination := answered.rows, answered.pagination
 
 	result := &SettlementTransactionsPage{
 		Notification: notification,
@@ -220,6 +212,260 @@ func (c *LedgerClient) ListSettlementTransactions(ctx context.Context, notificat
 	)
 
 	return result, nil
+}
+
+// SettlementListing is every row Singapay lists for one settlement, read page by page and
+// not yet put beside the ledger.
+//
+// It is Singapay's answer about a completed batch, which does not change, so a consumer may
+// keep it and put it beside the ledger again (MatchSettlementTransactions) each time it is
+// shown: the ledger's side is what moves, as the daily pass settles what the batch covered.
+type SettlementListing struct {
+	// Notification is the stored webhook the settlement was read through.
+	Notification *domain.SettlementNotification
+	// Rows are in Singapay's order, page after page.
+	Rows []SettlementGatewayTransaction
+	// Total is Singapay's count across every page, as its first page reported it; 0 when it
+	// sent none.
+	Total int
+	// Complete says every row Singapay lists was read. It is false when the read stopped
+	// early: at the row cap, or at a page Singapay answered as another page than the one
+	// asked for — the rows before that page are kept, nothing after it is read.
+	Complete bool
+}
+
+// MaxSettlementListingRows bounds ReadSettlementListing. A batch is the merchant's whole
+// window — every seller's payments — so it grows with the platform; the largest so far
+// held 7. Ten thousand rows is a hundred pages, read four at a time within one request's
+// deadline.
+const MaxSettlementListingRows = 10_000
+
+// settlementListingConcurrency is how many pages ReadSettlementListing asks Singapay for at
+// once, after the first page has said how many there are.
+const settlementListingConcurrency = 4
+
+// ReadSettlementListing reads every row Singapay lists for the settlement a stored
+// notification names, MaxSettlementTransactionsPerPage a page, at most maxRows rows (0, or
+// anything above MaxSettlementListingRows, is MaxSettlementListingRows). Nothing is matched
+// to the ledger: MatchSettlementTransactions does that, as often as the rows are shown.
+//
+// When Singapay's first page counts the pages (or the rows), the rest are read
+// settlementListingConcurrency at a time; when it counts nothing, one after another until a
+// page comes back short. A page Singapay answers as another page than the one asked for —
+// its documentation lists no `page` parameter — ends the listing there, as in
+// ListSettlementTransactions, and so does the row cap; either leaves Complete false.
+//
+// Errors are ListSettlementTransactions's: one page Singapay fails to answer fails the read,
+// so a listing is never silently missing a page in the middle.
+func (c *LedgerClient) ReadSettlementListing(ctx context.Context, notificationID string, maxRows int) (*SettlementListing, error) {
+	notification, err := c.settlementNotification(ctx, notificationID)
+	if err != nil {
+		return nil, err
+	}
+	if maxRows <= 0 || maxRows > MaxSettlementListingRows {
+		maxRows = MaxSettlementListingRows
+	}
+	started := time.Now()
+
+	const perPage = MaxSettlementTransactionsPerPage
+	first, err := c.readSettlementPage(ctx, notification, 1, perPage)
+	if err != nil {
+		return nil, err
+	}
+	// Singapay may answer a smaller page than asked for; its page numbers count its pages.
+	pageSize := cmp.Or(first.pagination.PerPage, perPage)
+	maxPages := (maxRows + pageSize - 1) / pageSize
+
+	pageCount := first.pagination.TotalPages
+	if pageCount == 0 && first.pagination.Total > 0 {
+		pageCount = (first.pagination.Total + pageSize - 1) / pageSize
+	}
+
+	var pages []settlementPage
+	complete := false
+	switch {
+	case pageCount > 0:
+		complete = pageCount <= maxPages
+		pages, err = c.readSettlementPages(ctx, notification, first, min(pageCount, maxPages), perPage)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		pages = []settlementPage{first}
+		complete = len(first.rows) < pageSize
+		for p := 2; !complete && p <= maxPages; p++ {
+			next, err := c.readSettlementPage(ctx, notification, p, perPage)
+			if err != nil {
+				return nil, err
+			}
+			pages = append(pages, next)
+			complete = len(next.rows) < pageSize
+		}
+	}
+
+	listing := &SettlementListing{Notification: notification, Total: first.pagination.Total, Complete: complete}
+	for i, page := range pages {
+		asked := i + 1
+		if answered := cmp.Or(page.pagination.CurrentPage, asked); answered != asked {
+			c.logger.WarnContext(ctx, "Singapay answered another page of a settlement's transactions than the one asked for",
+				"settlement_notification_uuid", notification.UUID,
+				"settlement_id", notification.SettlementID,
+				"asked_page", asked,
+				"answered_page", answered,
+			)
+			listing.Complete = false
+			break
+		}
+		for _, row := range page.rows {
+			listing.Rows = append(listing.Rows, settlementGatewayTransaction(row))
+		}
+	}
+	if len(listing.Rows) > maxRows {
+		listing.Rows = listing.Rows[:maxRows]
+		listing.Complete = false
+	}
+
+	// One payment is one row of a batch. A transaction id listed twice is Singapay's ordering
+	// moving between pages, or a payment settled twice; either is worth a look, and the rows
+	// are kept as listed.
+	seen := make(map[string]bool, len(listing.Rows))
+	repeated := 0
+	for _, row := range listing.Rows {
+		if row.TransactionID == "" {
+			continue
+		}
+		if seen[row.TransactionID] {
+			repeated++
+		}
+		seen[row.TransactionID] = true
+	}
+	if repeated > 0 {
+		c.logger.WarnContext(ctx, "Singapay listed a transaction id more than once in one settlement",
+			"settlement_notification_uuid", notification.UUID,
+			"settlement_id", notification.SettlementID,
+			"repeated_rows", repeated,
+		)
+	}
+
+	c.logger.InfoContext(ctx, "Read a settlement's listing",
+		"settlement_notification_uuid", notification.UUID,
+		"settlement_id", notification.SettlementID,
+		"settlement_reference", notification.SettlementReference,
+		"pages", len(pages),
+		"rows", len(listing.Rows),
+		"total", listing.Total,
+		"complete", listing.Complete,
+		"duration_ms", time.Since(started).Milliseconds(),
+	)
+	return listing, nil
+}
+
+// MatchSettlementTransactions puts each row of a settlement's listing beside the ledger's
+// record of the same payment, as ListSettlementTransactions does a page: by invoice number,
+// then by a stored gateway identifier, else unmatched and kept — each with the account it
+// belongs to. The rows keep their order. Read only.
+//
+// Errors: CodeDatabaseError.
+func (c *LedgerClient) MatchSettlementTransactions(ctx context.Context, rows []SettlementGatewayTransaction) ([]SettlementTransaction, error) {
+	matched := make([]SettlementTransaction, len(rows))
+	for i, row := range rows {
+		matched[i] = SettlementTransaction{Gateway: row, Match: SettlementMatchNone}
+	}
+	if err := c.matchSettlementTransactions(ctx, matched); err != nil {
+		return nil, err
+	}
+	if err := c.attachSettlementAccounts(ctx, matched); err != nil {
+		return nil, err
+	}
+	return matched, nil
+}
+
+// settlementNotification reads the stored notification a listing is read through.
+func (c *LedgerClient) settlementNotification(ctx context.Context, notificationID string) (*domain.SettlementNotification, error) {
+	if notificationID == "" {
+		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest, "settlement notification id is required", nil)
+	}
+	notification, err := c.repoProvider.SettlementNotification().GetByID(ctx, notificationID)
+	if err != nil {
+		if ledgererr.IsAppError(err, repo.ErrNotFound) {
+			return nil, ledgererr.ErrSettlementNotificationNotFound.WithError(err)
+		}
+		return nil, ledgererr.NewError(ledgererr.CodeDatabaseError, "failed to read the settlement notification", err)
+	}
+	return notification, nil
+}
+
+// settlementPage is one page of a settlement's listing as Singapay answered it.
+type settlementPage struct {
+	rows       []singapay.SettlementTransaction
+	pagination singapay.Pagination
+}
+
+// readSettlementPage asks Singapay for one page of the settlement's listing. Its 404 is
+// ErrSettlementNotListed — the batch is not completed, or not this merchant's — and
+// anything else it fails with is CodeGatewayAPIError.
+func (c *LedgerClient) readSettlementPage(ctx context.Context, notification *domain.SettlementNotification, page, perPage int) (settlementPage, error) {
+	rows, pagination, err := c.gateway.ListSettlementTransactions(ctx, notification.SettlementID,
+		singapay.ListSettlementTransactionsOptions{Page: page, PerPage: perPage})
+	if err != nil {
+		if gatewayErr, ok := singapay.AsError(err); ok && gatewayErr.StatusCode == http.StatusNotFound {
+			return settlementPage{}, ledgererr.ErrSettlementNotListed.WithError(err)
+		}
+		return settlementPage{}, ledgererr.NewError(ledgererr.CodeGatewayAPIError, "could not read the settlement's transactions from Singapay", err)
+	}
+	return settlementPage{rows: rows, pagination: pagination}, nil
+}
+
+// readSettlementPages reads pages 2 … count, settlementListingConcurrency at a time, and
+// returns every page from first on, in order. The first page to fail cancels the pages
+// still in flight; its error — not the cancellation it caused — is the one returned.
+func (c *LedgerClient) readSettlementPages(ctx context.Context, notification *domain.SettlementNotification, first settlementPage, count, perPage int) ([]settlementPage, error) {
+	pages := make([]settlementPage, count)
+	pages[0] = first
+	if count == 1 {
+		return pages, nil
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errs := make([]error, count)
+	slots := make(chan struct{}, settlementListingConcurrency)
+	var wg sync.WaitGroup
+	for p := 2; p <= count && ctx.Err() == nil; p++ {
+		slots <- struct{}{}
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			page, err := c.readSettlementPage(ctx, notification, p, perPage)
+			if err != nil {
+				errs[p-1] = err
+				cancel()
+				return
+			}
+			pages[p-1] = page
+		}(p)
+	}
+	wg.Wait()
+
+	var cancelled error
+	for _, err := range errs {
+		switch {
+		case err == nil:
+		case !errors.Is(err, context.Canceled):
+			return nil, err
+		case cancelled == nil:
+			cancelled = err
+		}
+	}
+	if cancelled != nil {
+		return nil, cancelled
+	}
+	if err := ctx.Err(); err != nil {
+		// The caller's context ended between launching the reads: some pages were never read.
+		return nil, ledgererr.NewError(ledgererr.CodeGatewayAPIError, "could not read the settlement's transactions from Singapay", err)
+	}
+	return pages, nil
 }
 
 // settlementGatewayTransaction converts a listed row to the ledger's units.
@@ -338,8 +584,8 @@ func (c *LedgerClient) matchSettlementTransactions(ctx context.Context, rows []S
 }
 
 // attachSettlementAccounts names each row's ledger account: the matched transaction's
-// seller, else the account holding the Singapay sub-account the row names. A page involves
-// a handful of sellers, so each distinct account is read once.
+// seller, else the account holding the Singapay sub-account the row names. A settlement
+// involves far fewer sellers than rows, so each distinct account is read once.
 func (c *LedgerClient) attachSettlementAccounts(ctx context.Context, rows []SettlementTransaction) error {
 	byID := map[string]*domain.Account{}
 	bySingapayID := map[string]*domain.Account{}
