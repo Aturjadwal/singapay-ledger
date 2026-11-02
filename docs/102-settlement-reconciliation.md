@@ -65,6 +65,16 @@ conversations; not one of them decides which transactions settled.
 That makes the webhook an optimisation for latency, not a correctness dependency. A delivery
 that never arrives delays settlement to the next floor-age tick rather than losing it.
 
+**The totals can arrive with float noise.** Singapay adds a batch's figures up in floating
+point and prints the result in full. On 2026-11-02 a batch of 3000 + 2089.42 + 909.36 +
+909.36 in fees arrived as `"total_admin_fee":6908.139999999999`, and its net total as
+`"amount":3058398.8600000003`. `Amount` refused both ("more precision than IDR carries"),
+so the delivery was answered 400 three times and never stored. Now a decimal that can only
+be float64 noise is read as the sen it is a hair away from. Noise here means at least 15
+significant digits, with the digits past the second decimal starting `000` or `999`. A real
+third decimal is still refused, for example `793.055`. Every `Amount` follows this rule, the
+money-in webhooks included.
+
 Two kinds of delivery are parked as `NEEDS_REVIEW` rather than acted on:
 
 - **Refund events.** `settlement.refunded` can pull back funds that are already `AVAILABLE`

@@ -440,6 +440,29 @@ func TestParseSettlementNotification(t *testing.T) {
 	}
 }
 
+// settlementFloatTotalsWebhook is the settlement delivery of 2026-11-02 as rebuilt: the keys
+// every earlier delivery carried, and the totals of its four transactions as a float sum
+// prints them. Rebuilt this way it is 659 bytes, the size that was logged; the parser refused
+// it with "more precision than IDR carries", three times.
+const settlementFloatTotalsWebhook = `{"status":200,"success":true,"event":"settlement.completed","timestamp":"02 Nov 2026 12:02:07","data":{"settlement":{"id":4999,"title":"Settlement Aturjadwal (01\/11\/2026 - 02\/11\/2026)","amount":3058398.8600000003,"status":"completed","currency":"IDR","end_date":"02 Nov 2026 00:00:00","recipient":{"bank_code":null,"account_name":null,"account_number":null},"start_date":"01 Nov 2026 00:00:00","reference_no":"SETTLEMENT-647-6AE8194FB2992","settlement_fee":0,"total_refunded":0,"settlement_type":"ALL","total_admin_fee":6908.139999999999,"transfer_status":null,"settlement_method":"balance","total_to_transfer":3058398.8600000003},"total_transactions":4}}`
+
+func TestParseSettlementNotification_FloatTotals(t *testing.T) {
+	if len(settlementFloatTotalsWebhook) != 659 {
+		t.Fatalf("the rebuilt delivery is %d bytes, not the 659 that arrived", len(settlementFloatTotalsWebhook))
+	}
+	n, err := ParseSettlementNotification([]byte(settlementFloatTotalsWebhook))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := n.Data.Settlement
+	if s.Amount.Minor() != 305839886 || s.TotalToTransfer.Minor() != 305839886 {
+		t.Errorf("Amount = %s, TotalToTransfer = %s, want 3058398.86 both", s.Amount, s.TotalToTransfer)
+	}
+	if s.TotalAdminFee.Minor() != 690814 {
+		t.Errorf("TotalAdminFee = %s, want 6908.14", s.TotalAdminFee)
+	}
+}
+
 func TestSettlementMethodDecidesBalanceMovement(t *testing.T) {
 	tests := []struct {
 		method SettlementMethod

@@ -128,11 +128,20 @@ func (a Amount) MarshalJSON() ([]byte, error) {
 
 var errMalformedAmount = errors.New("singapay: malformed amount")
 
+// floatNoiseMinDigits is how many significant digits a float64 shows when it is printed in
+// full: 15 to 17. Singapay's json_encode (PHP) prints a float sum that way: the settlement
+// webhook of 2026-11-02 added up 3000 + 2089.42 + 909.36 + 909.36 and sent 6908.139999999999,
+// and its net total as 3058398.8600000003. No amount anyone writes is that long.
+const floatNoiseMinDigits = 15
+
 // parseDecimalToMinor converts a decimal string to sen without touching floating point.
 //
-// Fractional digits beyond the second are accepted only when they are zeros. Singapay
-// documents two decimals everywhere; a third significant digit means the contract moved,
-// and silently dropping it is how money goes missing one sen at a time.
+// Fractional digits beyond the second are accepted only when they are zeros, or when they
+// can only be float64 noise (isFloatNoise), which is read as the sen it is a hair away from.
+// Singapay documents two decimals everywhere; a third significant digit means the contract
+// moved, and silently dropping it is how money goes missing one sen at a time. Noise is not
+// such a digit: 6908.139999999999 is 6908.14 that went through a float, and refusing it
+// refused the whole settlement webhook it was in.
 func parseDecimalToMinor(s string) (int64, error) {
 	neg := false
 	switch {
@@ -173,8 +182,16 @@ func parseDecimalToMinor(s string) (int64, error) {
 		if err != nil {
 			return 0, fmt.Errorf("%w %q: %w", errMalformedAmount, s, err)
 		}
-		if strings.Trim(padded[2:], "0") != "" {
-			return 0, fmt.Errorf("%w %q: more precision than IDR carries", errMalformedAmount, s)
+		if excess := padded[2:]; strings.Trim(excess, "0") != "" {
+			if !isFloatNoise(intPart, fracPart, excess) {
+				return 0, fmt.Errorf("%w %q: more precision than IDR carries", errMalformedAmount, s)
+			}
+			if strings.HasPrefix(excess, "999") {
+				// Just under the next sen: 6908.139999999999 is 6908.14, and .999… on 99
+				// sen carries into the rupiah.
+				cents++
+			}
+			// Otherwise just over a whole sen: 3058398.8600000003 is 3058398.86.
 		}
 	}
 
@@ -183,4 +200,16 @@ func parseDecimalToMinor(s string) (int64, error) {
 		minor = -minor
 	}
 	return minor, nil
+}
+
+// isFloatNoise reports whether excess — the digits past the second decimal — can only be
+// float64 noise: the number shows at least floatNoiseMinDigits significant digits, as a
+// float printed in full does, and excess is within a thousandth of a sen of a whole sen (it
+// starts 000 or 999). 793.055 is half a sen and too short besides; 6908.135000000001 is long
+// but half a sen. Both are still refused.
+func isFloatNoise(intPart, fracPart, excess string) bool {
+	if !strings.HasPrefix(excess, "000") && !strings.HasPrefix(excess, "999") {
+		return false
+	}
+	return len(strings.TrimLeft(intPart+fracPart, "0")) >= floatNoiseMinDigits
 }

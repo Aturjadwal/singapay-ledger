@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — an amount with float noise no longer refuses the webhook it is in
+
+Singapay adds a settlement batch's figures up in floating point and prints them in full. On
+2026-11-02 the settlement webhook arrived with `"total_admin_fee":6908.139999999999` and
+`"amount":3058398.8600000003` (3000 + 2089.42 + 909.36 + 909.36 in fees), `Amount` refused
+them with "more precision than IDR carries", and `HandleSettlementNotification` answered
+`CodeInvalidRequest` to all three deliveries. The batch was never stored.
+
+- `Amount` (`parseDecimalToMinor`) reads a decimal that can only be float64 noise as the sen
+  it is a hair away from. Noise means at least 15 significant digits, as a float printed in
+  full shows, with the digits past the second decimal starting `000` (rounded down) or `999`
+  (carried up). So `6908.139999999999` reads as 6908.14, `3058398.8600000003` as 3058398.86,
+  and `6908.999999999999` as 6909.00.
+- A real third decimal is still refused: `793.055`, `1.23999` (too short to be a float
+  printed in full), and `6908.135000000001` (long, but half a sen).
+- Applies to every `Amount`: settlement, money-in and money-out webhooks, and API answers.
+
 ### Added — a settlement's whole listing, read once and matched whenever it is shown
 
 The settlement view in the consuming service shows a batch as a summary (where every payment

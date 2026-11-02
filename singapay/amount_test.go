@@ -27,6 +27,15 @@ func TestAmountUnmarshal(t *testing.T) {
 		{"one decimal place is padded", `"10.5"`, 1050, "", true},
 		{"trailing zeros beyond two are fine", `"10.5000"`, 1050, "", true},
 
+		// Float noise: a PHP float sum printed in full. The settlement webhook of 2026-11-02
+		// was refused for the first two.
+		{"float noise just over a sen", `3058398.8600000003`, 305839886, "", true},
+		{"float noise just under a sen is carried", `6908.139999999999`, 690814, "", true},
+		{"float noise carried into the rupiah", `6908.999999999999`, 690900, "", true},
+		{"float noise, quoted", `"0.30000000000000004"`, 30, "", true},
+		{"float noise, negative", `-6908.139999999999`, -690814, "", true},
+		{"float noise in a money object", `{"value":1.1300000000000001,"currency":"IDR"}`, 113, "IDR", true},
+
 		// Absent, which is not the same as zero: a failed disbursement carries
 		// balance_after "" and processed_timestamp "".
 		{"null", `null`, 0, "", false},
@@ -53,7 +62,11 @@ func TestAmountUnmarshal(t *testing.T) {
 }
 
 func TestAmountRejectsMalformed(t *testing.T) {
-	for _, in := range []string{`"abc"`, `"12.ab"`, `"1.234"`, `"12."`, `"1,234.00"`} {
+	for _, in := range []string{`"abc"`, `"12.ab"`, `"1.234"`, `"12."`, `"1,234.00"`,
+		// A third significant digit is still refused: half a sen; a .999 too short to be a
+		// float printed in full; a number that long whose excess is half a sen.
+		`"793.055"`, `"1.23999"`, `"6908.135000000001"`,
+	} {
 		t.Run(in, func(t *testing.T) {
 			var a Amount
 			if err := json.Unmarshal([]byte(in), &a); err == nil {
