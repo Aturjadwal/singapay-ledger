@@ -219,8 +219,10 @@ func TestCreateEwalletOrderPutsAccountInBody(t *testing.T) {
 	var got *capture
 	srv := newServer(t, nil, func(w http.ResponseWriter, r *http.Request, c *capture) {
 		got = c
+		// account_id comes back as Singapay's numeric id for the sub-account, not the
+		// ULID sent in the request.
 		writeJSON(w, 200, `{"response_code":"SP000","response_message":"Successfully","data":{
-			"id":42,"account_id":"01K9","reff_no":"EW-1","merchant_reff_no":"INV-2026-001",
+			"id":42,"account_id":35,"reff_no":"EW-1","merchant_reff_no":"INV-2026-001",
 			"status":"pending","ewallet_vendor":"EWALLET_DANA",
 			"amount":95000,"total_amount":100000,"merchant_fee":5000,"net_amount":95000,
 			"checkout_url":"https://pay.example.com/x"}}`)
@@ -245,8 +247,14 @@ func TestCreateEwalletOrderPutsAccountInBody(t *testing.T) {
 	if body["account_id"] != "01K9" {
 		t.Errorf("account_id must travel in the body on v2, got %v", body["account_id"])
 	}
+	if tx.ID != 42 {
+		t.Errorf("ID = %d, want 42: the ledger tracks the payment by it", tx.ID)
+	}
 	if tx.CheckoutURL == "" {
 		t.Error("want a checkout_url")
+	}
+	if tx.AccountID != "35" {
+		t.Errorf("AccountID = %q, want the numeric id's digits", tx.AccountID)
 	}
 	fee, _ := tx.MerchantFee.Rupiah()
 	if fee != 5000 {
