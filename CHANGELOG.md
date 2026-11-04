@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — an e-wallet order whose account_id comes back as a number is read, not lost (v0.10.2)
+
+Singapay answers `POST /api/v2.0/ewallet-native/create-order` with `account_id` as its own
+numeric id for the sub-account (as on the payment-link webhook, `"account_id": 35`), not the
+ULID the order was created with. `EwalletTransaction.AccountID` was a string, and the test
+fixture had made the answer a string too. On 2026-11-04 the first three e-wallet checkouts
+that reached Singapay in production (ShopeePay twice, DANA once) failed with `json: cannot
+unmarshal number into Go struct field EwalletTransaction.account_id of type string`. Singapay
+had already opened each checkout, but `GeneratePayment` returned an error before saving
+anything, and the payer never saw a checkout URL. No money moved.
+
+- `EwalletTransaction` has its own `UnmarshalJSON`. `account_id` is read as a number's digits
+  or as a string, and nothing else about it can fail a read, because nothing acts on it.
+- `is_expired` and `has_settle` read `true`/`false` and `1`/`0`, quoted or not; null is false.
+  Singapay's settlement listing already prints booleans as `1`, and Go reports only the
+  first mistyped field, so these could have failed next. Any other value is still refused,
+  because `has_settle` decides settlement.
+- Every other field reads as before. The failure itself shows that the amounts and
+  timestamps of a real create-order answer already decode, because Go returns a custom
+  decoder's error ahead of a mistyped field.
+- Applies everywhere the type is read: `CreateEwalletOrder`, `GetEwalletTransaction` (the
+  settlement check), `ListEwalletTransactions` and `InquiryEwalletStatus`.
+
 ### Fixed — an amount with float noise no longer refuses the webhook it is in
 
 Singapay adds a settlement batch's figures up in floating point and prints them in full. On

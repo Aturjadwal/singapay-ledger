@@ -899,6 +899,15 @@ Simpan SWIFT sebagai kanonik, atau simpan keduanya.
 `settlement.refunded` bisa menarik dana yang sudah AVAILABLE dan mungkin sudah ditarik
 seller. Perlu kebijakan saldo negatif yang saat ini tidak ada di ledger.
 
+### 9.13 `account_id` di jawaban transaksi adalah id numerik, bukan ULID
+Request memakai ULID sub-account (di path, atau di body pada v2). Tapi transaksi yang
+dikembalikan Singapay menyebut akunnya dengan id numerik internal mereka: `"account_id": 35`
+di webhook Payment Link, dan juga angka di jawaban `POST /api/v2.0/ewallet-native/create-order`.
+Yang terakhir ini baru ketahuan di produksi pada 2026-11-04, karena fixture test-nya
+mengarang string. `EwalletTransaction` sekarang membaca keduanya, dan juga membaca
+`is_expired`/`has_settle` yang ditulis `1`/`0`. Jangan pakai `account_id` dari jawaban untuk
+mencocokkan akun. Yang menjadi kunci tetap ULID yang kita simpan sendiri.
+
 ---
 
 ## 10. Pertanyaan untuk tim Singapay
