@@ -20,12 +20,19 @@ var jakarta = time.FixedZone("WIB", 7*60*60)
 // canonicalJSON normalises a JSON document the way Singapay's signature scheme expects:
 // every object's keys sorted recursively and alphabetically, re-encoded compactly.
 //
-// Two details do the real work here. Numbers are decoded with UseNumber so they survive
-// as written: routed through float64 instead, 10000.00 comes back out as 10000 and 0.070
-// as 0.07, and any integer past 2^53 is corrupted outright. Either way the hash stops
-// matching the one Singapay computed, and the only symptom is SP016. And HTML escaping is
-// switched off, because Go escapes <, > and & by default while PHP's JSON_UNESCAPED_*
-// flags do not.
+// Numbers are decoded with UseNumber and kept as written, so the hash covers the bytes on
+// the wire. A float64 round trip would corrupt any integer past 2^53 outright.
+//
+// Keeping a number as written is only correct for a number already in the form Singapay's
+// own re-encoding produces. Singapay decodes a body and encodes it again before hashing it
+// (PHP's json_encode), which rewrites 10000.00 as 10000 and 0.070 as 0.07. A body Singapay
+// sent is always in that form. A body this client sends has to be written in it, which is
+// [Amount.MarshalJSON]'s job; every other outbound amount is an int64. A body that sends
+// 10000.00 is signed over 10000.00 here and over 10000 at Singapay, and is refused with
+// 401 "Invalid X-SIGNATURE".
+//
+// HTML escaping is switched off, because Go escapes <, > and & by default while PHP's
+// JSON_UNESCAPED_* flags do not.
 //
 // Key sorting comes free: encoding/json emits map keys in sorted order.
 func canonicalJSON(raw []byte) ([]byte, error) {

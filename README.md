@@ -372,9 +372,12 @@ resp, err := client.RetryDisbursement(ctx, disbursementID)
 result, err := client.ProcessPlatformFeeTransfer(ctx, 50)
 ```
 
-It finds nothing today: its input is `SETTLED` transactions, and nothing reaches `SETTLED`
-while reconciliation is unimplemented. The routine itself is complete and wired to
-Singapay's account transfer, so running it on a schedule now is harmless.
+Its input is `SETTLED` transactions whose platform fee has not been swept. It moves the
+balanced fee, sen included (see [docs/104](docs/104-fee-mismatch-reconciliation.md)), from
+the seller's sub-account to the platform's with Singapay's account transfer. The amount goes
+on the wire in its shortest form (`4000`, `4000.1`, `4000.42`). Singapay re-encodes a signed
+body before hashing it, and a `4000.00` was refused with 401 Invalid X-SIGNATURE until
+v0.10.3.
 
 The transfer's `merchant_ref_no` is **derived from the invoice number, never generated**.
 Singapay's `merchant_ref_no` is unique per merchant across every account movement, and
@@ -676,8 +679,13 @@ Sandbox is the default on purpose: an unset or misspelled variable must not move
 `SINGAPAY_PRODUCTION=yes` is an error rather than a silent `false` — that is exactly how a
 production deploy ends up pointed at sandbox.
 
-Three notes worth reading before deploying:
+Notes worth reading before deploying:
 
+- **A signed body is hashed after Singapay re-encodes it, not as sent.** Singapay decodes the
+  body to sort its keys and encodes it again with PHP's `json_encode`, which writes every
+  number in its shortest form. A number sent any other way, such as `4000.00` for `4000`,
+  fails the signature with 401 `Invalid X-SIGNATURE`, and nothing in the answer says why.
+  `Amount` marshals in that shortest form, and every other outbound amount is an `int64`.
 - **`SINGAPAY_TIMESTAMP_FORMAT` exists because Singapay's documentation contradicts itself.**
   The signing guide says `X-Timestamp` is Unix seconds; the OpenAPI spec for the disbursement
   endpoint says ISO-8601. A wrong guess surfaces only as `SP016`. It is an environment

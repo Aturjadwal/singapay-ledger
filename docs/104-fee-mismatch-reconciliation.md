@@ -71,7 +71,7 @@ is precisely the quantity the balancing exists to place.
 | `SettledTransaction` (`GrossMinor`, `NetMinor`, `FeeMinor`) | **sen** | it comes from Singapay, which uses decimals |
 | `product_transactions.settled_platform_fee` / `settled_gateway_fee` / `platform_residual` | **sen** | what the fees turned out to be |
 | `ledger_entries.amount` | whole rupiah | unchanged |
-| `TransferRequest.Amount` | **decimal** | the account-transfer endpoint takes one |
+| `TransferRequest.Amount` | **decimal**, shortest form (`4000`, `4000.1`, `4000.42`) | the account-transfer endpoint takes one. Singapay re-encodes the body before checking the signature, so `4000.00` is refused (401 Invalid X-SIGNATURE) |
 
 > **The ×100 bug this replaced.** `SettledTransaction`'s fields were once named
 > `GrossAmount` / `NetAmount` / `Fee` and carried no unit, while `readSettledTransaction`
