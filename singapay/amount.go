@@ -38,7 +38,8 @@ func NewAmount(rupiah int64, currency string) Amount {
 // Singapay reported as 119.84, or a platform fee balanced against one. Sending such a
 // figure back to Singapay is not a special case: the account-transfer endpoint types its
 // amount as a number with decimals and returns it as a string "to preserve decimal
-// precision", and Amount marshals to exactly two decimals without going through float64.
+// precision", and Amount marshals exactly, without going through float64, in the form
+// Singapay's signature check reads it (see [Amount.MarshalJSON]).
 func NewAmountFromMinor(minor int64, currency string) Amount {
 	return Amount{minor: minor, Currency: currency, Set: true}
 }
@@ -118,12 +119,35 @@ func (a *Amount) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// MarshalJSON writes the amount as a JSON number with two decimals.
+// MarshalJSON writes the amount as a JSON number in its shortest exact form: 4000, 4000.1,
+// 4000.42. Never 4000.00.
+//
+// The form decides whether Singapay accepts a signed request. Singapay does not hash the
+// body it received: it decodes it to sort the keys and encodes it again (PHP's
+// json_encode), and that turns a number into a float printed in the fewest digits that read
+// back as the same float. So 4000.00 arrives as 4000 and 4000.10 as 4000.1 on Singapay's
+// side, while the client signed the bytes it sent. The two hashes differ and the answer is
+// 401 "Invalid X-SIGNATURE". Written in the form that re-encoding produces, the sent body
+// and the body Singapay hashes are the same bytes.
+//
+// That 401 is what refused every platform-fee transfer of a whole rupiah (every virtual
+// account payment, whose gateway fee is flat) while this wrote two decimals, until v0.10.3.
+// A fee with a non-zero last digit, such as 4000.42, re-encodes to itself and always went
+// through.
+//
+// The digits still come from the sen, never from a float64.
 func (a Amount) MarshalJSON() ([]byte, error) {
 	if !a.Set {
 		return []byte("null"), nil
 	}
-	return []byte(a.String()), nil
+	return []byte(a.jsonNumber()), nil
+}
+
+// jsonNumber is String without the zeros a float drops: "4000.00" → "4000", "4000.10" →
+// "4000.1", "0.00" → "0". String always has a decimal point, so the trim never reaches the
+// integer part.
+func (a Amount) jsonNumber() string {
+	return strings.TrimSuffix(strings.TrimRight(a.String(), "0"), ".")
 }
 
 var errMalformedAmount = errors.New("singapay: malformed amount")

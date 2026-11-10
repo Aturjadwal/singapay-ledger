@@ -124,6 +124,83 @@ func TestAmountString(t *testing.T) {
 	}
 }
 
+func TestAmountMarshalJSON(t *testing.T) {
+	tests := []struct {
+		name  string
+		minor int64
+		want  string
+	}{
+		{"a whole rupiah, as every virtual account platform fee is", 400000, `4000`},
+		{"a last sen digit of zero is dropped too", 400010, `4000.1`},
+		{"two sen digits are kept", 400042, `4000.42`},
+		{"below the quoted fee", 399958, `3999.58`},
+		{"the Rp1 transfer minimum", 100, `1`},
+		{"sen only", 7, `0.07`},
+		{"half a rupiah", 50, `0.5`},
+		{"zero", 0, `0`},
+		{"zeros in the rupiah part are kept", 1000000, `10000`},
+		{"negative", -250050, `-2500.5`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := json.Marshal(NewAmountFromMinor(tc.minor, "IDR"))
+			if err != nil {
+				t.Fatalf("Marshal: %v", err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("minor %d: got %s, want %s", tc.minor, got, tc.want)
+			}
+		})
+	}
+
+	t.Run("an unset amount is null", func(t *testing.T) {
+		got, err := json.Marshal(Amount{})
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		if string(got) != `null` {
+			t.Errorf("got %s, want null", got)
+		}
+	})
+}
+
+// The property the request signature depends on: an amount written by MarshalJSON comes
+// back out of Singapay's decode-and-re-encode byte for byte, and still reads as the same sen.
+// Every sen value from -Rp100 to Rp2.000 covers each last-two-digit pattern many times; the
+// large bases check that nothing changes at checkout totals and beyond.
+func TestAmountMarshalJSONSurvivesSingapaysReencoding(t *testing.T) {
+	check := func(minor int64) {
+		t.Helper()
+		sent, err := json.Marshal(NewAmountFromMinor(minor, "IDR"))
+		if err != nil {
+			t.Fatalf("minor %d: Marshal: %v", minor, err)
+		}
+		got, err := reencodeLikeSingapay(sent)
+		if err != nil {
+			t.Fatalf("minor %d: re-encode %s: %v", minor, sent, err)
+		}
+		if got != string(sent) {
+			t.Fatalf("minor %d: sent %s, Singapay re-encodes it as %s", minor, sent, got)
+		}
+		var back Amount
+		if err := json.Unmarshal(sent, &back); err != nil {
+			t.Fatalf("minor %d: Unmarshal(%s): %v", minor, sent, err)
+		}
+		if back.Minor() != minor {
+			t.Fatalf("minor %d: %s reads back as %d", minor, sent, back.Minor())
+		}
+	}
+
+	for minor := int64(-10_000); minor <= 200_000; minor++ {
+		check(minor)
+	}
+	for _, base := range []int64{941_994_000, 12_345_678_900, 999_999_999_900} {
+		for sen := int64(0); sen < 100; sen++ {
+			check(base + sen)
+		}
+	}
+}
+
 func TestNewAmount(t *testing.T) {
 	a := NewAmount(50000, "IDR")
 	if a.Minor() != 5000000 {

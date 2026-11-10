@@ -4,6 +4,55 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — a platform-fee transfer of a whole rupiah is no longer refused for its signature (v0.10.3)
+
+Every platform-fee transfer whose amount was a whole rupiah failed with `singapay: http 401:
+Unauthorized. Invalid X-SIGNATURE`, on every sweep. That is every virtual account payment:
+its gateway fee is flat, so the balanced platform fee is exactly 4000.00. QRIS and e-wallet
+fees went through, because their balanced fee almost always carries sen. Between 2026-10-19
+and 2026-11-09, 18 of them were transferred (4000.42, 3999.58, …). On 2026-11-10, five
+whole-rupiah fees (Rp20.000) were still in sellers' sub-accounts. The oldest was from
+2026-09-25, and the worker logs reach back only to 2026-10-12. No money moved wrongly:
+Singapay refuses at the signature check, and the rows stayed owed.
+
+The cause is how Singapay checks a signature. It does not hash the body it received. It
+decodes the body to sort the keys and encodes it again with PHP's `json_encode`, which reads
+a number as a float and prints it in the fewest digits. `Amount` marshalled with two
+decimals, so the client signed `"amount":4000.00` while Singapay hashed `"amount":4000`.
+
+- **Production evidence:** on 2026-11-09 one seller's sub-account sent two transfers in the
+  same pass, with the same token, secret and destination. The 4000.42 one moved; the
+  4000.00 one was refused.
+- **PHP check:** PHP 8.3 `json_encode(json_decode($body, true))` rewrites 4000.00 as 4000
+  and 4000.10 as 4000.1, and leaves 4000.42 alone.
+
+What changed:
+
+- `Amount.MarshalJSON` writes the shortest exact form: `4000`, `4000.1`, `4000.42`, `0`.
+  The digits still come from the sen, never from a float64. `String()` still renders two
+  decimals for log lines.
+- Only `TransferRequest` sends an `Amount`; every other outbound amount is an `int64` and
+  was never affected. Code that marshals a decoded Singapay answer now writes its amounts
+  the same shortest way, and `UnmarshalJSON` reads either form.
+- **A fee ending in a zero sen digit was refused the same way.** For example 4000.10 or
+  3999.90. It now goes through too.
+- **Nothing to backfill.** The owed rows keep their derived `merchant_ref_no`
+  (`PF-<invoice>`), and Singapay never recorded the refused attempts. The next sweep
+  transfers them.
+
+Tests:
+
+- **A stand-in for Singapay's signature check.** It re-encodes the body before hashing.
+  It is first checked against production: it refuses the 4000.00 body production refused
+  and accepts the 4000.42 one.
+- **Transfers through the stand-in** for 4000, 4000.1, 4000.42, 3999.58 and 1. All are
+  refused on v0.10.2 except 4000.42 and 3999.58.
+- **A round-trip check:** every sen value from -Rp100 to Rp2.000, plus large totals,
+  marshals to bytes the re-encode leaves unchanged, and reads back as the same sen.
+- **A one-off PHP check:** 200,301 transfer bodies, checked once against PHP 8.3
+  `json_encode(json_decode())`, with both default and `JSON_UNESCAPED_*` flags, came back
+  byte-identical.
+
 ### Fixed — an e-wallet order whose account_id comes back as a number is read, not lost (v0.10.2)
 
 Singapay answers `POST /api/v2.0/ewallet-native/create-order` with `account_id` as its own

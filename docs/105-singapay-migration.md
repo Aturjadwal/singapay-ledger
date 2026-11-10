@@ -194,6 +194,13 @@ rekening.
 - `ENDPOINT` = path **termasuk query string**, tanpa domain.
 - `ACCESS_TOKEN` = token tanpa prefix `Bearer `.
 - Header wajib: `X-PARTNER-ID`, `Authorization: Bearer ...`, `X-Timestamp`, `X-Signature`.
+- **Angka di body harus ditulis dalam bentuk terpendek.** Untuk mengurutkan key (langkah 1),
+  Singapay men-decode body lalu meng-encode ulang dengan PHP `json_encode` sebelum
+  menghitung hash. Akibatnya `4000.00` di-hash sebagai `4000`, dan `4000.10` sebagai
+  `4000.1`. Body yang mengirim nol di belakang koma selalu ditolak `401 Unauthorized.
+  Invalid X-SIGNATURE`. Ini terbukti di production: Okt–Nov 2026, semua transfer platform
+  fee senilai rupiah bulat ditolak, sedangkan yang bersen (`4000.42`) lolos. Diperbaiki di
+  v0.10.3: `Amount.MarshalJSON` menulis `4000`, `4000.1`, `4000.42`.
 
 Wajib di: `POST /api/v2.0/disbursement/transfer`, `POST /api/v2.0/ewallet/trigger-topup`,
 `POST /api/v1.0/account-transfer/{account_id}/transfer`, QRIS issuer, Direct Debit charge.

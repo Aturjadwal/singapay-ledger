@@ -35,8 +35,10 @@ func TestCanonicalJSON(t *testing.T) {
 			want: `{"id":9007199254740993}`,
 		},
 		{
-			// The likelier failure, and the quieter one: a float64 round-trip
-			// rewrites 10000.00 as 10000 and 0.070 as 0.07.
+			// The hash covers the bytes on the wire. Singapay re-encodes the body
+			// before hashing it and would read these as 10000 and 0.07, so an
+			// outbound body must never be written this way. That is
+			// Amount.MarshalJSON's job, tested in transfer_test.go.
 			name: "decimals keep the form they were sent in",
 			in:   `{"a":10000.00,"b":0.070}`,
 			want: `{"a":10000.00,"b":0.070}`,

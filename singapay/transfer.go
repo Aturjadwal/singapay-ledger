@@ -43,8 +43,11 @@ type TransferRequest struct {
 	// an int64 here would silently drop it — leaving that fraction stranded in the seller's
 	// sub-account, which is precisely the divergence the balancing exists to prevent.
 	//
-	// Amount marshals to two decimals without going through float64, so 4000.16 is sent as
-	// 4000.16 rather than 4000.1599999999999.
+	// Amount marshals without going through float64, so 4000.16 is sent as 4000.16 rather
+	// than 4000.1599999999999. It writes the shortest form, so a whole rupiah is sent as
+	// 4000, not 4000.00. Singapay re-encodes the body before checking the signature, and a
+	// 4000.00 refused every whole-rupiah platform fee with 401 "Invalid X-SIGNATURE" (see
+	// [Amount.MarshalJSON]).
 	//
 	// Singapay rejects anything below 1: a transfer must be at least one rupiah, so a
 	// balanced platform fee that lands under Rp1 cannot be swept and must not be attempted.
