@@ -17,6 +17,8 @@ Dokumen ini menjelaskan seluruh tabel/entitas yang terlibat dalam operasional le
 | [SettlementNotification](#7-settlementnotification) | `settlement_notifications` | Inbox webhook settlement Singapay |
 | [Disbursement](#8-disbursement) | `disbursements` | Penarikan saldo seller ke rekening bank |
 | [Verification](#9-verification) | `ledger_verifications` | Verifikasi KYC seller |
+| [PlatformFeeReconciliation](#10-platformfeereconciliation) | `platform_fee_reconciliations` | Hitung ulang biaya platform kartu, satu baris per seller per putaran |
+| [PlatformFeeReconciliationItem](#11-platformfeereconciliationitem) | `platform_fee_reconciliation_items` | Satu baris per kartu per putaran |
 
 > **Dihapus pada 2026-09-13** oleh [migrasi 026](../database/migrations/026_settlement_cleanup_contract.sql):
 > `settlement_batches`, `settlement_items`, `reconciliation_discrepancies`. Ketiganya adalah
@@ -102,8 +104,10 @@ Entitas pusat yang merepresentasikan penjualan produk antara buyer dan seller. I
 | `transfer_request_id` | TEXT | Singapay request-id untuk transfer platform fee (dipakai ulang saat retry untuk idempotency) |
 | `completed_at` | TIMESTAMP | Waktu pembayaran dikonfirmasi webhook Singapay |
 | `settled_at` | TIMESTAMP | Waktu Singapay mengkonfirmasi dana sudah settle |
-| `settled_platform_fee` | BIGINT NULL | Platform fee setelah fee gateway sebenarnya diketahui. `NULL` = settle sebelum kolom ini ada, pakai `platform_fee`. **Bukan nol.** |
-| `settled_gateway_fee` | BIGINT NULL | Fee yang benar-benar diambil Singapay. `NULL` berarti sama |
+| `settled_platform_fee` | BIGINT NULL | Platform fee setelah fee gateway sebenarnya diketahui, **dalam sen**. Inilah yang dipindah sapuan. `NULL` = settle sebelum kolom ini ada, pakai `platform_fee`. **Bukan nol.** |
+| `settled_gateway_fee` | BIGINT NULL | Fee yang benar-benar diambil Singapay, dalam sen. `NULL` berarti sama |
+| `platform_residual` | BIGINT NULL | Bagian sen dari `settled_platform_fee` yang tidak muat di entri ledger rupiah: `settled_platform_fee = entri platform × 100 + platform_residual` |
+| `settled_fee_source` | VARCHAR(20) NULL | Asal tiga angka di atas (migrasi 032): `GATEWAY` (dilaporkan Singapay: VA, QRIS, e-wallet), `ESTIMATE` (salinan perkiraan checkout: kartu, payment link — sapuan menunggu), `BALANCE` (dihitung ulang dari saldo sub-akun seller), `MANUAL` (dikoreksi manual, SWIMLQ). `NULL` = settle sebelum migrasi 032, dibaca sebagai `GATEWAY` |
 | `metadata` | JSONB | Detail produk (photo_id, title, resolution, dll.) |
 | `created_at` | TIMESTAMP | Waktu pembuatan |
 | `updated_at` | TIMESTAMP | Waktu update terakhir |
@@ -141,7 +145,8 @@ SETTLED ──► REFUNDED
 > Kedua perpindahan yang menggerakkan uang — `PENDING → COMPLETED` di money-in webhook dan
 > `COMPLETED → SETTLED` di settling pass — dilakukan lewat `UpdateStatusIf`, sebuah
 > compare-and-set yang memegang row lock. Pemanggil yang kalah balapan rollback tanpa menulis
-> apa pun.
+> apa pun. Hitung ulang kartu (`settled_fee_source` `ESTIMATE → BALANCE`) memakai pola yang
+> sama lewat `SaveBalancedFeesIf`.
 
 ---
 
@@ -256,7 +261,7 @@ Event akuntansi atomik yang mengelompokkan satu atau lebih `ledger_entries`. Set
 | `PAYMENT_SUCCESS` | money-in webhook konfirmasi pembayaran | 3 entri: seller (PENDING), platform (PENDING), Singapay (PENDING) |
 | `SETTLEMENT` | Singapay mengkonfirmasi dana settle (per transaksi) | 2 entri per akun: debit PENDING, kredit AVAILABLE; plus pembersihan akun gateway |
 | `DISBURSEMENT` | Seller membuat permintaan penarikan | 1 entri: debit AVAILABLE seller |
-| `RECONCILIATION` | Penyesuaian saldo manual. Tidak ditulis kode mana pun saat ini; nilainya dipertahankan di CHECK constraint untuk baris historis | Bervariasi |
+| `RECONCILIATION` | Hitung ulang biaya platform kartu (`ReconcileCardPlatformFees`), satu journal per kartu dengan `source_type='PRODUCT_TRANSACTION'` | 0 atau 1 entri: `FEE_ADJUSTMENT` di AVAILABLE akun platform |
 | `MANUAL_ADJUSTMENT` | Koreksi manual oleh admin | Bervariasi |
 
 ### Catatan Penting
@@ -306,7 +311,8 @@ Catatan double-entry yang immutable. Setiap entri merepresentasikan debit atau k
 | `SETTLEMENT` | PENDING / AVAILABLE | Bervariasi | Entry settlement generik (legacy) |
 | `DISBURSEMENT` | AVAILABLE | Debit | Penarikan dari saldo AVAILABLE |
 | `RECONCILIATION` | AVAILABLE / PENDING | Bervariasi | Penyesuaian selisih |
-| `FEE_ADJUSTMENT` | AVAILABLE / PENDING | Bervariasi | Penyesuaian fee (koreksi selisih fee aktual vs yang dihitung) |
+| `FEE_ADJUSTMENT` | AVAILABLE | Bervariasi | Perubahan bagian rupiah biaya platform saat biaya platform kartu dihitung ulang (journal `RECONCILIATION`) atau dikoreksi manual (SWIMLQ). Baris PENDING lama berasal dari aturan settlement sebelumnya |
+| `DISBURSEMENT_REVERSAL` | AVAILABLE | Kredit | Pengembalian reservasi penarikan yang pasti tidak terjadi |
 
 ### Dua Bucket Saldo
 
@@ -561,6 +567,88 @@ PENDING ──► APPROVED
 
 ---
 
+## 10. PlatformFeeReconciliation
+
+**Tabel:** `platform_fee_reconciliations` (migrasi 032)
+
+Satu baris per seller per putaran hitung ulang biaya platform kartu. Kartu dibayar lewat
+payment link, dan Singapay tidak melaporkan fee per transaksi untuk payment link, jadi
+settlement menyalin perkiraan checkout (`settled_fee_source = 'ESTIMATE'`). Sebelum sapuan,
+bagian platform kartu seller dihitung dari saldo sub-akunnya. Insert-only; **semua nominal
+dalam sen**.
+
+### Fields
+
+| Field | Tipe | Keterangan |
+|---|---|---|
+| `uuid` | VARCHAR(255) PK | Identifier putaran seller |
+| `randid` | VARCHAR(255) UNIQUE | ID acak |
+| `seller_account_id` | VARCHAR(255) FK | Akun seller (`ledger_accounts`) |
+| `singapay_account_id` | VARCHAR(255) | ULID sub-akun yang ditanya |
+| `singapay_available` / `singapay_pending` / `singapay_held` | BIGINT NULL | Jawaban balance-inquiry. `NULL` bila tidak dibaca |
+| `seller_ledger_available` | BIGINT | Saldo AVAILABLE seller di ledger × 100 |
+| `certain_unswept_platform_fee` | BIGINT | Biaya platform yang sudah pasti tapi belum ditransfer |
+| `computed_platform_fee` | BIGINT NULL | `singapay_available − seller_ledger_available − certain_unswept_platform_fee` |
+| `nominal_platform_fee` | BIGINT | Biaya platform kartu-kartu itu sesuai harga |
+| `tolerance` | BIGINT | Selisih yang diizinkan: toleransi per kartu × jumlah kartu |
+| `card_count` | INT | Jumlah kartu (> 0) |
+| `outcome` | VARCHAR(20) | `APPLIED` atau `HELD` |
+| `hold_reason` | VARCHAR(50) NULL | `DEVIATION_ABOVE_TOLERANCE`, `DISBURSEMENT_IN_FLIGHT`, `BALANCE_READ_FAILED`; terisi tepat ketika `HELD` |
+| `raw_balance` | JSONB NULL | Jawaban balance-inquiry seperti yang didekode klien |
+| `created_at` | TIMESTAMP | Waktu putaran |
+
+### Catatan Penting
+
+- **APPLIED** ditulis dalam satu DB transaction dengan perubahan kartu, journal, dan entrinya.
+- **HELD** tidak menulis apa pun selain baris ini dan item-itemnya. Kartu tetap `ESTIMATE`,
+  tidak disapu, dan dicoba lagi di putaran berikutnya.
+- Putaran yang **SKIPPED** (ledger berubah saat saldo dibaca, atau kartu sudah diubah pihak
+  lain) dan yang **FAILED** tidak dicatat di sini, hanya di log dan hasil method.
+
+### Relasi
+
+- `N:1` ke `ledger_accounts` (seller)
+- `1:N` ke `platform_fee_reconciliation_items`
+
+---
+
+## 11. PlatformFeeReconciliationItem
+
+**Tabel:** `platform_fee_reconciliation_items` (migrasi 032)
+
+Satu baris per kartu per putaran. Pada putaran `HELD`, kolom hasil bernilai `NULL`. Semua
+nominal dalam sen.
+
+### Fields
+
+| Field | Tipe | Keterangan |
+|---|---|---|
+| `uuid` | VARCHAR(255) PK | Identifier item |
+| `randid` | VARCHAR(255) UNIQUE | ID acak |
+| `reconciliation_uuid` | VARCHAR(255) FK | Putaran seller-nya |
+| `product_transaction_uuid` | VARCHAR(255) FK | Transaksi kartunya |
+| `priced_platform_fee` | BIGINT | `platform_fee × 100` |
+| `previous_settled_gateway_fee` / `previous_settled_platform_fee` | BIGINT | Angka settle sebelum dihitung ulang |
+| `allocated_platform_fee` | BIGINT NULL | Bagian platform hasil hitung ulang |
+| `settled_gateway_fee` | BIGINT NULL | `total_charged × 100 − seller_net_amount × 100 − allocated_platform_fee` |
+| `platform_residual` | BIGINT NULL | `allocated_platform_fee − (allocated_platform_fee / 100) × 100` |
+| `journal_uuid` | VARCHAR(255) FK NULL | Journal `RECONCILIATION` |
+| `ledger_entry_uuid` | VARCHAR(255) FK NULL | Entri `FEE_ADJUSTMENT` akun platform; `NULL` bila bagian rupiahnya tetap |
+| `created_at` | TIMESTAMP | Waktu putaran |
+
+### Catatan Penting
+
+Index unik parsial `uq_platform_fee_reconciliation_items_applied` menjaga satu transaksi
+hanya sekali `APPLIED`. Kolom hasil diisi semua atau kosong semua (CHECK
+`platform_fee_reconciliation_items_applied_check`).
+
+### Relasi
+
+- `N:1` ke `platform_fee_reconciliations`
+- `N:1` ke `product_transactions`, `journals`, `ledger_entries`
+
+---
+
 ## Diagram Relasi
 
 ```
@@ -576,11 +664,15 @@ PENDING ──► APPROVED
       │                                          │
       ├──► ledger_verifications                  │
       │                                          │
-      └──► ledger_entries ◄── journals          │
-                                   │             │
-                                   └─────────────┘
-                             (source: product_transactions,
-                              disbursements, manual_adjustment)
+      ├──► ledger_entries ◄── journals          │
+      │                            │             │
+      │                            └─────────────┘
+      │                      (source: product_transactions,
+      │                       disbursements, manual_adjustment)
+      │
+      └──► platform_fee_reconciliations ──► platform_fee_reconciliation_items
+                                              (──► product_transactions,
+                                                   journals, ledger_entries)
 ```
 
 `settlement_notifications` sengaja berdiri sendiri tanpa FK: sebuah notifikasi tidak memiliki
@@ -633,13 +725,13 @@ SettlementNotification (PENDING)               │
                           ▼
         satu DB transaction per ProductTransaction:
           ProductTransaction (SETTLED)        ← compare-and-set, statement pertama
-            + settled_platform_fee / settled_gateway_fee
+            + settled_platform_fee / settled_gateway_fee / platform_residual
+            + settled_fee_source: GATEWAY (fee dilaporkan) atau ESTIMATE (kartu, payment link)
             + Journal (SETTLEMENT)            ← metadata = jejak audit fee aktual
             + LedgerEntry:
                 seller   PENDING -net,  AVAILABLE +net
-                platform PENDING -fee,  AVAILABLE +fee
+                platform PENDING -fee,  AVAILABLE +fee yang sudah diseimbangkan (lihat 104)
                 gateway  PENDING -gateway_fee   (dibersihkan, tanpa AVAILABLE)
-                FEE_ADJUSTMENT bila fee aktual ≠ fee ekspektasi (lihat 104)
                           │
                           ▼
             SettlementNotification (PROCESSED)
@@ -668,18 +760,39 @@ Disbursement (COMPLETED)
     Dana masuk ke rekening bank seller
 ```
 
-### 4. Transfer Platform Fee
+### 4. Hitung Ulang Biaya Platform Kartu, lalu Transfer Platform Fee
+
+Urutannya: settling pass → hitung ulang kartu → sapuan. Rinciannya di
+[104](./104-fee-mismatch-reconciliation.md#card-payments-recomputed-from-the-sub-account-balance).
 
 ```
-[background job: ProcessPlatformFeeTransfer]
+[ReconcileCardPlatformFees]  per seller yang punya kartu ESTIMATE
+    │
+    ├─ 1 statement: saldo AVAILABLE seller, biaya platform pasti yang belum ditransfer,
+    │               payout PENDING/PROCESSING, daftar kartu
+    ├─ payout sedang berjalan        → HELD DISBURSEMENT_IN_FLIGHT
+    ├─ balance-inquiry Singapay gagal → HELD BALANCE_READ_FAILED
+    ├─ baca ulang; ledger berubah     → SKIPPED (tidak dicatat)
+    ├─ bagian kartu = available − AVAILABLE seller × 100 − biaya pasti
+    │     selisih dari harga > Rp100/kartu, atau negatif → HELD DEVIATION_ABOVE_TOLERANCE
+    │
+    ▼ APPLIED, satu DB transaction:
+ProductTransaction ESTIMATE → BALANCE    ← compare-and-set, statement pertama
+    + Journal (RECONCILIATION) per kartu
+    + LedgerEntry platform AVAILABLE ±FEE_ADJUSTMENT (bila bagian rupiahnya berubah)
+    + PlatformFeeReconciliation + PlatformFeeReconciliationItem
+
+[ProcessPlatformFeeTransfer]
     │
     ▼
 Cari ProductTransaction dengan:
     status = SETTLED
     platform_fee_transferred = false
+    platform_fee > 0
+    COALESCE(settled_fee_source, 'GATEWAY') <> 'ESTIMATE'
     │
     ▼
-Transfer via Singapay intra sub-account API
+Transfer settled_platform_fee via Singapay intra sub-account API
     │
     ▼
 ProductTransaction.platform_fee_transferred = true

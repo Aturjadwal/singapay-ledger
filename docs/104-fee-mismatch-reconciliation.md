@@ -12,7 +12,10 @@ and `ActualGatewayFee` (what Singapay actually took) disagree.
 > **Virtual account, QRIS and e-wallet report their own fee. Payment link reports none.** For
 > a payment link the actual fee is copied from the estimate, which makes `feeDelta` zero
 > by construction — that is the absence of a reconciliation, not a perfect one, and
-> `FeeReported` is what keeps the two distinguishable.
+> `FeeReported` is what keeps the two distinguishable. Settlement records it as
+> `settled_fee_source = 'ESTIMATE'`, and a **card** payment — a payment link pinned to the
+> card methods — is reconciled after settlement, from the seller's sub-account balance:
+> see [Card payments](#card-payments-recomputed-from-the-sub-account-balance).
 
 The arithmetic below is what `resolveFeeAdjustment` in [`settlement.go`](../settlement.go)
 implements.
@@ -116,6 +119,7 @@ not a drift. The seller's two balances agree exactly, with no residual at all.
 | `feeDelta` | `ActualGatewayFee - EstimatedGatewayFee`, in sen |
 | `SettledPlatformFee` | `PlatformFee - feeDelta` — the balanced figure the sweep moves |
 | `FeeReported` | whether `ActualGatewayFee` is a fact or a copy of the estimate (false for payment link) |
+| `settled_fee_source` | where the settled figures came from: `GATEWAY` (reported), `ESTIMATE` (copied), `BALANCE` (recomputed from the sub-account), `MANUAL` (corrected by hand). `NULL` predates migration 032 and reads as `GATEWAY` |
 
 ---
 
@@ -243,6 +247,113 @@ seller still ends at exactly 13,000.
 
 ---
 
+## Card payments: recomputed from the sub-account balance
+
+A card payment settles on the estimate, like any payment link: Singapay reports no fee for
+it, so `FeeMinor` is the checkout's `GatewayFee × 100` and `feeDelta` is zero. The estimate
+is whole rupiah; Singapay takes 3% + Rp2.000 to the sen. On SWIMLQ (2026-09-25) the
+checkout quoted 4,041 and Singapay took 4,041.24, so the seller's sub-account held 3,999.76
+for a 4,000.00 sweep, and Singapay refused the sweep (422 Insufficient remitter account
+balance) once the seller had withdrawn everything else.
+
+### Where the real fee is
+
+Nowhere per transaction — but the seller's sub-account balance contains every real fee.
+Everything else in it is accounted for:
+
+- the seller's own money is exactly their ledger balance (the rule at the top: a seller is
+  paid what they were priced), and
+- a platform fee that is final — Singapay reported it, an earlier round recomputed it, or a
+  person corrected it — and not yet swept is known to the sen.
+
+So, per seller, in sen:
+
+```
+card platform share = sub-account available            (balance inquiry)
+                    − seller AVAILABLE in the ledger × 100
+                    − final platform fee not yet transferred
+```
+
+"Final" is `SETTLED`, `platform_fee_transferred = false`, `settled_fee_source` not
+`ESTIMATE`, at `COALESCE(settled_platform_fee, platform_fee × 100)`. A card made `BALANCE`
+in an earlier round whose transfer has not succeeded counts here, so its share is never
+taken twice. The ledger side is read in **one statement**, so the balance and the fees are
+from the same moment even if a settlement pass commits alongside.
+
+### The round
+
+`LedgerClient.ReconcileCardPlatformFees` runs after the settlement pass and before
+`ProcessPlatformFeeTransfer`, which leaves `ESTIMATE` rows alone. The candidates are
+`SETTLED`, untransferred, `ESTIMATE`, channel `CREDIT_CARD`, `GATEWAY_ON_CUSTOMER`, with a
+platform fee, sold by a seller account. A subscription (payment link, `GATEWAY_ON_SELLER`,
+no platform fee) is not one, and virtual account, QRIS and e-wallet are untouched.
+
+For each seller with candidates:
+
+1. Read the ledger side and the cards (one statement).
+2. **Hold** `DISBURSEMENT_IN_FLIGHT` if a payout is `PENDING` or `PROCESSING`: the ledger has
+   debited it and Singapay may not have.
+3. Ask Singapay for the sub-account's `available_balance`. **Hold** `BALANCE_READ_FAILED` if
+   that fails.
+4. Read the ledger side again. A payout that started holds the round; any other change
+   **skips** it, unrecorded: the balance may be from before the change or after it.
+5. Compute the share. **Hold** `DEVIATION_ABOVE_TOLERANCE` if it is negative, or further from
+   the cards' priced platform fee than Rp100 per card (configurable:
+   `CardPlatformFeeReconciliationOptions.TolerancePerCardMinor`). Money the ledger has not
+   booked yet, or booked money Singapay has not made available yet, lands here.
+6. Otherwise split it over the cards in proportion to what the checkout formula expects
+   each to leave the platform — `total_charged×100 − seller_net_amount×100 − (3% ×
+   total_charged×100 + 200000)` — largest remainder first for the leftover sen, so the parts
+   sum to the total exactly. And write, in **one** database transaction:
+   - first, per card, the conditional update `ESTIMATE → BALANCE` (`SaveBalancedFeesIf`,
+     the reconciliation's `UpdateStatusIf`): `settled_platform_fee = share`,
+     `settled_gateway_fee = total_charged×100 − seller_net_amount×100 − share`,
+     `platform_residual = share − (share / 100) × 100`. A card that no longer matches what
+     was read rolls the seller back, unrecorded;
+   - the round's `platform_fee_reconciliations` row;
+   - a `RECONCILIATION` journal per card, sourced on the transaction;
+   - a `FEE_ADJUSTMENT` entry on the platform's `AVAILABLE` bucket for
+     `share / 100 − previous / 100` rupiah where that is not zero, sourced on the
+     transaction so it lands on that transaction's line of the platform statement, through
+     `SaveBatch` (running balance and cached balance kept right);
+   - one `platform_fee_reconciliation_items` row per card.
+
+A held round writes its row and one item per card with empty results, nothing else. The
+cards stay `ESTIMATE`, unswept, and the next round tries again; a second round over cards
+already `BALANCE` finds nothing to do.
+
+### SWIMLQ, replayed
+
+| | |
+|---|---|
+| Sub-account available (balance inquiry, 2026-11-11) | 3,999.76 |
+| Seller AVAILABLE in the ledger (after withdrawing 407,900) | 0 |
+| Final unswept platform fee | 0 |
+| **Card platform share** | **3,999.76** (priced 4,000.00 — 24 sen off, within Rp100) |
+| `settled_gateway_fee` | 6,804,100 − 6,000,000 − 399,976 = 404,124 (4,041.24) |
+| `platform_residual` | 76 |
+| Platform `FEE_ADJUSTMENT` | 3,999 − 4,000 = **−1** |
+
+The same figures the manual correction of 2026-11-11 wrote by hand. That correction left the
+row `MANUAL` (migration 032 marks it), so the round leaves it alone and counts its 3,999.76
+as a final fee until the sweep moves it.
+
+### What it cannot see
+
+- **Held balance.** Whether Singapay's `held_balance` is already inside `available_balance`
+  is not documented (see `singapay/balance.go`). The round uses `available_balance` as it
+  is; held money counted there would read as a deviation and be stopped by the tolerance.
+- **A payment link that carries a platform fee.** It would settle `ESTIMATE` and is not a
+  card, so it is neither swept nor reconciled. The consuming service refuses an empty
+  channel for bookings and voucher purchases; only subscriptions go through a payment link,
+  and they carry no platform fee.
+- **A concurrent sweep of the same seller.** A transfer that Singapay executes before the
+  balance inquiry but that is marked transferred only after the second read makes the share
+  too small by that fee. The tolerance stops it unless the seller has about 40 cards in one
+  round; the consuming service runs the sweep after this, in the same process.
+
+---
+
 ## Entry Type Reference
 
 | EntryType | Bucket | Direction | Event |
@@ -254,10 +365,13 @@ seller still ends at exactly 13,000.
 | `SETTLEMENT_NET` | AVAILABLE | + | Phase 3: settlement |
 | `SETTLEMENT` | PENDING | - | Phase 3: clear Singapay PENDING |
 | `DISBURSEMENT` | AVAILABLE | - | Seller withdrawal |
+| `FEE_ADJUSTMENT` | AVAILABLE | ± | Card platform fee recomputed (Platform; `RECONCILIATION` journal) |
 
-`FEE_ADJUSTMENT` is no longer written. It stays in the `CHECK` constraint and in
-`domain.EntryType` because `ledger_entries` is insert-only and rows booked under the old
-rules carry it — a reader that cannot name it cannot read its own history.
+Settlement no longer writes `FEE_ADJUSTMENT`: the platform's two settlement legs carry the
+delta. The card reconciliation writes it on the platform's `AVAILABLE` bucket when a card's
+whole-rupiah platform share changes, and the manual SWIMLQ correction wrote one by hand
+(`MANUAL_ADJUSTMENT` journal). Older `PENDING` rows from the previous rules remain, since
+`ledger_entries` is insert-only.
 
 ---
 

@@ -4,6 +4,90 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added — card platform fees are recomputed from the seller's sub-account balance before the sweep (v0.11.0)
+
+A card payment's platform fee was swept on the checkout estimate. Singapay reports no fee for
+a payment link, and a card payment is one, so settlement copies the gateway fee quoted at
+checkout — whole rupiah — while Singapay takes 3% + Rp2.000 to the sen. When it took more,
+the seller's sub-account held a few sen less than the ledger, and the sweep was refused
+(422 Insufficient remitter account balance) once the seller had withdrawn the rest:
+INV-20260925161538-SWIMLQ, booked 4041.00, taken 4041.24, 3999.76 left for a 4000.00
+transfer, corrected by hand on 2026-11-11.
+
+The sub-account balance is the one figure that contains Singapay's real cut. Per seller, in sen:
+
+```
+card platform share = sub-account available − seller AVAILABLE × 100 − final unswept platform fee
+```
+
+What changed:
+
+- **`product_transactions.settled_fee_source`** (migration 032): `GATEWAY` when Singapay
+  reported the fee, `ESTIMATE` when settlement copied the estimate, `BALANCE` once
+  recomputed, `MANUAL` for a hand correction; `NULL` (settled before 032) reads as
+  `GATEWAY`. `bookSettlement` writes it with the figures, and its journal records it.
+- **The sweep leaves `ESTIMATE` rows alone.** `GetSettledWithoutPlatformFeeTransfer` adds
+  `COALESCE(settled_fee_source, 'GATEWAY') <> 'ESTIMATE'`. VA, QRIS and e-wallet are swept as
+  before.
+- **`LedgerClient.ReconcileCardPlatformFees(ctx, CardPlatformFeeReconciliationOptions)`**, to
+  run after the settlement pass and before `ProcessPlatformFeeTransfer`. For each seller with
+  cards on the estimate (`SETTLED`, untransferred, `CREDIT_CARD`, `GATEWAY_ON_CUSTOMER`, a
+  platform fee):
+  - the ledger side is read in one statement, the sub-account balance is asked for
+    (`GetAccountBalance`, used for the first time), and the ledger side is read again;
+  - **HELD**, recorded, nothing else written: a payout in `PENDING`/`PROCESSING`
+    (`DISBURSEMENT_IN_FLIGHT`), a failed balance inquiry (`BALANCE_READ_FAILED`), or a share
+    that is negative or further than Rp100 per card from the priced fee
+    (`DEVIATION_ABOVE_TOLERANCE`; `TolerancePerCardMinor` configures it);
+  - **SKIPPED**, not recorded: the ledger moved between the two reads, or a card changed
+    before the write;
+  - **APPLIED**: the share is split over the cards by the checkout formula (largest
+    remainder for the leftover sen, the parts summing exactly), and one database transaction
+    writes each card's conditional `ESTIMATE → BALANCE` update first (`SaveBalancedFeesIf`),
+    then the round's row, a `RECONCILIATION` journal per card, the platform's `AVAILABLE`
+    `FEE_ADJUSTMENT` entry where the whole-rupiah part changed (through `SaveBatch`), and an
+    item per card.
+  - The result lists every seller with its outcome, reason, figures and invoices.
+- **Tables** `platform_fee_reconciliations` (one row per seller per round) and
+  `platform_fee_reconciliation_items` (one per card; a unique partial index keeps a card to
+  one `APPLIED` item), migration 032. **Index** `idx_product_transactions_fee_estimate`,
+  migration 033 (`CONCURRENTLY`, on its own).
+- `domain`: `SettledFeeSource`, `CardFeeSnapshot`, `ComputeCardPlatformFees`,
+  `AllocateProportionally`, `NewPlatformFeeAdjustmentEntry`, and the two entities.
+  `ProductTransactionRepository.SaveSettledFees` takes the source; `SaveBalancedFeesIf` is
+  new. `RepositoryProvider` and `Tx` gain `PlatformFeeReconciliation()`.
+- `schema.sql`: the column, tables and index, and the `entry_type` CHECK brought in line with
+  migrations 012 and 015 — it lacked `FEE_ADJUSTMENT` and `DISBURSEMENT_REVERSAL`, so a
+  database built from it refused both.
+
+**Order:** apply 032 before the consuming service deploys this version, with no 13:00 WIB
+settlement pass in between (a card the old code settles after the backfill stays `NULL`, and
+`NULL` is swept on the estimate); re-run 032 right before the deploy if one did. Then 033.
+032 is idempotent and may be run again after the deploy.
+
+Replayed against the 2026-10-22 production data with the 11-10 withdrawal and the balance
+Singapay answered on 11-11 (3999.76), a round writes exactly what the manual correction
+wrote: 399976 / 404124 / 76 and a −1 `FEE_ADJUSTMENT`. With the correction in place
+(`MANUAL`), it touches nothing.
+
+Tests:
+
+- **Domain:** the checkout formula, the split (largest remainder, ties, exact sums, no
+  overflow), the residual, the tolerance boundary, a negative share, the fallback weights.
+- **Rounds over the fakes**, with a Singapay that keeps the sub-account's real balance and a
+  sweep that is refused when it asks for more: SWIMLQ before and after the manual
+  correction; 14 cards and a QRIS; 15 cards (each share within two sen of what Singapay left,
+  the sub-account equal to the ledger once swept); a card settled in the ledger but not
+  available at Singapay, and unbooked money (both held); a payout in flight; a failed balance
+  read; a held round applied later; yesterday's `BALANCE` card counted as final today; a
+  second round that changes nothing; the ledger moving during the read; a payout starting
+  during it; a lost race; every other channel left alone.
+- **Repositories (sqlmock):** each new and changed statement; `TestInsertStatementsHaveMatchingArity`
+  covers the two new `INSERT`s.
+- **Against PostgreSQL** (`LEDGER_TEST_DATABASE_URL`): a whole round with its constraints,
+  running balance and unique index; a held round; a rollback that undoes the first card's
+  update when the second card changed.
+
 ### Fixed — a platform-fee transfer of a whole rupiah is no longer refused for its signature (v0.10.3)
 
 Every platform-fee transfer whose amount was a whole rupiah failed with `singapay: http 401:

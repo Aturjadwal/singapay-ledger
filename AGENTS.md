@@ -15,7 +15,8 @@ workers and the commands; this repo owns the ledger and every table under it.
 
 **This package owns its tables.** `ledger_accounts`, `product_transactions`,
 `payment_requests`, `journals`, `ledger_entries`, `settlement_notifications`, `disbursements`,
-`fee_configs`, `ledger_verifications`.
+`fee_configs`, `ledger_verifications`, `platform_fee_reconciliations`,
+`platform_fee_reconciliation_items`.
 
 A consumer that needs data from them gets a method on `LedgerClient`. It does not write SQL of
 its own against them — that puts the consumer's `SELECT` and this package's state machine on
@@ -34,6 +35,7 @@ separate copies of the same rules, and the copies drift.
 ├── webhook.go             # Inbound webhook verification and booking
 ├── settlement.go          # Settlement inbox + the per-transaction settling pass
 ├── settlement_transactions.go # What one settlement batch covered, read back from Singapay
+├── platform_fee_reconciliation.go # Card platform fees recomputed from the sub-account balance
 ├── gateway.go             # PaymentGateway interface and channel mapping
 ├── domain.go, response.go # Re-exports and response shapes
 ├── dummy.go               # Local seeder. Not used in production.
@@ -44,7 +46,7 @@ separate copies of the same rules, and the copies drift.
 ├── analytics/             # Read-side queries
 ├── database/
 │   ├── schemas/schema.sql # The current shape of the database
-│   └── migrations/        # Ordered: 001_*.sql .. 030_*.sql
+│   └── migrations/        # Ordered: 001_*.sql .. 033_*.sql
 ├── docs/                  # Reference docs — see §7
 └── cmd/singapay-smoke/    # Verifies a Singapay connection end to end
 ```
@@ -60,8 +62,10 @@ Dependency direction: `singapay/` and `domain/` know nothing above them; `repo/`
 GeneratePayment      -> product_transactions PENDING + payment_requests (instrument issued)
 money-in webhook     -> PENDING -> COMPLETED, funds credited to the PENDING bucket
 settlement pass      -> COMPLETED -> SETTLED, PENDING bucket moves to AVAILABLE
+                        (a card's fee figures are the checkout estimate: settled_fee_source ESTIMATE)
+card reconciliation  -> ESTIMATE -> BALANCE, from the seller's sub-account balance
 Withdraw             -> AVAILABLE debited, disbursement sent (WithdrawFromPlatform: the same, from the platform account)
-platform-fee sweep   -> platform's cut transferred between Singapay sub-accounts
+platform-fee sweep   -> platform's cut transferred between Singapay sub-accounts (not ESTIMATE rows)
 ```
 
 Two balance buckets, per account: `PENDING` (captured, not yet settled) and `AVAILABLE`
@@ -83,6 +87,10 @@ written nothing. Both money-moving transitions use it:
 
 - `PENDING → COMPLETED` in `webhook.go` (money-in)
 - `COMPLETED → SETTLED` in `settlement.go` (`bookSettlement`)
+
+The card reconciliation's `ESTIMATE → BALANCE` (`SaveBalancedFeesIf`, in
+`platform_fee_reconciliation.go`) follows the same rule: every card's conditional update
+comes first in the seller's transaction, and one that matches nothing rolls the seller back.
 
 Never stamp the in-memory entity first and save it after. The row in the database is what
 decides, and an in-memory answer is a second answer to the same question — the one that is

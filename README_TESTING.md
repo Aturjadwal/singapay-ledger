@@ -17,6 +17,9 @@ conversion, a `FILTER`, a join that must add up to the statement — so their sc
 twice: against the fakes, always, and against a real database when one is named. So does the
 settlement listing's (`settlement_transactions_test.go`), for its batch lookups by invoice
 number and gateway identifier.
+The card platform-fee reconciliation (`platform_fee_reconciliation_postgres_test.go`) runs its
+snapshot statement, conditional update, constraints and a real rollback against PostgreSQL too;
+its scenarios run against the fakes in `platform_fee_reconciliation_test.go`.
 `CreateAccount`'s creation lock (`account_create_postgres_test.go`: 24 callers at once, a refused
 holder, a Singapay timeout, a short server idle limit) and `TransactReadCommitted`
 (`repo/transact_postgres_test.go`) need a real database and real concurrency, so they run only

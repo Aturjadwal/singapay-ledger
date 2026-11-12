@@ -366,11 +366,31 @@ stuck, err := client.GetPendingDisbursements(ctx, time.Now().Add(-2*time.Hour), 
 resp, err := client.RetryDisbursement(ctx, disbursementID)
 ```
 
+### Card platform fees — before the sweep
+
+```go
+// After the settlement pass, before ProcessPlatformFeeTransfer.
+result, err := client.ReconcileCardPlatformFees(ctx, ledger.CardPlatformFeeReconciliationOptions{})
+// result.Applied, result.Held, result.Skipped, result.Failed; result.Sellers says why.
+```
+
+Singapay reports no fee for a payment link, and a card payment is one, so settlement books a
+card on the checkout estimate (`settled_fee_source = 'ESTIMATE'`) and the sweep leaves it
+alone. This recomputes each seller's card platform share from the sub-account balance —
+`available − seller AVAILABLE × 100 − final unswept platform fee` — splits it over the
+cards, and makes them `BALANCE`, which the sweep then moves. A round is **held** (recorded,
+nothing else written) while a payout is in flight, when the balance inquiry fails, or when
+the share is more than Rp100 per card from the priced fee (`TolerancePerCardMinor`); the
+next round tries again. See [docs/104](docs/104-fee-mismatch-reconciliation.md#card-payments-recomputed-from-the-sub-account-balance).
+
 ### Platform fee transfer
 
 ```go
 result, err := client.ProcessPlatformFeeTransfer(ctx, 50)
 ```
+
+A row whose `settled_fee_source` is `ESTIMATE` is not swept until `ReconcileCardPlatformFees`
+has recomputed it.
 
 Its input is `SETTLED` transactions whose platform fee has not been swept. It moves the
 balanced fee, sen included (see [docs/104](docs/104-fee-mismatch-reconciliation.md)), from
@@ -584,7 +604,8 @@ Requires PostgreSQL. Schema is in [`database/schemas/schema.sql`](database/schem
 migrations are in [`database/migrations/`](database/migrations/).
 
 Key tables: `ledger_accounts`, `product_transactions`, `payment_requests`, `ledger_entries`,
-`journals`, `settlement_notifications`, `fee_configs`, `disbursements`.
+`journals`, `settlement_notifications`, `fee_configs`, `disbursements`,
+`platform_fee_reconciliations`, `platform_fee_reconciliation_items`.
 
 Removing the batch reconciler's tables is a **two-phase migration**, because
 `payment_requests.status` is `NOT NULL` and the new code no longer supplies it:
@@ -600,6 +621,13 @@ Removing the batch reconciler's tables is a **two-phase migration**, because
 [`030_product_transactions_paid_day_index.sql`](database/migrations/030_product_transactions_paid_day_index.sql)
 indexes the paid transactions by payment time for the platform statistics. It is one
 `CREATE INDEX CONCURRENTLY`: run it on its own, outside a transaction (the file says how).
+
+[`032_card_platform_fee_reconciliation.sql`](database/migrations/032_card_platform_fee_reconciliation.sql)
+adds `settled_fee_source` with its backfill and the card reconciliation's two tables. Apply it
+**before** deploying v0.11.0, with no 13:00 WIB settlement pass in between (re-run it right
+before the deploy if one ran; it is idempotent).
+[`033_product_transactions_fee_estimate_index.sql`](database/migrations/033_product_transactions_fee_estimate_index.sql)
+is its index, `CONCURRENTLY`, on its own, after 032.
 
 ### Migrating an existing database
 
@@ -632,6 +660,7 @@ neither take a payment nor pay out, and the code refuses both explicitly.
 | `Withdraw`, `WithdrawFromPlatform` | `POST /api/v2.0/disbursement/check-fee` then `.../transfer` |
 | `RetryDisbursement` | `POST /api/v2.0/disbursement/inquiry-status` |
 | `HandleDisbursementNotification` | `disbursement_notif_url` webhook |
+| `ReconcileCardPlatformFees` | `GET /api/v1.0/balance-inquiry/{id}` (the seller's sub-account) |
 | `ProcessPlatformFeeTransfer` | `POST /api/v1.0/account-transfer/{id}/transfer` |
 | `ListSettlementTransactions`, `ReadSettlementListing` | `GET /api/v1.0/settlement-transactions/{id}` (read only) |
 | `GetBalance` (verification) | `GET /api/v1.0/balance-inquiry/{id}` |
