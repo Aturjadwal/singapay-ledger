@@ -161,6 +161,11 @@ type ProductTransactionRepository interface {
 	UpdateStatusIf(ctx context.Context, id string, from, to TransactionStatus, timestamp time.Time) (bool, error)
 	SaveTransferRequestID(ctx context.Context, id string, requestID string) error
 	MarkPlatformFeeTransferred(ctx context.Context, id string) error
+
+	// GetSettledWithoutPlatformFeeTransfer returns what the platform-fee sweep owes: SETTLED,
+	// not transferred, with a platform fee, oldest settlement first — except rows whose
+	// settled_fee_source is ESTIMATE. Their figures are still the checkout estimate, and a
+	// card's are replaced by ReconcileCardPlatformFees first; NULL is read as GATEWAY.
 	GetSettledWithoutPlatformFeeTransfer(ctx context.Context, limit int) ([]*ProductTransaction, error)
 
 	// GetAwaitingSettlement returns COMPLETED transactions whose funds have not settled
@@ -169,14 +174,28 @@ type ProductTransactionRepository interface {
 	// the transactions the batch covered.
 	GetAwaitingSettlement(ctx context.Context, limit int) ([]*ProductTransaction, error)
 
-	// SaveSettledFees records what the fees turned out to be, IN SEN. Called inside the
-	// same transaction as the status move, so a transaction never reaches SETTLED with the
-	// figures the transfer step reads still unset.
+	// SaveSettledFees records what the fees turned out to be, IN SEN, and where they came
+	// from. Called inside the same transaction as the status move, so a transaction never
+	// reaches SETTLED with the figures the transfer step reads still unset.
 	//
 	// residualMinor is the sub-rupiah part of platformFeeMinor — the part the ledger entry
 	// could not carry. Passing it here rather than deriving it later keeps the figure the
 	// settling pass actually decided, instead of one recomputed from a rounded entry.
-	SaveSettledFees(ctx context.Context, id string, platformFeeMinor, gatewayFeeMinor, residualMinor int64) error
+	//
+	// source is GATEWAY when Singapay reported the fee and ESTIMATE when settlement copied
+	// the checkout estimate; the sweep leaves an ESTIMATE row alone (migration 032).
+	SaveSettledFees(ctx context.Context, id string, platformFeeMinor, gatewayFeeMinor, residualMinor int64, source SettledFeeSource) error
+
+	// SaveBalancedFeesIf replaces an estimated settlement's fee figures with the ones
+	// ReconcileCardPlatformFees computed, and marks them BALANCE — only while the row is
+	// still SETTLED, not transferred, ESTIMATE, and carries the figures the reconciliation
+	// read (prevPlatformFeeMinor and prevGatewayFeeMinor; nil means NULL). It reports whether
+	// the row moved.
+	//
+	// It is the reconciliation's compare-and-set, as UpdateStatusIf is settlement's: the FIRST
+	// statement of its database transaction, taking the row lock. false means another round,
+	// or a person, changed the row first, and the caller rolls back having written nothing.
+	SaveBalancedFeesIf(ctx context.Context, id string, prevPlatformFeeMinor, prevGatewayFeeMinor *int64, platformFeeMinor, gatewayFeeMinor, residualMinor int64) (bool, error)
 
 	// OldestAwaitingSettlement returns when the oldest unsettled COMPLETED transaction
 	// was completed, and false when there are none.

@@ -317,6 +317,35 @@ func NewFeeAdjustmentCreditEntry(
 	return entry
 }
 
+// NewPlatformFeeAdjustmentEntry moves the platform's AVAILABLE balance by the change in the
+// whole-rupiah part of a transaction's settled platform fee, when that fee is recomputed after
+// settlement (ReconcileCardPlatformFees):
+//
+//	platform account  ±amount  AVAILABLE  FEE_ADJUSTMENT
+//
+// amount is signed, whole rupiah: new_fee/100 − old_fee/100. Sourced on the product
+// transaction, so the platform statement's line for that transaction — the sum of the
+// platform's entries for it — shows the recomputed fee. The manual SWIMLQ correction of
+// 2026-11-11 wrote the same entry (−1) by hand.
+func NewPlatformFeeAdjustmentEntry(
+	journalUUID string,
+	productTransactionID string,
+	platformAccountID string,
+	amount int64,
+) *LedgerEntry {
+	entry := &LedgerEntry{
+		JournalUUID:   journalUUID,
+		AccountUUID:   platformAccountID,
+		Amount:        amount,
+		BalanceBucket: BalanceBucketAvailable,
+		EntryType:     EntryTypeFeeAdjustment,
+		SourceType:    SourceTypeProductTransaction,
+		SourceID:      productTransactionID,
+	}
+	redifu.InitRecord(entry)
+	return entry
+}
+
 // NewDisbursementEntry creates the AVAILABLE debit entry for a seller withdrawal
 // (Optional Phase — Seller Withdrawal).
 //

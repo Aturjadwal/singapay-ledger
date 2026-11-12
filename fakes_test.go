@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lib/pq"
+
 	"github.com/Aturjadwal/singapay-ledger/domain"
 	"github.com/Aturjadwal/singapay-ledger/repo"
 )
@@ -267,13 +269,30 @@ type FakeProductTransactionRepository struct {
 	// the Postgres query reads ledger_entries. NewFakeRepositoryProvider wires it; a
 	// repository built on its own reports every credit as zero.
 	ledgerEntries *FakeLedgerEntryRepository
+
+	// feeSources is settled_fee_source, which the domain type does not carry: the
+	// repository's generic reads do not select it. Absent is NULL.
+	feeSources map[string]domain.SettledFeeSource
+
+	// beforeBalancedCAS, when set, runs once immediately before SaveBalancedFeesIf compares:
+	// how a test lands a concurrent change between the reconciliation's read and its write.
+	beforeBalancedCAS func()
 }
 
 func NewFakeProductTransactionRepository() *FakeProductTransactionRepository {
 	return &FakeProductTransactionRepository{
 		transactions: make(map[string]*domain.ProductTransaction),
 		byInvoice:    make(map[string]*domain.ProductTransaction),
+		feeSources:   make(map[string]domain.SettledFeeSource),
 	}
+}
+
+// feeSource is the row's settled_fee_source as the sweep reads it: NULL is GATEWAY.
+func (f *FakeProductTransactionRepository) feeSource(id string) domain.SettledFeeSource {
+	if source, ok := f.feeSources[id]; ok {
+		return source
+	}
+	return domain.SettledFeeSourceGateway
 }
 
 // detach copies a stored transaction on the way out, the way a real read does.
@@ -593,10 +612,20 @@ func (f *FakeProductTransactionRepository) updateStatusIf(id string, from, to do
 }
 
 func (f *FakeProductTransactionRepository) SaveTransferRequestID(ctx context.Context, id string, requestID string) error {
+	if tx, ok := f.transactions[id]; ok {
+		tx.TransferRequestID = requestID
+	}
 	return nil
 }
 
 func (f *FakeProductTransactionRepository) MarkPlatformFeeTransferred(ctx context.Context, id string) error {
+	tx, ok := f.transactions[id]
+	if !ok {
+		return repo.ErrNotFound
+	}
+	now := time.Now()
+	tx.PlatformFeeTransferred = true
+	tx.PlatformFeeTransferredAt = &now
 	return nil
 }
 
@@ -617,11 +646,33 @@ func (f *FakeProductTransactionRepository) GetAwaitingSettlement(ctx context.Con
 	return result, nil
 }
 
+// GetSettledWithoutPlatformFeeTransfer is the sweep's query: SETTLED, not transferred, with a
+// platform fee, not ESTIMATE (NULL read as GATEWAY), oldest settlement first.
 func (f *FakeProductTransactionRepository) GetSettledWithoutPlatformFeeTransfer(ctx context.Context, limit int) ([]*domain.ProductTransaction, error) {
-	return nil, nil
+	var owed []*domain.ProductTransaction
+	for _, tx := range f.transactions {
+		if tx.Status != domain.TransactionStatusSettled || tx.PlatformFeeTransferred || tx.Fee.PlatformFee <= 0 {
+			continue
+		}
+		if f.feeSource(tx.UUID) == domain.SettledFeeSourceEstimate {
+			continue
+		}
+		owed = append(owed, detach(tx))
+	}
+	sort.Slice(owed, func(i, j int) bool {
+		a, b := owed[i].SettledAt, owed[j].SettledAt
+		if a != nil && b != nil && !a.Equal(*b) {
+			return a.Before(*b)
+		}
+		return owed[i].UUID < owed[j].UUID
+	})
+	if limit > 0 && len(owed) > limit {
+		owed = owed[:limit]
+	}
+	return owed, nil
 }
 
-func (f *FakeProductTransactionRepository) SaveSettledFees(ctx context.Context, id string, platformFeeMinor, gatewayFeeMinor, residualMinor int64) error {
+func (f *FakeProductTransactionRepository) SaveSettledFees(ctx context.Context, id string, platformFeeMinor, gatewayFeeMinor, residualMinor int64, source domain.SettledFeeSource) error {
 	tx, ok := f.transactions[id]
 	if !ok {
 		return repo.ErrNotFound
@@ -629,7 +680,41 @@ func (f *FakeProductTransactionRepository) SaveSettledFees(ctx context.Context, 
 	tx.SettledPlatformFeeMinor = &platformFeeMinor
 	tx.SettledGatewayFeeMinor = &gatewayFeeMinor
 	tx.PlatformResidualMinor = &residualMinor
+	f.feeSources[id] = source
 	return nil
+}
+
+// SaveBalancedFeesIf mirrors the Postgres compare-and-set: every condition of its WHERE clause.
+func (f *FakeProductTransactionRepository) SaveBalancedFeesIf(ctx context.Context, id string, prevPlatformFeeMinor, prevGatewayFeeMinor *int64, platformFeeMinor, gatewayFeeMinor, residualMinor int64) (bool, error) {
+	if f.beforeBalancedCAS != nil {
+		hook := f.beforeBalancedCAS
+		f.beforeBalancedCAS = nil
+		hook()
+	}
+	tx, ok := f.transactions[id]
+	if !ok {
+		return false, nil
+	}
+	source, recorded := f.feeSources[id]
+	if tx.Status != domain.TransactionStatusSettled || tx.PlatformFeeTransferred ||
+		!recorded || source != domain.SettledFeeSourceEstimate ||
+		!sameMinor(tx.SettledPlatformFeeMinor, prevPlatformFeeMinor) ||
+		!sameMinor(tx.SettledGatewayFeeMinor, prevGatewayFeeMinor) {
+		return false, nil
+	}
+	tx.SettledPlatformFeeMinor = &platformFeeMinor
+	tx.SettledGatewayFeeMinor = &gatewayFeeMinor
+	tx.PlatformResidualMinor = &residualMinor
+	f.feeSources[id] = domain.SettledFeeSourceBalance
+	return true, nil
+}
+
+// sameMinor is IS NOT DISTINCT FROM over two nullable figures.
+func sameMinor(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 func (f *FakeProductTransactionRepository) OldestAwaitingSettlement(ctx context.Context) (time.Time, bool, error) {
@@ -928,6 +1013,7 @@ type FakeRepositoryProvider struct {
 	journalRepo                *FakeJournalRepository
 	disbursementRepo           *FakeDisbursementRepository
 	paymentRequestRepo         *FakePaymentRequestRepository
+	reconciliationRepo         *FakePlatformFeeReconciliationRepository
 }
 
 // Ensure FakeRepositoryProvider implements repo.RepositoryProvider at compile time
@@ -947,6 +1033,7 @@ func NewFakeRepositoryProvider() *FakeRepositoryProvider {
 		paymentRequestRepo:         NewFakePaymentRequestRepository(),
 	}
 	fakes.productTransactionRepo.ledgerEntries = fakes.ledgerEntryRepo
+	fakes.reconciliationRepo = &FakePlatformFeeReconciliationRepository{fakes: fakes}
 	return fakes
 }
 
@@ -986,10 +1073,17 @@ func (f *FakeRepositoryProvider) Verification() domain.VerificationRepository {
 	return nil // Not needed for reconciliation tests
 }
 
+func (f *FakeRepositoryProvider) PlatformFeeReconciliation() domain.PlatformFeeReconciliationRepository {
+	return f.reconciliationRepo
+}
+
 // FakeTransactionProvider implements repo.TransactionProvider for testing
 // It doesn't actually provide transaction semantics - just returns the same fakes
 type FakeTransactionProvider struct {
 	fakes *FakeRepositoryProvider
+
+	// transactions counts the transactions begun, so a test can show a path wrote nothing.
+	transactions int
 }
 
 // Ensure FakeTransactionProvider implements repo.TransactionProvider
@@ -1001,6 +1095,7 @@ func NewFakeTransactionProvider(fakes *FakeRepositoryProvider) *FakeTransactionP
 
 // Transact executes the function with fake repositories (no actual transaction)
 func (f *FakeTransactionProvider) Transact(ctx context.Context, fn func(tx repo.Tx) error) error {
+	f.transactions++
 	// Just call the function with our fakes (which implement repo.Tx)
 	return fn(f.fakes)
 }
@@ -1014,4 +1109,159 @@ func (f *FakeTransactionProvider) TransactReadCommitted(ctx context.Context, fn 
 // nothing and a failing one says why.
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+}
+
+// FakePlatformFeeReconciliationRepository answers the card reconciliation's reads from the
+// other fakes, condition for condition the way the Postgres statements read the tables, and
+// keeps the rows it is given. The arithmetic under test is only meaningful if the snapshot
+// is computed from what the ledger fakes actually hold.
+type FakePlatformFeeReconciliationRepository struct {
+	fakes *FakeRepositoryProvider
+
+	reconciliations []*domain.PlatformFeeReconciliation
+	items           []*domain.PlatformFeeReconciliationItem
+
+	// beforeSnapshot runs before every ReadCardFeeSnapshot with its 1-based call number: how a
+	// test moves the ledger between the two reads of one seller's round.
+	beforeSnapshot func(call int)
+	snapshots      int
+}
+
+var _ domain.PlatformFeeReconciliationRepository = (*FakePlatformFeeReconciliationRepository)(nil)
+
+// isCandidate is estimatedCardFeeSQL plus the SELLER owner check.
+func (f *FakePlatformFeeReconciliationRepository) isCandidate(tx *domain.ProductTransaction) bool {
+	pts := f.fakes.productTransactionRepo
+	source, recorded := pts.feeSources[tx.UUID]
+	if tx.Status != domain.TransactionStatusSettled || tx.PlatformFeeTransferred ||
+		!recorded || source != domain.SettledFeeSourceEstimate ||
+		tx.Fee.FeeModel != domain.FeeModelGatewayOnCustomer || tx.Fee.PlatformFee <= 0 {
+		return false
+	}
+	pr, ok := f.fakes.paymentRequestRepo.byProduct[tx.UUID]
+	if !ok || pr.PaymentChannel != ChannelCreditCard {
+		return false
+	}
+	account, ok := f.fakes.accountRepo.accounts[tx.SellerAccountID]
+	return ok && account.OwnerType == domain.OwnerTypeSeller
+}
+
+func (f *FakePlatformFeeReconciliationRepository) candidates(sellerAccountID string) []*domain.ProductTransaction {
+	var out []*domain.ProductTransaction
+	for _, tx := range f.fakes.productTransactionRepo.transactions {
+		if (sellerAccountID == "" || tx.SellerAccountID == sellerAccountID) && f.isCandidate(tx) {
+			out = append(out, tx)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i].SettledAt, out[j].SettledAt
+		if a != nil && b != nil && !a.Equal(*b) {
+			return a.Before(*b)
+		}
+		return out[i].UUID < out[j].UUID
+	})
+	return out
+}
+
+func (f *FakePlatformFeeReconciliationRepository) SellersWithEstimatedCardFees(ctx context.Context, limit int) ([]string, error) {
+	var sellers []string
+	seen := map[string]bool{}
+	// candidates("") is oldest settlement first, so first sight is MIN(settled_at) order.
+	for _, tx := range f.candidates("") {
+		if !seen[tx.SellerAccountID] {
+			seen[tx.SellerAccountID] = true
+			sellers = append(sellers, tx.SellerAccountID)
+		}
+	}
+	if limit > 0 && len(sellers) > limit {
+		sellers = sellers[:limit]
+	}
+	return sellers, nil
+}
+
+func (f *FakePlatformFeeReconciliationRepository) ReadCardFeeSnapshot(ctx context.Context, sellerAccountID string) (*domain.CardFeeSnapshot, error) {
+	f.snapshots++
+	if f.beforeSnapshot != nil {
+		f.beforeSnapshot(f.snapshots)
+	}
+
+	snapshot := &domain.CardFeeSnapshot{SellerAccountID: sellerAccountID, Cards: []domain.CardFeeCandidate{}}
+
+	_, available, err := f.fakes.ledgerEntryRepo.GetAllBalances(ctx, sellerAccountID)
+	if err != nil {
+		return nil, err
+	}
+	snapshot.SellerLedgerAvailable = available
+
+	pts := f.fakes.productTransactionRepo
+	for _, tx := range pts.transactions {
+		if tx.SellerAccountID != sellerAccountID || tx.Status != domain.TransactionStatusSettled ||
+			tx.PlatformFeeTransferred || pts.feeSource(tx.UUID) == domain.SettledFeeSourceEstimate {
+			continue
+		}
+		fee := domain.RupiahToMinor(tx.Fee.PlatformFee)
+		if tx.SettledPlatformFeeMinor != nil {
+			fee = *tx.SettledPlatformFeeMinor
+		}
+		snapshot.CertainUnsweptPlatformFeeMinor += fee
+	}
+
+	for _, d := range f.fakes.disbursementRepo.disbursements {
+		if d.LedgerUUID == sellerAccountID &&
+			(d.Status == domain.DisbursementStatusPending || d.Status == domain.DisbursementStatusProcessing) {
+			snapshot.DisbursementsInFlight++
+		}
+	}
+
+	for _, tx := range f.candidates(sellerAccountID) {
+		snapshot.Cards = append(snapshot.Cards, domain.CardFeeCandidate{
+			ProductTransactionUUID:  tx.UUID,
+			InvoiceNumber:           tx.InvoiceNumber,
+			PlatformFee:             tx.Fee.PlatformFee,
+			GatewayFee:              tx.Fee.GatewayFee,
+			TotalCharged:            tx.Fee.TotalCharged,
+			SellerNetAmount:         tx.Fee.SellerNetAmount,
+			SettledPlatformFeeMinor: copyMinor(tx.SettledPlatformFeeMinor),
+			SettledGatewayFeeMinor:  copyMinor(tx.SettledGatewayFeeMinor),
+			PlatformResidualMinor:   copyMinor(tx.PlatformResidualMinor),
+			SettledAt:               tx.SettledAt,
+		})
+	}
+	return snapshot, nil
+}
+
+func (f *FakePlatformFeeReconciliationRepository) Save(ctx context.Context, rec *domain.PlatformFeeReconciliation) error {
+	stored := *rec
+	f.reconciliations = append(f.reconciliations, &stored)
+	return nil
+}
+
+// SaveItems refuses a second applied item for one transaction, as the unique index does.
+func (f *FakePlatformFeeReconciliationRepository) SaveItems(ctx context.Context, items []*domain.PlatformFeeReconciliationItem) error {
+	for _, item := range items {
+		if item.AllocatedPlatformFeeMinor == nil {
+			continue
+		}
+		for _, existing := range f.items {
+			if existing.ProductTransactionUUID == item.ProductTransactionUUID && existing.AllocatedPlatformFeeMinor != nil {
+				return repo.ErrFailedInsertSQL.WithError(&pq.Error{
+					Code:       "23505",
+					Constraint: repo.ConstraintUniqueAppliedReconciliationItem,
+				})
+			}
+		}
+	}
+	for _, item := range items {
+		stored := *item
+		f.items = append(f.items, &stored)
+	}
+	return nil
+}
+
+func copyMinor(v *int64) *int64 {
+	if v == nil {
+		return nil
+	}
+	n := *v
+	return &n
 }

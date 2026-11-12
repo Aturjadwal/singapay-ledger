@@ -15,6 +15,14 @@ func toNullTime(t *time.Time) sql.NullTime {
 	return sql.NullTime{Time: *t, Valid: true}
 }
 
+// toNullInt64 converts *int64 to sql.NullInt64: nil is NULL, never zero.
+func toNullInt64(v *int64) sql.NullInt64 {
+	if v == nil {
+		return sql.NullInt64{Valid: false}
+	}
+	return sql.NullInt64{Int64: *v, Valid: true}
+}
+
 // toNullString converts string to sql.NullString for proper NULL handling in PostgreSQL.
 // Empty strings are stored as NULL in the database.
 func toNullString(s string) sql.NullString {

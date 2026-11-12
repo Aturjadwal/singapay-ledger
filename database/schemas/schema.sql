@@ -117,7 +117,12 @@ CREATE TABLE ledger_entries (
             'SETTLEMENT_CLEAR',
             'SETTLEMENT_NET',
             'SETTLEMENT',
-            'RECONCILIATION'
+            'RECONCILIATION',
+            -- Migration 012. Written again since v0.11.0: the platform's AVAILABLE moves by
+            -- it when a card's platform fee is recomputed (and by hand, SWIMLQ 2026-11-11).
+            'FEE_ADJUSTMENT',
+            -- Migration 015: a reservation released when a payout did not happen.
+            'DISBURSEMENT_REVERSAL'
         )
     ),
     -- Business origin (what table generated this). 'SETTLEMENT_BATCH' is historical
@@ -233,6 +238,17 @@ CREATE TABLE IF NOT EXISTS product_transactions (
     -- balance differs from its Singapay balance by SUM of this over settled rows; the
     -- seller's two balances agree exactly, with no residual at all.
     platform_residual BIGINT,
+    -- Where the three figures above came from (migration 032):
+    --   GATEWAY   Singapay reported this transaction's fee (VA, QRIS, e-wallet). Final.
+    --   ESTIMATE  a copy of the checkout estimate (card, payment link): Singapay reports no
+    --             fee there. The platform-fee sweep leaves the row alone; a card's figures
+    --             are recomputed from the seller's sub-account balance first.
+    --   BALANCE   recomputed that way (ReconcileCardPlatformFees). Final.
+    --   MANUAL    corrected by hand (SWIMLQ, 2026-11-11). Final.
+    --   NULL      settled before the column existed; read as GATEWAY.
+    settled_fee_source VARCHAR(20) CHECK (
+        settled_fee_source IN ('GATEWAY', 'ESTIMATE', 'BALANCE', 'MANUAL')
+    ),
     -- Product details (what was purchased)
     metadata JSONB -- Buyer name, product title, resolution, license type, etc.
 );
@@ -269,6 +285,14 @@ WHERE
 CREATE INDEX idx_product_transactions_paid_at ON product_transactions ((COALESCE(completed_at, created_at)))
 WHERE
     status IN ('COMPLETED', 'SETTLED');
+
+-- Serves the card platform-fee reconciliation's reads (estimatedCardFeeSQL): the settled
+-- rows still on the checkout estimate, per seller, oldest first (migration 033).
+CREATE INDEX idx_product_transactions_fee_estimate ON product_transactions (seller_account_id, settled_at)
+WHERE
+    status = 'SETTLED'
+    AND platform_fee_transferred = false
+    AND settled_fee_source = 'ESTIMATE';
 
 -- payment_requests: PAYMENT GATEWAY INTEGRATION
 -- Purpose: records which payment instrument was issued for a transaction, and the keys
@@ -583,3 +607,88 @@ CREATE INDEX idx_verifications_status ON ledger_verifications(status);
 CREATE INDEX idx_verifications_pending ON ledger_verifications(status, created_at ASC)
 WHERE
     status = 'PENDING';
+
+-- platform_fee_reconciliations: THE CARD PLATFORM-FEE RECONCILIATION, one row per seller per
+-- round (migration 032). Insert-only; every amount is sen.
+--
+-- Singapay reports no fee for a card payment (a payment link), so settlement books the
+-- checkout estimate (settled_fee_source ESTIMATE). Before the sweep, each seller's cards are
+-- recomputed from the sub-account balance:
+--
+--   computed = singapay_available − seller_ledger_available − certain_unswept_platform_fee
+--
+-- APPLIED: the cards were made BALANCE in the same database transaction as this row.
+-- HELD: nothing else was written; the cards stay ESTIMATE, unswept, for the next round.
+CREATE TABLE IF NOT EXISTS platform_fee_reconciliations (
+    uuid VARCHAR(255) PRIMARY KEY,
+    randid VARCHAR(255) NOT NULL UNIQUE,
+    seller_account_id VARCHAR(255) NOT NULL REFERENCES ledger_accounts(uuid),
+    singapay_account_id VARCHAR(255) NOT NULL,
+    -- The balance inquiry's answer. NULL when it was not read.
+    singapay_available BIGINT,
+    singapay_pending BIGINT,
+    singapay_held BIGINT,
+    -- The seller's AVAILABLE balance × 100.
+    seller_ledger_available BIGINT NOT NULL,
+    -- Platform fee already final (GATEWAY, BALANCE, MANUAL or NULL) but not transferred.
+    certain_unswept_platform_fee BIGINT NOT NULL,
+    -- available − seller − certain. NULL when not computed.
+    computed_platform_fee BIGINT,
+    -- The cards' platform fee as priced, and the deviation allowed: per card × cards.
+    nominal_platform_fee BIGINT NOT NULL,
+    tolerance BIGINT NOT NULL,
+    card_count INT NOT NULL CHECK (card_count > 0),
+    outcome VARCHAR(20) NOT NULL CHECK (outcome IN ('APPLIED', 'HELD')),
+    hold_reason VARCHAR(50) CHECK (
+        hold_reason IN (
+            'DEVIATION_ABOVE_TOLERANCE',
+            'DISBURSEMENT_IN_FLIGHT',
+            'BALANCE_READ_FAILED'
+        )
+    ),
+    raw_balance JSONB,
+    created_at TIMESTAMP NOT NULL,
+    CONSTRAINT platform_fee_reconciliations_outcome_reason_check CHECK (
+        (outcome = 'HELD') = (hold_reason IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_platform_fee_reconciliations_seller ON platform_fee_reconciliations (seller_account_id, created_at DESC);
+
+CREATE INDEX idx_platform_fee_reconciliations_held ON platform_fee_reconciliations (created_at DESC)
+WHERE
+    outcome = 'HELD';
+
+-- platform_fee_reconciliation_items: one row per card per round (migration 032). On a HELD
+-- round the result columns are NULL. Every amount is sen.
+CREATE TABLE IF NOT EXISTS platform_fee_reconciliation_items (
+    uuid VARCHAR(255) PRIMARY KEY,
+    randid VARCHAR(255) NOT NULL UNIQUE,
+    reconciliation_uuid VARCHAR(255) NOT NULL REFERENCES platform_fee_reconciliations(uuid),
+    product_transaction_uuid VARCHAR(255) NOT NULL REFERENCES product_transactions(uuid),
+    priced_platform_fee BIGINT NOT NULL,
+    previous_settled_gateway_fee BIGINT NOT NULL,
+    previous_settled_platform_fee BIGINT NOT NULL,
+    -- The recomputed figures: the platform's share, the gateway fee that leaves
+    -- (total_charged×100 − seller_net×100 − share), and the sen a whole-rupiah entry cannot carry.
+    allocated_platform_fee BIGINT,
+    settled_gateway_fee BIGINT,
+    platform_residual BIGINT,
+    -- The RECONCILIATION journal, and the platform's FEE_ADJUSTMENT entry (NULL when the
+    -- whole-rupiah part did not change).
+    journal_uuid VARCHAR(255) REFERENCES journals(uuid),
+    ledger_entry_uuid VARCHAR(255) REFERENCES ledger_entries(uuid),
+    created_at TIMESTAMP NOT NULL,
+    CONSTRAINT platform_fee_reconciliation_items_applied_check CHECK (
+        (allocated_platform_fee IS NULL) = (settled_gateway_fee IS NULL)
+        AND (allocated_platform_fee IS NULL) = (platform_residual IS NULL)
+        AND (allocated_platform_fee IS NULL) = (journal_uuid IS NULL)
+    )
+);
+
+-- A transaction's platform fee is recomputed (APPLIED) once.
+CREATE UNIQUE INDEX uq_platform_fee_reconciliation_items_applied ON platform_fee_reconciliation_items (product_transaction_uuid)
+WHERE
+    allocated_platform_fee IS NOT NULL;
+
+CREATE INDEX idx_platform_fee_reconciliation_items_run ON platform_fee_reconciliation_items (reconciliation_uuid);

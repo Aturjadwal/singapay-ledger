@@ -28,6 +28,7 @@ type RepositoryProvider interface {
 	Disbursement() domain.DisbursementRepository
 	SettlementNotification() domain.SettlementNotificationRepository
 	Verification() domain.VerificationRepository
+	PlatformFeeReconciliation() domain.PlatformFeeReconciliationRepository
 }
 
 // PostgresRepositoryProvider implements RepositoryProvider interface with PostgreSQL.
@@ -73,4 +74,8 @@ func (p *PostgresRepositoryProvider) SettlementNotification() domain.SettlementN
 
 func (p *PostgresRepositoryProvider) Verification() domain.VerificationRepository {
 	return NewPostgresVerificationRepository(p.db)
+}
+
+func (p *PostgresRepositoryProvider) PlatformFeeReconciliation() domain.PlatformFeeReconciliationRepository {
+	return NewPostgresPlatformFeeReconciliationRepository(p.db)
 }

@@ -1009,6 +1009,10 @@ func (c *LedgerClient) bookSettlement(
 		return settleOutcomeBlocked, nil
 	}
 
+	// Where the fee figures come from decides whether the sweep may move them: Singapay's own
+	// figure is final, a copy of the checkout estimate is not (docs/104, card payments).
+	feeSource := domain.SettledFeeSourceFor(settled.FeeReported)
+
 	journal := domain.NewJournal(
 		domain.EventTypeSettlement,
 		domain.SourceTypeProductTransaction,
@@ -1027,6 +1031,7 @@ func (c *LedgerClient) bookSettlement(
 			"estimated_gateway_fee":      tx.Fee.GatewayFee,
 			"actual_gateway_fee_minor":   settled.FeeMinor,
 			"fee_reported":               settled.FeeReported,
+			"settled_fee_source":         string(feeSource),
 			"fee_delta_minor":            adjustment.FeeDeltaMinor,
 			"fee_model":                  string(tx.Fee.FeeModel),
 			"priced_platform_fee":        tx.Fee.PlatformFee,
@@ -1068,9 +1073,10 @@ func (c *LedgerClient) bookSettlement(
 		}
 
 		// Written inside the same transaction as the status move, so the transfer step
-		// can never find a SETTLED row whose figures are still unset.
+		// can never find a SETTLED row whose figures are still unset — nor one whose
+		// estimated figures are not yet marked as estimated.
 		if err := dbtx.ProductTransaction().SaveSettledFees(ctx, tx.UUID,
-			adjustment.PlatformFeeMinor, settled.FeeMinor, adjustment.PlatformResidualMinor()); err != nil {
+			adjustment.PlatformFeeMinor, settled.FeeMinor, adjustment.PlatformResidualMinor(), feeSource); err != nil {
 			return err
 		}
 
@@ -1104,6 +1110,7 @@ func (c *LedgerClient) bookSettlement(
 		"actual_gateway_fee", formatMinor(settled.FeeMinor),
 		"fee_delta", formatMinor(adjustment.FeeDeltaMinor),
 		"fee_reported", settled.FeeReported,
+		"settled_fee_source", string(feeSource),
 	)
 
 	return settleOutcomeSettled, nil

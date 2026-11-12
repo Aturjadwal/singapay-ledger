@@ -161,6 +161,16 @@ type fakeGateway struct {
 	// records each request it was asked. Leaving it nil keeps the panic below.
 	createAccount   func(context.Context, singapay.CreateAccountRequest) (*singapay.Account, error)
 	accountRequests []singapay.CreateAccountRequest
+
+	// balance scripts the balance inquiry (platform_fee_reconciliation_test.go); balanceCalls
+	// records each sub-account asked about. Leaving it nil keeps the panic below.
+	balance      func(accountID string) (*singapay.Balance, error)
+	balanceCalls []string
+
+	// transfer scripts account transfers, the platform-fee sweep; transfers records each one.
+	// Leaving it nil keeps the panic below.
+	transfer  func(fromAccountID string, req singapay.TransferRequest) (*singapay.AccountTransfer, error)
+	transfers []singapay.TransferRequest
 }
 
 var _ PaymentGateway = (*fakeGateway)(nil)
@@ -209,8 +219,12 @@ func (f *fakeGateway) CreateAccount(ctx context.Context, req singapay.CreateAcco
 func (f *fakeGateway) GetAccount(context.Context, string) (*singapay.Account, error) {
 	panic("fakeGateway.GetAccount: not scripted for this test")
 }
-func (f *fakeGateway) GetAccountBalance(context.Context, string) (*singapay.Balance, error) {
-	panic("fakeGateway.GetAccountBalance: not scripted for this test")
+func (f *fakeGateway) GetAccountBalance(_ context.Context, accountID string) (*singapay.Balance, error) {
+	if f.balance == nil {
+		panic("fakeGateway.GetAccountBalance: not scripted for this test")
+	}
+	f.balanceCalls = append(f.balanceCalls, accountID)
+	return f.balance(accountID)
 }
 func (f *fakeGateway) CreateVirtualAccount(context.Context, string, singapay.CreateVirtualAccountRequest) (*singapay.VirtualAccount, error) {
 	panic("fakeGateway.CreateVirtualAccount: not scripted for this test")
@@ -260,8 +274,12 @@ func (f *fakeGateway) ListSettlementTransactions(context.Context, string, singap
 func (f *fakeGateway) CheckBeneficiary(context.Context, string, string) (*singapay.Beneficiary, error) {
 	panic("fakeGateway.CheckBeneficiary: not scripted for this test")
 }
-func (f *fakeGateway) TransferBetweenAccounts(context.Context, string, singapay.TransferRequest) (*singapay.AccountTransfer, error) {
-	panic("fakeGateway.TransferBetweenAccounts: not scripted for this test")
+func (f *fakeGateway) TransferBetweenAccounts(_ context.Context, fromAccountID string, req singapay.TransferRequest) (*singapay.AccountTransfer, error) {
+	if f.transfer == nil {
+		panic("fakeGateway.TransferBetweenAccounts: not scripted for this test")
+	}
+	f.transfers = append(f.transfers, req)
+	return f.transfer(fromAccountID, req)
 }
 func (f *fakeGateway) VerifyWebhook(req singapay.WebhookRequest) error {
 	if f.verifyWebhook == nil {

@@ -827,8 +827,14 @@ func (r *PostgresProductTransactionRepository) MarkPlatformFeeTransferred(ctx co
 	return nil
 }
 
-// GetSettledWithoutPlatformFeeTransfer returns SETTLED transactions that haven't had platform fees transferred yet
-// Used by background job to retry failed platform fee transfers
+// GetSettledWithoutPlatformFeeTransfer returns the SETTLED transactions whose platform fee
+// the sweep still owes, oldest settlement first. See the interface.
+//
+// A row whose settled_fee_source is ESTIMATE is left out: its figures are the checkout
+// estimate, and moving that out of a sub-account that holds a few sen less is what failed
+// with 422 for SWIMLQ. A card's figures become BALANCE once ReconcileCardPlatformFees has
+// recomputed them, and the row is swept from then on. NULL is a row settled before
+// migration 032, read as GATEWAY like every row the sweep moved before it.
 func (r *PostgresProductTransactionRepository) GetSettledWithoutPlatformFeeTransfer(ctx context.Context, limit int) ([]*domain.ProductTransaction, error) {
 	query := `
 		SELECT uuid, randid, buyer_account_id, seller_account_id, product_id, product_type, invoice_number,
@@ -837,9 +843,10 @@ func (r *PostgresProductTransactionRepository) GetSettledWithoutPlatformFeeTrans
 		       platform_fee_transferred, platform_fee_transferred_at, transfer_request_id, metadata,
 		       settled_platform_fee, settled_gateway_fee, platform_residual
 		FROM product_transactions
-		WHERE status = 'SETTLED' 
-		  AND platform_fee_transferred = false 
+		WHERE status = 'SETTLED'
+		  AND platform_fee_transferred = false
 		  AND platform_fee > 0
+		  AND COALESCE(settled_fee_source, 'GATEWAY') <> 'ESTIMATE'
 		ORDER BY settled_at ASC
 		LIMIT $1
 	`
@@ -885,17 +892,21 @@ func (r *PostgresProductTransactionRepository) GetAwaitingSettlement(ctx context
 // queries. The suffix is kept in Go because that is where it earns its place — the ×100 bug
 // this replaced was a rupiah figure assigned to a sen field, and a compiler cannot catch
 // that when neither name says which is which.
-func (r *PostgresProductTransactionRepository) SaveSettledFees(ctx context.Context, id string, platformFeeMinor, gatewayFeeMinor, residualMinor int64) error {
+//
+// settled_fee_source (migration 032) says whether the figures are Singapay's or the
+// checkout estimate, which decides whether the sweep may move them.
+func (r *PostgresProductTransactionRepository) SaveSettledFees(ctx context.Context, id string, platformFeeMinor, gatewayFeeMinor, residualMinor int64, source domain.SettledFeeSource) error {
 	query := `
 		UPDATE product_transactions
 		SET settled_platform_fee = $1,
 		    settled_gateway_fee = $2,
 		    platform_residual = $3,
-		    updated_at = $4
-		WHERE uuid = $5
+		    settled_fee_source = $4,
+		    updated_at = $5
+		WHERE uuid = $6
 	`
 
-	result, err := r.db.ExecContext(ctx, query, platformFeeMinor, gatewayFeeMinor, residualMinor, time.Now(), id)
+	result, err := r.db.ExecContext(ctx, query, platformFeeMinor, gatewayFeeMinor, residualMinor, string(source), time.Now(), id)
 	if err != nil {
 		return ErrFailedUpdateSQL.WithError(err)
 	}
@@ -910,6 +921,44 @@ func (r *PostgresProductTransactionRepository) SaveSettledFees(ctx context.Conte
 	}
 
 	return nil
+}
+
+// SaveBalancedFeesIf is the card reconciliation's compare-and-set. See the interface.
+//
+// Every condition the reconciliation relied on is in the WHERE clause, so the row that is
+// written is the row that was read: still SETTLED and untransferred (the sweep has not taken
+// it), still ESTIMATE (no other round has), and still carrying the booked figures the share
+// was computed against (nobody corrected it by hand in between). IS NOT DISTINCT FROM lets a
+// NULL figure match a NULL one.
+func (r *PostgresProductTransactionRepository) SaveBalancedFeesIf(ctx context.Context, id string, prevPlatformFeeMinor, prevGatewayFeeMinor *int64, platformFeeMinor, gatewayFeeMinor, residualMinor int64) (bool, error) {
+	query := `
+		UPDATE product_transactions
+		SET settled_platform_fee = $1,
+		    settled_gateway_fee = $2,
+		    platform_residual = $3,
+		    settled_fee_source = 'BALANCE',
+		    updated_at = $4
+		WHERE uuid = $5
+		  AND status = 'SETTLED'
+		  AND platform_fee_transferred = false
+		  AND settled_fee_source = 'ESTIMATE'
+		  AND settled_platform_fee IS NOT DISTINCT FROM $6
+		  AND settled_gateway_fee IS NOT DISTINCT FROM $7
+	`
+
+	result, err := r.db.ExecContext(ctx, query,
+		platformFeeMinor, gatewayFeeMinor, residualMinor, time.Now(), id,
+		toNullInt64(prevPlatformFeeMinor), toNullInt64(prevGatewayFeeMinor))
+	if err != nil {
+		return false, ErrFailedUpdateSQL.WithError(err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, ErrFailedQuerySQL.WithError(err)
+	}
+
+	return rowsAffected > 0, nil
 }
 
 // OldestAwaitingSettlement returns when the oldest unsettled COMPLETED transaction was

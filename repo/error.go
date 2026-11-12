@@ -30,3 +30,7 @@ const (
 	ConstraintUniqueSeller         = "idx_accounts_unique_seller"
 	ConstraintUniquePaymentGateway = "idx_accounts_unique_payment_gateway"
 )
+
+// ConstraintUniqueAppliedReconciliationItem refuses a second APPLIED reconciliation item for
+// one transaction (migration 032): a card's platform fee is recomputed once.
+const ConstraintUniqueAppliedReconciliationItem = "uq_platform_fee_reconciliation_items_applied"
