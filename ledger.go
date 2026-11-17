@@ -1647,12 +1647,46 @@ type PlatformFeeTransferResult struct {
 // PlatformFeeMinor is in sen, like every settled fee figure: the amount a sweep moves is
 // the platform fee after it has balanced the gateway fee delta, and that is routinely not
 // a whole rupiah.
+//
+// The sweep returns a failed row rather than logging it at ERROR: the caller is the loop that
+// retries it and logs it once (the consuming service's settlement worker), so everything the
+// sweep knows about the failure travels with it — the step that refused, the cause, and the
+// accounts and reference of the transfer as far as it got. The sweep's own line about it is
+// DEBUG.
 type PlatformFeeTransferError struct {
 	TransactionID    string `json:"transaction_id"`
 	InvoiceNumber    string `json:"invoice_number"`
 	PlatformFeeMinor int64  `json:"platform_fee_minor"`
 	ErrorMessage     string `json:"error_message"`
+
+	// Step is the step that refused: one of the PlatformFeeStep values.
+	Step string `json:"step"`
+	// Cause is the error's text as the step got it (Singapay's answer, the database's error);
+	// empty when the step refused on a rule of its own.
+	Cause string `json:"cause,omitempty"`
+	// SellerAccountID is the seller's ledger account.
+	SellerAccountID string `json:"seller_account_id,omitempty"`
+	// FromAccount is the seller's Singapay sub-account id, once it was read.
+	FromAccount string `json:"from_account,omitempty"`
+	// ToAccountNumber is the platform's Singapay account number the transfer names.
+	ToAccountNumber string `json:"to_account_number,omitempty"`
+	// MerchantRefNo is the transfer's idempotency reference, once it was derived.
+	MerchantRefNo string `json:"merchant_ref_no,omitempty"`
+	// PricedPlatformFee is the fee priced at checkout, whole rupiah; SettledFeeRecorded says
+	// whether settlement recorded a balanced figure (PlatformFeeMinor) or the priced one stands.
+	PricedPlatformFee  int64 `json:"priced_platform_fee"`
+	SettledFeeRecorded bool  `json:"settled_fee_recorded"`
 }
+
+// The steps of a platform-fee transfer a failed row names (PlatformFeeTransferError.Step).
+const (
+	PlatformFeeStepBelowMinimum      = "below_minimum"      // under the Rp1 Singapay accepts
+	PlatformFeeStepSellerAccount     = "seller_account"     // the seller's ledger account could not be read
+	PlatformFeeStepSubAccount        = "sub_account"        // the seller has no Singapay sub-account id
+	PlatformFeeStepTransferReference = "transfer_reference" // the reference could not be stored
+	PlatformFeeStepSingapayTransfer  = "singapay_transfer"  // Singapay refused or failed the transfer
+	PlatformFeeStepMarkTransferred   = "mark_transferred"   // moved at Singapay, the row not marked
+)
 
 // PlatformFeeTransferSuccess contains details for a successful transfer.
 // PlatformFeeMinor is in sen — see [PlatformFeeTransferError].
@@ -1772,8 +1806,8 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 		if platformFeeMinor < domain.MinorPerRupiah {
 			result.recordFailure(tx, fmt.Sprintf(
 				"settled platform fee %s is below the Rp1 minimum Singapay accepts for a transfer",
-				formatMinor(platformFeeMinor)))
-			c.logger.WarnContext(ctx, "Platform fee transfer skipped - below the Rp1 gateway minimum",
+				formatMinor(platformFeeMinor)), platformFeeFailure{step: PlatformFeeStepBelowMinimum})
+			c.logger.DebugContext(ctx, "Platform fee transfer skipped - below the Rp1 gateway minimum",
 				"transaction_id", tx.UUID,
 				"invoice_number", tx.InvoiceNumber,
 				"settled_platform_fee_minor", platformFeeMinor,
@@ -1784,8 +1818,10 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 
 		sellerAccount, err := c.repoProvider.Account().GetByID(ctx, tx.SellerAccountID)
 		if err != nil {
-			result.recordFailure(tx, fmt.Sprintf("failed to get seller account: %v", err))
-			c.logger.ErrorContext(ctx, "Platform fee transfer failed - seller account not found",
+			result.recordFailure(tx, fmt.Sprintf("failed to get seller account: %v", err), platformFeeFailure{
+				step: PlatformFeeStepSellerAccount, cause: err, toAccountNumber: platformAccount.SingapayAccountNumber,
+			})
+			c.logger.DebugContext(ctx, "Platform fee transfer failed - seller account not found",
 				"transaction_id", tx.UUID,
 				"invoice_number", tx.InvoiceNumber,
 				"seller_account_id", tx.SellerAccountID,
@@ -1795,8 +1831,10 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 		}
 
 		if sellerAccount.SingapayAccountID == "" {
-			result.recordFailure(tx, "seller account has no Singapay sub-account id")
-			c.logger.ErrorContext(ctx, "Platform fee transfer failed - invalid seller account",
+			result.recordFailure(tx, "seller account has no Singapay sub-account id", platformFeeFailure{
+				step: PlatformFeeStepSubAccount, toAccountNumber: platformAccount.SingapayAccountNumber,
+			})
+			c.logger.DebugContext(ctx, "Platform fee transfer failed - invalid seller account",
 				"transaction_id", tx.UUID,
 				"invoice_number", tx.InvoiceNumber,
 				"seller_account_id", tx.SellerAccountID,
@@ -1810,8 +1848,11 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 		reference := platformFeeTransferReference(tx.InvoiceNumber)
 		if tx.TransferRequestID != reference {
 			if err := c.repoProvider.ProductTransaction().SaveTransferRequestID(ctx, tx.UUID, reference); err != nil {
-				result.recordFailure(tx, fmt.Sprintf("failed to save transfer reference: %v", err))
-				c.logger.ErrorContext(ctx, "Platform fee transfer failed - could not persist transfer reference",
+				result.recordFailure(tx, fmt.Sprintf("failed to save transfer reference: %v", err), platformFeeFailure{
+					step: PlatformFeeStepTransferReference, cause: err, fromAccount: sellerAccount.SingapayAccountID,
+					toAccountNumber: platformAccount.SingapayAccountNumber, merchantRefNo: reference,
+				})
+				c.logger.DebugContext(ctx, "Platform fee transfer failed - could not persist transfer reference",
 					"transaction_id", tx.UUID,
 					"invoice_number", tx.InvoiceNumber,
 					"error", err,
@@ -1826,8 +1867,11 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 			MerchantRefNo:            reference,
 		})
 		if gwErr != nil {
-			result.recordFailure(tx, fmt.Sprintf("Singapay account transfer failed: %v", gwErr))
-			c.logger.ErrorContext(ctx, "Platform fee transfer failed - Singapay API error",
+			result.recordFailure(tx, fmt.Sprintf("Singapay account transfer failed: %v", gwErr), platformFeeFailure{
+				step: PlatformFeeStepSingapayTransfer, cause: gwErr, fromAccount: sellerAccount.SingapayAccountID,
+				toAccountNumber: platformAccount.SingapayAccountNumber, merchantRefNo: reference,
+			})
+			c.logger.DebugContext(ctx, "Platform fee transfer failed - Singapay API error",
 				"transaction_id", tx.UUID,
 				"invoice_number", tx.InvoiceNumber,
 				"platform_fee", formatMinor(platformFeeMinor),
@@ -1842,14 +1886,17 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 		if err := c.repoProvider.ProductTransaction().MarkPlatformFeeTransferred(ctx, tx.UUID); err != nil {
 			// Not lost: the next run re-sends the same merchant_ref_no, Singapay returns
 			// the original transfer without moving anything, and the flag is set then.
-			c.logger.ErrorContext(ctx, "Singapay transfer succeeded but the DB update failed - the next run will re-present the same reference",
+			c.logger.DebugContext(ctx, "Singapay transfer succeeded but the DB update failed - the next run will re-present the same reference",
 				"transaction_id", tx.UUID,
 				"invoice_number", tx.InvoiceNumber,
 				"platform_fee", formatMinor(platformFeeMinor),
 				"merchant_ref_no", reference,
 				"db_error", err,
 			)
-			result.recordFailure(tx, fmt.Sprintf("Singapay transfer succeeded but DB update failed: %v", err))
+			result.recordFailure(tx, fmt.Sprintf("Singapay transfer succeeded but DB update failed: %v", err), platformFeeFailure{
+				step: PlatformFeeStepMarkTransferred, cause: err, fromAccount: sellerAccount.SingapayAccountID,
+				toAccountNumber: platformAccount.SingapayAccountNumber, merchantRefNo: reference,
+			})
 			continue
 		}
 
@@ -1879,10 +1926,20 @@ func (c *LedgerClient) ProcessPlatformFeeTransfer(ctx context.Context, batchSize
 	return result, nil
 }
 
+// platformFeeFailure is what a failed step knows beyond the row: recordFailure puts it on the
+// PlatformFeeTransferError the caller logs.
+type platformFeeFailure struct {
+	step            string
+	cause           error
+	fromAccount     string
+	toAccountNumber string
+	merchantRefNo   string
+}
+
 // recordFailure appends one failed transfer. The four call sites above all built the same
 // struct by hand and differed only in the message, which is exactly the kind of repetition
 // that lets one of them quietly forget to increment the counter.
-func (r *PlatformFeeTransferResult) recordFailure(tx *domain.ProductTransaction, message string) {
+func (r *PlatformFeeTransferResult) recordFailure(tx *domain.ProductTransaction, message string, failure platformFeeFailure) {
 	r.Failed++
 	// The settled figure where it exists, the priced one where it does not — the same
 	// fallback the sweep itself makes, so a failure report names the amount that was
@@ -1892,10 +1949,22 @@ func (r *PlatformFeeTransferResult) recordFailure(tx *domain.ProductTransaction,
 		platformFeeMinor = *tx.SettledPlatformFeeMinor
 	}
 
+	cause := ""
+	if failure.cause != nil {
+		cause = failure.cause.Error()
+	}
 	r.Errors = append(r.Errors, PlatformFeeTransferError{
-		TransactionID:    tx.UUID,
-		InvoiceNumber:    tx.InvoiceNumber,
-		PlatformFeeMinor: platformFeeMinor,
-		ErrorMessage:     message,
+		TransactionID:      tx.UUID,
+		InvoiceNumber:      tx.InvoiceNumber,
+		PlatformFeeMinor:   platformFeeMinor,
+		ErrorMessage:       message,
+		Step:               failure.step,
+		Cause:              cause,
+		SellerAccountID:    tx.SellerAccountID,
+		FromAccount:        failure.fromAccount,
+		ToAccountNumber:    failure.toAccountNumber,
+		MerchantRefNo:      failure.merchantRefNo,
+		PricedPlatformFee:  tx.Fee.PlatformFee,
+		SettledFeeRecorded: tx.SettledPlatformFeeMinor != nil,
 	})
 }

@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed — a failed platform-fee row is logged once, by the caller, with everything the ledger knew
+
+The sweep logged every failed row at ERROR and returned it; the consuming service's settlement
+worker logged the same row again. One Singapay refusal was two error-tracker groups
+("Platform fee transfer failed - Singapay API error" here, "platform fee could not be
+transferred" in the worker: 132 + 132 lines in 30 days before the v0.10.3 fix), and an alert
+email went out for each. The rule now is the consuming service's: log once, where the failure
+is decided — the loop that retries it.
+
+- **`PlatformFeeTransferError` carries what the ledger line carried:** `Step` (one of the new
+  `PlatformFeeStep*` constants: `below_minimum`, `seller_account`, `sub_account`,
+  `transfer_reference`, `singapay_transfer`, `mark_transferred`), `Cause` (the error as the step
+  got it — Singapay's answer, the database's error), `SellerAccountID`, `FromAccount`,
+  `ToAccountNumber`, `MerchantRefNo`, `PricedPlatformFee` and `SettledFeeRecorded`.
+  `ErrorMessage` is unchanged.
+- **`CardPlatformFeeSellerResult.Cause`**: the error a FAILED card round ran into.
+- **The ledger's own lines about those failures are DEBUG** (the six platform-fee failures, the
+  below-minimum skip, and the two card-round failures). Errors that stop a run before it starts
+  are returned as before and were never logged here.
+- Not changed: every other ERROR line of the ledger. Payment creation's ("Singapay payment
+  creation failed") is a double only some of the time: the consuming service answers a Singapay
+  that is down as a 424 and logs it at WARN, so there the ledger's line is the only ERROR the
+  error tracker counts; any other failure is a 500 with an ERROR line of its own. Moving it
+  needs that line to carry `payment_channel` first, and is left for a change of its own.
+
 ### Added — card platform fees are recomputed from the seller's sub-account balance before the sweep (v0.11.0)
 
 A card payment's platform fee was swept on the checkout estimate. Singapay reports no fee for
