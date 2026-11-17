@@ -45,6 +45,8 @@ type FakeAccountRepository struct {
 	// probes counts the looks.
 	probeErr func(ctx context.Context) error
 	probes   int
+	// getByIDErr, when set, fails GetByID with it (a read the database refused).
+	getByIDErr error
 }
 
 func NewFakeAccountRepository() *FakeAccountRepository {
@@ -56,6 +58,9 @@ func NewFakeAccountRepository() *FakeAccountRepository {
 }
 
 func (f *FakeAccountRepository) GetByID(ctx context.Context, id string) (*domain.Account, error) {
+	if f.getByIDErr != nil {
+		return nil, f.getByIDErr
+	}
 	if acc, ok := f.accounts[id]; ok {
 		return acc, nil
 	}

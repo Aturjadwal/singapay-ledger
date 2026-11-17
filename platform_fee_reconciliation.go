@@ -91,6 +91,10 @@ type CardPlatformFeeSellerResult struct {
 	// Detail says why a round was SKIPPED or FAILED, or what the balance inquiry answered when
 	// it failed.
 	Detail string `json:"detail,omitempty"`
+	// Cause is the error a FAILED round ran into, as it came (the database's, Singapay's);
+	// Detail says the same in a sentence. A failed seller is the caller's to log, once: the
+	// ledger's own line about it is DEBUG.
+	Cause string `json:"cause,omitempty"`
 
 	// ReconciliationUUID is the platform_fee_reconciliations row, for APPLIED and HELD.
 	ReconciliationUUID string `json:"reconciliation_uuid,omitempty"`
@@ -224,8 +228,9 @@ func (c *LedgerClient) reconcileSellerCardFees(
 		out.Detail = detail
 		if err != nil {
 			out.Detail = fmt.Sprintf("%s: %v", detail, err)
+			out.Cause = err.Error()
 		}
-		c.logger.ErrorContext(ctx, "Card platform fee reconciliation failed for a seller; nothing was written",
+		c.logger.DebugContext(ctx, "Card platform fee reconciliation failed for a seller; nothing was written",
 			"seller_account_id", sellerAccountID,
 			"singapay_account_id", out.SingapayAccountID,
 			"detail", out.Detail,
@@ -418,7 +423,8 @@ func (c *LedgerClient) holdCardFees(
 	if err != nil {
 		out.Outcome = CardFeeOutcomeFailed
 		out.Detail = fmt.Sprintf("held (%s: %s), and the hold could not be recorded: %v", reason, detail, err)
-		c.logger.ErrorContext(ctx, "Card platform fee reconciliation could not record a hold",
+		out.Cause = err.Error()
+		c.logger.DebugContext(ctx, "Card platform fee reconciliation could not record a hold",
 			"seller_account_id", rec.SellerAccountID,
 			"hold_reason", string(reason),
 			"detail", detail,
