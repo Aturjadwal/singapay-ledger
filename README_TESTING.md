@@ -20,6 +20,11 @@ number and gateway identifier.
 The card platform-fee reconciliation (`platform_fee_reconciliation_postgres_test.go`) runs its
 snapshot statement, conditional update, constraints and a real rollback against PostgreSQL too;
 its scenarios run against the fakes in `platform_fee_reconciliation_test.go`.
+The platform balance reconciliation (`platform_reconciliation_postgres_test.go`) runs its snapshot
+statement, migration 034's constraints and indexes, and the platform account's row lock under
+real concurrency — eight processes rounding at once book once, eight admins booking one check
+book it once, two archives at once write one — against PostgreSQL; its scenarios run against the
+fakes in `platform_reconciliation_test.go`.
 `CreateAccount`'s creation lock (`account_create_postgres_test.go`: 24 callers at once, a refused
 holder, a Singapay timeout, a short server idle limit) and `TransactReadCommitted`
 (`repo/transact_postgres_test.go`) need a real database and real concurrency, so they run only

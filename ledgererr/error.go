@@ -148,6 +148,30 @@ const (
 	CodeInvalidAccountID      ErrorCode = 400019
 	CodeStartDateRequired     ErrorCode = 400020
 	CodeEndDateRequired       ErrorCode = 400021
+
+	// Platform balance reconciliation error codes (v0.13.0)
+	//
+	// CodePlatformReconciliationNotFound: no check has run yet, or the check named is not one.
+	CodePlatformReconciliationNotFound ErrorCode = 404011
+	// CodePlatformReconciliationNotLatest: a newer check ran since the one being booked.
+	CodePlatformReconciliationNotLatest ErrorCode = 409010
+	// CodePlatformReconciliationStale: the check is older than PlatformDifferenceMaxCheckAge.
+	CodePlatformReconciliationStale ErrorCode = 409011
+	// CodePlatformReconciliationNothingToBook: the check found no difference (MATCHED), or
+	// was skipped, so it has no figure to book.
+	CodePlatformReconciliationNothingToBook ErrorCode = 409012
+	// CodePlatformReconciliationAlreadyBooked: the check's difference is already booked.
+	CodePlatformReconciliationAlreadyBooked ErrorCode = 409013
+	// CodePlatformReconciliationPayoutInFlight: a platform payout started since the check.
+	CodePlatformReconciliationPayoutInFlight ErrorCode = 409016
+	// CodeReserveArchiveAlreadyDone: the DOKU era is already in the RESERVE account.
+	CodeReserveArchiveAlreadyDone ErrorCode = 409014
+	// CodeReserveArchiveAmountMismatch: the DOKU-era entries do not add up to the amount the
+	// caller expects.
+	CodeReserveArchiveAmountMismatch ErrorCode = 409015
+	// CodeInvalidPlatformAdjustment: a difference booked without a valid reason, without the
+	// note "other" needs, with a note too long, or without the admin.
+	CodeInvalidPlatformAdjustment ErrorCode = 400022
 )
 
 // Ledger errors
@@ -199,6 +223,19 @@ var (
 
 var (
 	ErrInvalidRequest = NewError(CodeInvalidRequest, "invalid request", nil)
+)
+
+// Platform balance reconciliation errors (v0.13.0). See the codes.
+var (
+	ErrPlatformReconciliationNotFound       = NewError(CodePlatformReconciliationNotFound, "no platform balance check found", nil)
+	ErrPlatformReconciliationNotLatest      = NewError(CodePlatformReconciliationNotLatest, "a newer platform balance check has run since this one", nil)
+	ErrPlatformReconciliationStale          = NewError(CodePlatformReconciliationStale, "the platform balance check is too old to book; check again", nil)
+	ErrPlatformReconciliationNothingToBook  = NewError(CodePlatformReconciliationNothingToBook, "the platform balance check has no difference to book", nil)
+	ErrPlatformReconciliationAlreadyBooked  = NewError(CodePlatformReconciliationAlreadyBooked, "the difference of this platform balance check is already booked", nil)
+	ErrPlatformReconciliationPayoutInFlight = NewError(CodePlatformReconciliationPayoutInFlight, "a platform payout is in flight; check again once it is final", nil)
+	ErrReserveArchiveAlreadyDone            = NewError(CodeReserveArchiveAlreadyDone, "the DOKU era is already archived to the RESERVE account", nil)
+	ErrReserveArchiveAmountMismatch         = NewError(CodeReserveArchiveAmountMismatch, "the DOKU-era entries do not add up to the expected amount", nil)
+	ErrInvalidPlatformAdjustment            = NewError(CodeInvalidPlatformAdjustment, "invalid platform adjustment", nil)
 )
 
 // Webhook errors

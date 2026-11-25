@@ -16,6 +16,7 @@ type Tx interface {
 	Disbursement() domain.DisbursementRepository
 	SettlementNotification() domain.SettlementNotificationRepository
 	PlatformFeeReconciliation() domain.PlatformFeeReconciliationRepository
+	PlatformReconciliation() domain.PlatformReconciliationRepository
 }
 
 type postgresTx struct {
@@ -56,4 +57,8 @@ func (p *postgresTx) SettlementNotification() domain.SettlementNotificationRepos
 
 func (p *postgresTx) PlatformFeeReconciliation() domain.PlatformFeeReconciliationRepository {
 	return NewPostgresPlatformFeeReconciliationRepository(p.tx)
+}
+
+func (p *postgresTx) PlatformReconciliation() domain.PlatformReconciliationRepository {
+	return NewPostgresPlatformReconciliationRepository(p.tx)
 }

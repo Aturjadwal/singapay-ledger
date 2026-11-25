@@ -405,6 +405,37 @@ re-sending a used value returns the original transfer and moves nothing further 
 what makes a retry safe. A random value per attempt would forfeit that protection without
 raising any error.
 
+### Platform balance reconciliation — the platform's ledger against its sub-account
+
+```go
+// After the sweep, in the same process (v0.13.0):
+rounding, err := client.BookPlatformResidual(ctx)   // whole rupiah of the residual sen, once ≥ Rp1
+check, err := client.CheckPlatformBalance(ctx)      // S − L − K + B: MATCHED, MISMATCH or SKIPPED
+
+// An admin books a MISMATCH, with a reason; the amount is the latest check's.
+booking, err := client.BookPlatformDifference(ctx, ledger.PlatformDifferenceRequest{
+    ReconciliationUUID: check.UUID,
+    Reason:             domain.PlatformAdjustmentReasonTestFunds,
+    Note:               "Dana uji coba staging, PF-INV-20260911084626-CSV7MW",
+    AdminID:            adminUUID,
+    AdminName:          adminName,
+})
+
+state, err := client.GetPlatformReconciliation(ctx) // latest check, its booking, the last alert
+
+// Once: the DOKU era to a RESERVE archive account. Apply false is a dry run.
+plan, err := client.ArchiveToReserve(ctx, ledger.ReserveArchiveRequest{ExpectedAmount: 45727})
+```
+
+The equation, every term in sen and recomputed from rows that never change: S is the platform
+sub-account's available balance at Singapay, L the platform's AVAILABLE entries, K the residual
+pool (the sen the sweeps moved that whole-rupiah entries could not record, less what was rounded),
+B the platform fee settled but not swept yet at the whole rupiah the ledger holds for it. It is 0
+in normal operation. **Only K is ever booked by itself**; anything else is an alert an admin books
+with a reason. A difference's rupiah are rounded down, its sen go to the pool, so the ledger never
+claims more than Singapay holds. Every booking takes the platform account's row lock. See
+[docs/106](docs/106-platform-balance-reconciliation.md).
+
 ### Platform account — balance, statement, payout
 
 The platform's own account gets the seller's three operations, with the account resolved
@@ -416,9 +447,9 @@ all three answer `ErrLedgerNotFound` until it exists.
 account, err := client.GetPlatformAccount(ctx)
 // account.AvailableBalance, account.PendingBalance, account.TotalWithdrawalAmount
 
-// Statement: money in and money out, interleaved, newest first.
+// Statement: money in, money out and adjustments, interleaved, newest first.
 page, err := client.GetPlatformTransactions(ctx, ledger.PlatformTransactionsRequest{
-    Type:     "",               // or ledger.PlatformTransactionIncome / PlatformTransactionPayout
+    Type:     "",               // or PlatformTransactionIncome / PlatformTransactionPayout / PlatformTransactionAdjustment
     PageSize: 20,               // capped at 100
     Cursor:   previous.NextCursor,
 })
@@ -446,9 +477,14 @@ reserved against the ledger's AVAILABLE balance, so one larger than the sub-acco
 holds is refused by Singapay (`SP003`) — which releases the reservation and books the payout
 `FAILED`, like any other refusal.
 
-**The statement cursor carries its own sort key.** Money in and money out live in different
-tables, so a page is a merge of both, ordered by `(OccurredAt, ID)`. A RandId cursor, which
-looks its row up again, cannot continue a list whose last row might be in either table.
+**An adjustment line comes from `platform_adjustments`** (v0.13.0): the cent rounding, a
+difference an admin booked, the DOKU-era archive. Its `Amount` is signed and `Adjustment` says
+which. Income + adjustments − payouts is the AVAILABLE balance.
+
+**The statement cursor carries its own sort key.** Money in, money out and adjustments live in
+different tables, so a page is a merge of the three, ordered by `(OccurredAt, ID)`. A RandId
+cursor, which looks its row up again, cannot continue a list whose last row might be in any of
+them.
 
 **A platform payout settles through the same webhook as a seller's.** `DisbursementOutcome`
 carries `OwnerType`; a caller that sends seller receipts must skip `OwnerTypePlatform`, whose
@@ -605,7 +641,8 @@ migrations are in [`database/migrations/`](database/migrations/).
 
 Key tables: `ledger_accounts`, `product_transactions`, `payment_requests`, `ledger_entries`,
 `journals`, `settlement_notifications`, `fee_configs`, `disbursements`,
-`platform_fee_reconciliations`, `platform_fee_reconciliation_items`.
+`platform_fee_reconciliations`, `platform_fee_reconciliation_items`,
+`platform_reconciliations`, `platform_adjustments`.
 
 Removing the batch reconciler's tables is a **two-phase migration**, because
 `payment_requests.status` is `NOT NULL` and the new code no longer supplies it:
@@ -628,6 +665,10 @@ adds `settled_fee_source` with its backfill and the card reconciliation's two ta
 before the deploy if one ran; it is idempotent).
 [`033_product_transactions_fee_estimate_index.sql`](database/migrations/033_product_transactions_fee_estimate_index.sql)
 is its index, `CONCURRENTLY`, on its own, after 032.
+
+[`034_platform_reconciliation.sql`](database/migrations/034_platform_reconciliation.sql) adds the
+platform balance reconciliation's two tables (v0.13.0). Tables and indexes only, nothing
+existing changes: apply it any time before deploying v0.13.0.
 
 ### Migrating an existing database
 
@@ -770,3 +811,4 @@ go run ./cmd/singapay-smoke -step qris -account-id 01K9... -amount 10000
 - [103 — Withdrawal / Disbursement](docs/103-withdrawal-disbursement.md)
 - [104 — Fee Mismatch Reconciliation](docs/104-fee-mismatch-reconciliation.md)
 - [105 — Singapay Migration](docs/105-singapay-migration.md)
+- [106 — Platform Balance Reconciliation](docs/106-platform-balance-reconciliation.md)

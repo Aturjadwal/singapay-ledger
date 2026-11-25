@@ -1019,6 +1019,7 @@ type FakeRepositoryProvider struct {
 	disbursementRepo           *FakeDisbursementRepository
 	paymentRequestRepo         *FakePaymentRequestRepository
 	reconciliationRepo         *FakePlatformFeeReconciliationRepository
+	platformReconciliationRepo *FakePlatformReconciliationRepository
 }
 
 // Ensure FakeRepositoryProvider implements repo.RepositoryProvider at compile time
@@ -1039,6 +1040,7 @@ func NewFakeRepositoryProvider() *FakeRepositoryProvider {
 	}
 	fakes.productTransactionRepo.ledgerEntries = fakes.ledgerEntryRepo
 	fakes.reconciliationRepo = &FakePlatformFeeReconciliationRepository{fakes: fakes}
+	fakes.platformReconciliationRepo = &FakePlatformReconciliationRepository{fakes: fakes}
 	return fakes
 }
 

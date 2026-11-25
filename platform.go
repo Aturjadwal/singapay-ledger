@@ -88,6 +88,12 @@ const (
 
 	// PlatformTransactionPayout is money out: a disbursement from the platform account.
 	PlatformTransactionPayout PlatformTransactionType = "PAYOUT"
+
+	// PlatformTransactionAdjustment is a movement no sale and no payout explains, read from
+	// platform_adjustments (v0.13.0): the cent rounding, a difference an admin booked, the
+	// DOKU-era archive. Not from the entries' type: RECONCILIATION journals are also the card
+	// fee recomputation's, which belongs on its sale's INCOME line.
+	PlatformTransactionAdjustment PlatformTransactionType = "ADJUSTMENT"
 )
 
 // PlatformIncomeSource says why a transaction credited the platform.
@@ -110,27 +116,34 @@ const (
 type PlatformTransaction struct {
 	Type PlatformTransactionType
 
-	// ID is the product transaction's UUID for an income and the disbursement's for a
-	// payout.
+	// ID is the product transaction's UUID for an income, the disbursement's for a payout and
+	// the platform_adjustments row's for an adjustment.
 	ID string
 
 	// OccurredAt is when the money moved as far as the platform's books are concerned:
-	// when the payer paid, for an income; when the payout was requested, for a payout. It
-	// is the key the statement is ordered by.
+	// when the payer paid, for an income; when the payout was requested, for a payout; when
+	// it was booked, for an adjustment. It is the key the statement is ordered by.
 	OccurredAt time.Time
 
-	// Amount is never negative. For an income it is what the platform was credited — the
-	// sum of its ledger entries for the transaction, so a settled line carries the settled
-	// figure, not the priced one. For a payout it is the requested amount, transfer fee
-	// included: what the reservation held. A payout that FAILED or was CANCELLED had that
-	// hold released again; read its Status.
+	// Amount is never negative for an income or a payout. For an income it is what the
+	// platform was credited — the sum of its ledger entries for the transaction, so a settled
+	// line carries the settled figure, not the priced one. For a payout it is the requested
+	// amount, transfer fee included: what the reservation held. A payout that FAILED or was
+	// CANCELLED had that hold released again; read its Status.
+	//
+	// For an adjustment it is SIGNED: the whole rupiah the platform's AVAILABLE moved by
+	// (a rounding is positive, the archive negative, a difference either). A difference under
+	// Rp1 moved no rupiah and reads 0; its sen went to the residual pool (ResidualMinor).
 	Amount int64
 
-	// Income is set on an INCOME line and nil on a PAYOUT line.
+	// Income is set on an INCOME line and nil otherwise.
 	Income *PlatformIncomeDetail
 
-	// Payout is set on a PAYOUT line and nil on an INCOME line.
+	// Payout is set on a PAYOUT line and nil otherwise.
 	Payout *domain.Disbursement
+
+	// Adjustment is set on an ADJUSTMENT line and nil otherwise.
+	Adjustment *domain.PlatformAdjustment
 }
 
 // PlatformIncomeDetail is what an income line knows beyond its amount.
@@ -144,7 +157,7 @@ type PlatformIncomeDetail struct {
 
 // PlatformTransactionsRequest pages through the platform statement.
 type PlatformTransactionsRequest struct {
-	// Type narrows the statement to one direction. Empty lists both, interleaved.
+	// Type narrows the statement to one kind of line. Empty lists all three, interleaved.
 	Type PlatformTransactionType
 
 	// Cursor is the previous page's NextCursor, or empty for the first page. It is opaque,
@@ -167,23 +180,23 @@ type PlatformTransactionsResponse struct {
 	HasMore    bool
 }
 
-// GetPlatformTransactions returns a page of the platform account's statement: money in and
-// money out, interleaved by when each happened.
+// GetPlatformTransactions returns a page of the platform account's statement: money in, money
+// out and the adjustments, interleaved by when each happened.
 //
 // It is a pure read of this package's tables — no gateway call.
 //
-// The two directions live in different tables, so the page is a merge. Each side is read in
+// The three kinds live in different tables, so the page is a merge. Each source is read in
 // (OccurredAt, ID) order, one line more than the page, continuing past the same cursor, and
-// the two are interleaved in Go. The first PageSize+1 lines of the union are always among
-// the first PageSize+1 of each side, so the page is exact, and the extra line is how
+// they are interleaved in Go. The first PageSize+1 lines of the union are always among
+// the first PageSize+1 of each source, so the page is exact, and the extra line is how
 // HasMore is known without a count. The cursor carries its sort key rather than naming a
-// row to look up, because a row named by the last page could live in either table.
+// row to look up, because a row named by the last page could live in any of the tables.
 //
 // An invalid cursor is CodeInvalidRequest. ErrLedgerNotFound means the platform account has
 // not been provisioned.
 func (c *LedgerClient) GetPlatformTransactions(ctx context.Context, req PlatformTransactionsRequest) (*PlatformTransactionsResponse, error) {
 	switch req.Type {
-	case "", PlatformTransactionIncome, PlatformTransactionPayout:
+	case "", PlatformTransactionIncome, PlatformTransactionPayout, PlatformTransactionAdjustment:
 	default:
 		return nil, ledgererr.NewError(ledgererr.CodeInvalidRequest,
 			fmt.Sprintf("unknown platform transaction type %q", req.Type), nil)
@@ -209,7 +222,7 @@ func (c *LedgerClient) GetPlatformTransactions(ctx context.Context, req Platform
 	}
 
 	var incomes []*PlatformTransaction
-	if req.Type != PlatformTransactionPayout {
+	if req.Type == "" || req.Type == PlatformTransactionIncome {
 		rows, err := c.repoProvider.ProductTransaction().GetPlatformIncomes(ctx, account.UUID, after, pageSize+1, ascending)
 		if err != nil {
 			return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to list platform incomes", err)
@@ -220,7 +233,7 @@ func (c *LedgerClient) GetPlatformTransactions(ctx context.Context, req Platform
 	}
 
 	var payouts []*PlatformTransaction
-	if req.Type != PlatformTransactionIncome {
+	if req.Type == "" || req.Type == PlatformTransactionPayout {
 		rows, err := c.repoProvider.Disbursement().GetByAccountIDAfter(ctx, account.UUID, after, pageSize+1, ascending)
 		if err != nil {
 			return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to list platform payouts", err)
@@ -230,7 +243,18 @@ func (c *LedgerClient) GetPlatformTransactions(ctx context.Context, req Platform
 		}
 	}
 
-	lines := mergePlatformTransactions(incomes, payouts, ascending)
+	var adjustments []*PlatformTransaction
+	if req.Type == "" || req.Type == PlatformTransactionAdjustment {
+		rows, err := c.repoProvider.PlatformReconciliation().ListAdjustments(ctx, account.UUID, after, pageSize+1, ascending)
+		if err != nil {
+			return nil, ledgererr.NewError(ledgererr.CodeInternal, "failed to list platform adjustments", err)
+		}
+		for _, row := range rows {
+			adjustments = append(adjustments, platformAdjustmentLine(row))
+		}
+	}
+
+	lines := mergePlatformTransactions(mergePlatformTransactions(incomes, payouts, ascending), adjustments, ascending)
 
 	resp := &PlatformTransactionsResponse{Transactions: lines}
 	if len(lines) > pageSize {
@@ -275,6 +299,16 @@ func platformPayoutLine(d *domain.Disbursement) *PlatformTransaction {
 		OccurredAt: d.CreatedAt,
 		Amount:     d.Amount,
 		Payout:     d,
+	}
+}
+
+func platformAdjustmentLine(a *domain.PlatformAdjustment) *PlatformTransaction {
+	return &PlatformTransaction{
+		Type:       PlatformTransactionAdjustment,
+		ID:         a.UUID,
+		OccurredAt: a.CreatedAt,
+		Amount:     a.Amount,
+		Adjustment: a,
 	}
 }
 
