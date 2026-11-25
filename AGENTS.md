@@ -16,7 +16,7 @@ workers and the commands; this repo owns the ledger and every table under it.
 **This package owns its tables.** `ledger_accounts`, `product_transactions`,
 `payment_requests`, `journals`, `ledger_entries`, `settlement_notifications`, `disbursements`,
 `fee_configs`, `ledger_verifications`, `platform_fee_reconciliations`,
-`platform_fee_reconciliation_items`.
+`platform_fee_reconciliation_items`, `platform_reconciliations`, `platform_adjustments`.
 
 A consumer that needs data from them gets a method on `LedgerClient`. It does not write SQL of
 its own against them — that puts the consumer's `SELECT` and this package's state machine on
@@ -36,6 +36,7 @@ separate copies of the same rules, and the copies drift.
 ├── settlement.go          # Settlement inbox + the per-transaction settling pass
 ├── settlement_transactions.go # What one settlement batch covered, read back from Singapay
 ├── platform_fee_reconciliation.go # Card platform fees recomputed from the sub-account balance
+├── platform_reconciliation.go # The platform's ledger against its sub-account: rounding, check, booking, DOKU archive
 ├── gateway.go             # PaymentGateway interface and channel mapping
 ├── domain.go, response.go # Re-exports and response shapes
 ├── dummy.go               # Local seeder. Not used in production.
@@ -46,7 +47,7 @@ separate copies of the same rules, and the copies drift.
 ├── analytics/             # Read-side queries
 ├── database/
 │   ├── schemas/schema.sql # The current shape of the database
-│   └── migrations/        # Ordered: 001_*.sql .. 033_*.sql
+│   └── migrations/        # Ordered: 001_*.sql .. 034_*.sql
 ├── docs/                  # Reference docs — see §7
 └── cmd/singapay-smoke/    # Verifies a Singapay connection end to end
 ```
@@ -66,6 +67,7 @@ settlement pass      -> COMPLETED -> SETTLED, PENDING bucket moves to AVAILABLE
 card reconciliation  -> ESTIMATE -> BALANCE, from the seller's sub-account balance
 Withdraw             -> AVAILABLE debited, disbursement sent (WithdrawFromPlatform: the same, from the platform account)
 platform-fee sweep   -> platform's cut transferred between Singapay sub-accounts (not ESTIMATE rows)
+platform check       -> residual sen rounded into the ledger, S − L − K + B recorded (docs/106)
 ```
 
 Two balance buckets, per account: `PENDING` (captured, not yet settled) and `AVAILABLE`
@@ -168,6 +170,7 @@ every payment creation in whichever direction it was applied.
 | How settlement works, and what was rejected | [`docs/102-settlement-reconciliation.md`](docs/102-settlement-reconciliation.md) |
 | How a withdrawal works, and the failure taxonomy | [`docs/103-withdrawal-disbursement.md`](docs/103-withdrawal-disbursement.md) |
 | What happens when the real fee differs from the priced one | [`docs/104-fee-mismatch-reconciliation.md`](docs/104-fee-mismatch-reconciliation.md) |
+| How the platform's ledger is reconciled with its sub-account | [`docs/106-platform-balance-reconciliation.md`](docs/106-platform-balance-reconciliation.md) |
 | How Singapay itself behaves (research) | [`docs/105-singapay-migration.md`](docs/105-singapay-migration.md) |
 | The public surface and quick start | [`README.md`](README.md) |
 

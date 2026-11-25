@@ -19,6 +19,8 @@ Dokumen ini menjelaskan seluruh tabel/entitas yang terlibat dalam operasional le
 | [Verification](#9-verification) | `ledger_verifications` | Verifikasi KYC seller |
 | [PlatformFeeReconciliation](#10-platformfeereconciliation) | `platform_fee_reconciliations` | Hitung ulang biaya platform kartu, satu baris per seller per putaran |
 | [PlatformFeeReconciliationItem](#11-platformfeereconciliationitem) | `platform_fee_reconciliation_items` | Satu baris per kartu per putaran |
+| [PlatformReconciliation](#12-platformreconciliation) | `platform_reconciliations` | Cek saldo akun PLATFORM terhadap sub-akun Singapay-nya, satu baris per cek |
+| [PlatformAdjustment](#13-platformadjustment) | `platform_adjustments` | Pergerakan saldo AVAILABLE platform di luar penjualan dan payout (pembulatan sen, selisih yang dibukukan admin, arsip era DOKU) |
 
 > **Dihapus pada 2026-09-13** oleh [migrasi 026](../database/migrations/026_settlement_cleanup_contract.sql):
 > `settlement_batches`, `settlement_items`, `reconciliation_discrepancies`. Ketiganya adalah
@@ -57,7 +59,7 @@ Entitas inti yang merepresentasikan akun keuangan dalam sistem. Setiap seller me
 - **`SELLER`** — Akun milik seller. Satu per seller. Saldo tumbuh dari transaksi yang settled.
 - **`PLATFORM`** — Satu akun untuk platform. Menerima platform fee dari setiap transaksi.
 - **`PAYMENT_GATEWAY`** — Satu akun untuk Singapay. Menerima gateway fee dari setiap transaksi.
-- **`RESERVE`** — Akun cadangan untuk penyesuaian manual.
+- **`RESERVE`** — Akun arsip: uang yang dicatat ledger tetapi tidak ada di sub-akun mana pun dan tidak dihitung total mana pun. Yang pertama dibuat oleh `ArchiveToReserve` (v0.13.0) dengan `owner_id = 'PLATFORM_DOKU_ARCHIVE'`, berisi era DOKU akun platform. Tanpa sub-akun Singapay.
 
 ### Catatan Penting
 
@@ -646,6 +648,106 @@ hanya sekali `APPLIED`. Kolom hasil diisi semua atau kosong semua (CHECK
 
 - `N:1` ke `platform_fee_reconciliations`
 - `N:1` ke `product_transactions`, `journals`, `ledger_entries`
+
+---
+
+## 12. PlatformReconciliation
+
+**Tabel:** `platform_reconciliations` (migrasi 034, v0.13.0)
+
+Satu baris per cek saldo akun PLATFORM terhadap sub-akun Singapay-nya. Semua nominal dalam
+**sen**. Insert-only, kecuali `emailed_at`.
+
+```
+tak terjelaskan = S − L − K + B
+S = saldo available sub-akun di Singapay
+L = saldo AVAILABLE platform di ledger (Σ entri) × 100
+K = kolam sen = Σ platform_residual baris tersapu + Σ platform_adjustments.residual_minor
+              − Σ platform_adjustments.amount × 100 baris ROUNDING
+B = fee platform yang sudah settle tapi belum tersapu, sebesar rupiah bulat di ledger, × 100
+```
+
+### Fields
+
+| Field | Tipe | Keterangan |
+|---|---|---|
+| `uuid` / `randid` | VARCHAR(255) | Identifier cek |
+| `platform_account_uuid` | VARCHAR(255) FK | Akun PLATFORM |
+| `singapay_account_id` | VARCHAR(255) | ULID sub-akun yang ditanya |
+| `singapay_available` / `singapay_pending` / `singapay_held` | BIGINT NULL | S dan jawaban balance-inquiry lainnya. `NULL` bila tidak dibaca |
+| `ledger_available` | BIGINT | L × 100 |
+| `residual_pool` | BIGINT | K |
+| `unswept_platform_fee` | BIGINT | B × 100 |
+| `unswept_count` | INT | Jumlah baris yang membentuk B |
+| `payouts_in_flight` | INT | Payout platform `PENDING`/`PROCESSING` saat dibaca |
+| `unexplained` | BIGINT NULL | S − L − K + B. `NULL` bila dilewati |
+| `status` | VARCHAR(20) | `MATCHED` (tepat 0), `MISMATCH`, `SKIPPED` |
+| `skip_reason` | VARCHAR(30) NULL | `PAYOUT_IN_FLIGHT`, `BALANCE_READ_FAILED`, `LEDGER_MOVED`; terisi tepat ketika `SKIPPED` |
+| `skip_detail` | TEXT NULL | Detail untuk operator (tidak untuk klien) |
+| `raw_balance` | JSONB NULL | Jawaban balance-inquiry seperti yang didekode klien |
+| `checked_at` | TIMESTAMP | Waktu saldo dibaca |
+| `emailed_at` | TIMESTAMP NULL | Waktu admin dikirimi alert untuk cek ini |
+| `created_at` | TIMESTAMP | Waktu baris ditulis |
+
+### Catatan Penting
+
+- Ledger dibaca dua kali, sebelum dan sesudah balance-inquiry, dalam satu statement masing-masing.
+  Kalau berubah di antaranya, saldo dibaca ulang (paling banyak tiga kali), lalu `LEDGER_MOVED`.
+- CHECK `platform_reconciliations_outcome_check`: `MATCHED` berarti `unexplained = 0`, `MISMATCH`
+  berarti tidak nol, `SKIPPED` berarti `unexplained` kosong dan ada alasannya.
+
+### Relasi
+
+- `N:1` ke `ledger_accounts` (platform)
+- `1:0..1` ke `platform_adjustments` (`DIFFERENCE` yang membukukannya)
+
+---
+
+## 13. PlatformAdjustment
+
+**Tabel:** `platform_adjustments` (migrasi 034, v0.13.0)
+
+Satu baris per pergerakan saldo AVAILABLE platform yang tidak dijelaskan penjualan atau payout.
+Insert-only. Journal dan entrinya bersumber pada baris ini (`source_type = 'MANUAL_ADJUSTMENT'`,
+`source_id = uuid`, entri `entry_type = 'RECONCILIATION'`), jadi baris statement penjualan dan
+grafik Platform Earnings tidak ikut berubah. Baris inilah sumber baris `ADJUSTMENT` di statement
+platform.
+
+| `kind` | Arti | Journal |
+|---|---|---|
+| `ROUNDING` | Rupiah utuh dari kolam sen, begitu kolam ≥ Rp1 (worker, setelah sapuan) | `RECONCILIATION` |
+| `DIFFERENCE` | Selisih satu cek, dibukukan admin dengan alasan; rupiah dibulatkan ke bawah ke ledger, sennya (0..99) ke kolam | `MANUAL_ADJUSTMENT` (tidak ada bila di bawah Rp1) |
+| `RESERVE_ARCHIVE` | Era DOKU dipindah ke akun `RESERVE`, sekali | `MANUAL_ADJUSTMENT`, dua entri: PLATFORM −, RESERVE + |
+
+### Fields
+
+| Field | Tipe | Keterangan |
+|---|---|---|
+| `uuid` / `randid` | VARCHAR(255) | Identifier |
+| `platform_account_uuid` | VARCHAR(255) FK | Akun PLATFORM |
+| `kind` | VARCHAR(30) | Lihat tabel di atas |
+| `amount` | BIGINT | Rupiah bulat, bertanda: pergerakan AVAILABLE platform |
+| `residual_minor` | BIGINT | Sen yang masuk kolam (`DIFFERENCE`: 0..99) |
+| `pool_before_minor` | BIGINT NULL | `ROUNDING`: kolam sebelum pembulatan |
+| `reason` | VARCHAR(40) NULL | `DIFFERENCE`: `TEST_FUNDS`, `OFF_SYSTEM_WITHDRAWAL`, `SINGAPAY_CORRECTION`, `OTHER` |
+| `note` | TEXT NULL | Wajib untuk `OTHER`; paling panjang 500 karakter |
+| `admin_id` / `admin_name` | VARCHAR(255) NULL | Siapa yang membukukan (`DIFFERENCE` wajib) |
+| `journal_uuid` | VARCHAR(255) FK NULL | Journal-nya; `NULL` untuk selisih di bawah Rp1 |
+| `reconciliation_uuid` | VARCHAR(255) FK NULL | Cek yang dibukukan (`DIFFERENCE`) |
+| `reserve_account_uuid` | VARCHAR(255) FK NULL | Akun arsip (`RESERVE_ARCHIVE`) |
+| `source_transaction_uuids` | TEXT[] | `ROUNDING`: transaksi tersapu yang sennya masuk kolam sejak pembulatan sebelumnya; `RESERVE_ARCHIVE`: transaksi era DOKU |
+| `created_at` | TIMESTAMP | Waktu dibukukan |
+
+### Catatan Penting
+
+- Index unik parsial `uq_platform_adjustments_reconciliation`: satu cek dibukukan sekali.
+  `uq_platform_adjustments_reserve_archive`: arsip DOKU sekali.
+- Semua pembukuan (pembulatan, selisih, arsip) mengunci baris akun PLATFORM
+  (`SELECT … FOR UPDATE`) lebih dulu, lalu menghitung ulang di dalam transaksi itu.
+
+### Relasi
+
+- `N:1` ke `ledger_accounts` (platform, dan akun `RESERVE`), `journals`, `platform_reconciliations`
 
 ---
 

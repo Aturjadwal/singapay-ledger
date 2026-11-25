@@ -4,6 +4,65 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added — the platform's ledger reconciled with its Singapay sub-account (v0.13.0)
+
+The platform's ledger balance never matched its sub-account. The sweep moves a platform fee to
+the sen (4000.16) while `ledger_entries.amount` is whole rupiah, so the sen piled up in
+`product_transactions.platform_residual` (Rp50,28 over 155 sweeps by 25 Nov 2026); money the
+ledger never saw reached the sub-account (CSV7MW, Rp4.000,16, a staging run on production
+credentials); and the DOKU era (Rp45.727) is in the ledger and was never at Singapay. Nothing
+said which part of the gap was which.
+
+The equation, all in sen, every term recomputed from rows that never change:
+
+```
+unexplained = S − L − K + B
+```
+
+S the sub-account's available balance, L the platform's AVAILABLE entries, K the residual pool
+(Σ residual of swept rows + Σ adjustment sen − Σ roundings), B the platform fee settled but not
+swept yet at the whole rupiah the ledger holds for it. Normal operation keeps it at exactly 0
+(docs/106).
+
+What changed:
+
+- **`LedgerClient.BookPlatformResidual(ctx)`**: books `floor(K/100)` rupiah as one `ROUNDING`
+  adjustment (journal `RECONCILIATION`, entry `RECONCILIATION` on the platform's AVAILABLE) when
+  K ≥ 100 sen, carrying the rest; names the swept transactions whose sen it books. Under the
+  platform account's row lock, so two processes book once.
+- **`CheckPlatformBalance(ctx)`**: one snapshot of L, K, B and the payouts in flight, Singapay's
+  balance inquiry (a read), the snapshot again, re-read up to three times when the ledger moved.
+  Records `MATCHED` (exactly 0), `MISMATCH`, or `SKIPPED` (`PAYOUT_IN_FLIGHT`,
+  `BALANCE_READ_FAILED`, `LEDGER_MOVED`). Never books anything.
+- **`BookPlatformDifference(ctx, PlatformDifferenceRequest)`**: an admin books the latest check's
+  figure, never a typed amount — rupiah rounded down to the ledger (journal `MANUAL_ADJUSTMENT`),
+  sen 0..99 to the pool (4.000,16 → 4.000 + 16; −41,30 → −42 + 70), with a reason (`TEST_FUNDS`,
+  `OFF_SYSTEM_WITHDRAWAL`, `SINGAPAY_CORRECTION`, `OTHER` + note) and the admin. Refused when the
+  check is not the latest, older than 10 minutes, MATCHED or SKIPPED, already booked, or a
+  platform payout is in flight.
+- **`ArchiveToReserve(ctx, ReserveArchiveRequest)`**: once, the DOKU era (the platform's AVAILABLE
+  entries for transactions settled before settled fees were recorded) to a new `RESERVE` account
+  (`owner_id PLATFORM_DOKU_ARCHIVE`): PLATFORM −amount, RESERVE +amount in one
+  `MANUAL_ADJUSTMENT` journal. The amount is computed and must equal `ExpectedAmount` (45.727 in
+  production); a dry run writes nothing; a second run is refused. The DOKU-era statement lines and
+  the Platform Earnings chart do not move.
+- **`GetPlatformReconciliation(ctx)`** and **`MarkPlatformReconciliationEmailed(ctx, uuid, at)`**:
+  the latest check, its booking, whether it can be booked, the last alert.
+- **`GetPlatformTransactions`** has a third source, `ADJUSTMENT` lines from
+  `platform_adjustments` (signed `Amount`, `Adjustment` set; Type `ADJUSTMENT` narrows to them).
+- **Tables** `platform_reconciliations` and `platform_adjustments`, migration 034 (tables and
+  indexes only; no existing CHECK changes — the journals and entries use `RECONCILIATION`,
+  `MANUAL_ADJUSTMENT` and source `MANUAL_ADJUSTMENT`, already allowed). Unique indexes: one
+  booking per check, one archive.
+- `domain`: `PlatformReconciliation`, `PlatformAdjustment`, `PlatformBalanceSnapshot`,
+  `FloorSplitMinor`, `NewPlatformReconciliationEntry`, `OwnerTypeReserve`;
+  `RepositoryProvider` and `Tx` gain `PlatformReconciliation()`. `ledgererr`: codes 404011,
+  409010–409016, 400022.
+- Tests: the equation, B with an unswept fee with sen and with a held card fee, the rounding and
+  the carried sen, the guards, the negative direction, the archive's idempotence, the statement —
+  against the fakes; the snapshot statement, the constraints and real concurrency (eight
+  processes rounding, eight admins booking one check, two archives) against PostgreSQL.
+
 ### Changed — a failed platform-fee row is logged once, by the caller, with everything the ledger knew (v0.12.0)
 
 The sweep logged every failed row at ERROR and returned it; the consuming service's settlement

@@ -692,3 +692,143 @@ WHERE
     allocated_platform_fee IS NOT NULL;
 
 CREATE INDEX idx_platform_fee_reconciliation_items_run ON platform_fee_reconciliation_items (reconciliation_uuid);
+
+-- platform_reconciliations: THE PLATFORM BALANCE RECONCILIATION, one row per check of the
+-- platform's ledger against its Singapay sub-account (migration 034). Every amount is sen.
+--
+--   unexplained = singapay_available − ledger_available − residual_pool + unswept_platform_fee
+--
+-- MATCHED is exactly 0, MISMATCH anything else (an alert, never booked by itself), SKIPPED a
+-- check that could not be computed honestly (a platform payout in flight, the balance read
+-- failed, the ledger moved while it was read). Insert-only except emailed_at.
+CREATE TABLE IF NOT EXISTS platform_reconciliations (
+    uuid VARCHAR(255) PRIMARY KEY,
+    randid VARCHAR(255) NOT NULL UNIQUE,
+    platform_account_uuid VARCHAR(255) NOT NULL REFERENCES ledger_accounts(uuid),
+    singapay_account_id VARCHAR(255) NOT NULL,
+    -- S, the balance inquiry's answer. NULL when it was not read.
+    singapay_available BIGINT,
+    singapay_pending BIGINT,
+    singapay_held BIGINT,
+    -- L × 100: the platform's AVAILABLE entries summed.
+    ledger_available BIGINT NOT NULL,
+    -- K: Σ platform_residual of swept rows + Σ platform_adjustments.residual_minor
+    --    − Σ platform_adjustments.amount × 100 of the ROUNDING rows.
+    residual_pool BIGINT NOT NULL,
+    -- B × 100: the platform's AVAILABLE entries for settled, unswept sellers' rows.
+    unswept_platform_fee BIGINT NOT NULL,
+    unswept_count INT NOT NULL DEFAULT 0,
+    payouts_in_flight INT NOT NULL DEFAULT 0,
+    -- S − L − K + B. NULL when skipped.
+    unexplained BIGINT,
+    status VARCHAR(20) NOT NULL CHECK (status IN ('MATCHED', 'MISMATCH', 'SKIPPED')),
+    skip_reason VARCHAR(30) CHECK (
+        skip_reason IN (
+            'PAYOUT_IN_FLIGHT',
+            'BALANCE_READ_FAILED',
+            'LEDGER_MOVED'
+        )
+    ),
+    skip_detail TEXT,
+    raw_balance JSONB,
+    checked_at TIMESTAMP NOT NULL,
+    -- When the admins were emailed about this check (at most one check a day is).
+    emailed_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL,
+    CONSTRAINT platform_reconciliations_outcome_check CHECK (
+        ((status = 'SKIPPED') = (skip_reason IS NOT NULL))
+        AND ((status = 'SKIPPED') = (unexplained IS NULL))
+        AND (status = 'SKIPPED' OR singapay_available IS NOT NULL)
+        AND (status <> 'MATCHED' OR unexplained = 0)
+        AND (status <> 'MISMATCH' OR unexplained <> 0)
+    )
+);
+
+CREATE INDEX idx_platform_reconciliations_latest ON platform_reconciliations (platform_account_uuid, checked_at DESC, created_at DESC);
+
+CREATE INDEX idx_platform_reconciliations_emailed ON platform_reconciliations (platform_account_uuid, emailed_at DESC)
+WHERE
+    emailed_at IS NOT NULL;
+
+-- platform_adjustments: every movement of the platform's AVAILABLE balance that no sale and
+-- no payout explains (migration 034). Insert-only. Its journal and entries are sourced on the
+-- row (source_type MANUAL_ADJUSTMENT, source_id = uuid), entry type RECONCILIATION.
+--   ROUNDING         whole rupiah out of the residual pool, once it reaches Rp1 (the worker)
+--   DIFFERENCE       one check's unexplained figure, by an admin with a reason; rupiah to the
+--                    ledger, the sen (0..99, the figure rounded down) to the pool
+--   RESERVE_ARCHIVE  the DOKU era moved to a RESERVE archive account, once
+CREATE TABLE IF NOT EXISTS platform_adjustments (
+    uuid VARCHAR(255) PRIMARY KEY,
+    randid VARCHAR(255) NOT NULL UNIQUE,
+    platform_account_uuid VARCHAR(255) NOT NULL REFERENCES ledger_accounts(uuid),
+    kind VARCHAR(30) NOT NULL CHECK (kind IN ('ROUNDING', 'DIFFERENCE', 'RESERVE_ARCHIVE')),
+    -- Whole rupiah, signed: what PLATFORM AVAILABLE moved by.
+    amount BIGINT NOT NULL,
+    -- Sen put into the residual pool: a DIFFERENCE's 0..99.
+    residual_minor BIGINT NOT NULL DEFAULT 0,
+    -- ROUNDING: the pool it booked from.
+    pool_before_minor BIGINT,
+    reason VARCHAR(40) CHECK (
+        reason IN (
+            'TEST_FUNDS',
+            'OFF_SYSTEM_WITHDRAWAL',
+            'SINGAPAY_CORRECTION',
+            'OTHER'
+        )
+    ),
+    note TEXT,
+    admin_id VARCHAR(255),
+    admin_name VARCHAR(255),
+    -- NULL for a difference under Rp1, which writes no entry.
+    journal_uuid VARCHAR(255) REFERENCES journals(uuid),
+    reconciliation_uuid VARCHAR(255) REFERENCES platform_reconciliations(uuid),
+    reserve_account_uuid VARCHAR(255) REFERENCES ledger_accounts(uuid),
+    -- A ROUNDING's swept transactions whose sen entered the pool since the previous rounding;
+    -- the archive's DOKU-era transactions.
+    source_transaction_uuids TEXT[] NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL,
+    CONSTRAINT platform_adjustments_shape_check CHECK (
+        (
+            kind = 'ROUNDING'
+            AND amount > 0
+            AND residual_minor = 0
+            AND pool_before_minor >= amount * 100
+            AND reason IS NULL
+            AND reconciliation_uuid IS NULL
+            AND reserve_account_uuid IS NULL
+            AND journal_uuid IS NOT NULL
+        )
+        OR (
+            kind = 'DIFFERENCE'
+            AND residual_minor BETWEEN 0 AND 99
+            AND (amount <> 0 OR residual_minor <> 0)
+            AND reason IS NOT NULL
+            AND (reason <> 'OTHER' OR btrim(COALESCE(note, '')) <> '')
+            AND reconciliation_uuid IS NOT NULL
+            AND reserve_account_uuid IS NULL
+            AND admin_id IS NOT NULL
+            AND ((amount = 0) = (journal_uuid IS NULL))
+        )
+        OR (
+            kind = 'RESERVE_ARCHIVE'
+            AND amount < 0
+            AND residual_minor = 0
+            AND reason IS NULL
+            AND reconciliation_uuid IS NULL
+            AND reserve_account_uuid IS NOT NULL
+            AND journal_uuid IS NOT NULL
+        )
+    )
+);
+
+-- One booking per check.
+CREATE UNIQUE INDEX uq_platform_adjustments_reconciliation ON platform_adjustments (reconciliation_uuid)
+WHERE
+    reconciliation_uuid IS NOT NULL;
+
+-- The DOKU era is archived once.
+CREATE UNIQUE INDEX uq_platform_adjustments_reserve_archive ON platform_adjustments (platform_account_uuid)
+WHERE
+    kind = 'RESERVE_ARCHIVE';
+
+CREATE INDEX idx_platform_adjustments_statement ON platform_adjustments (platform_account_uuid, created_at, uuid);
