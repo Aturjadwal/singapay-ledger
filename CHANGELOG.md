@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Changed — a failed platform-fee row is logged once, by the caller, with everything the ledger knew
+### Changed — a failed platform-fee row is logged once, by the caller, with everything the ledger knew (v0.12.0)
 
 The sweep logged every failed row at ERROR and returned it; the consuming service's settlement
 worker logged the same row again. One Singapay refusal was two error-tracker groups
